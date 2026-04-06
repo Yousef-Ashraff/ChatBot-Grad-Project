@@ -1,0 +1,29 @@
+# Environment & secrets
+.env
+service-account.json
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Debug logs
+debug_logs/
+
+# Archives
+*.rar
+*.zip
+
+# Deleted files folder
+Deleted_files/
+
+# Claude Code session data
+.claude/
+
+# Misc
+demo.txt
+demo2
