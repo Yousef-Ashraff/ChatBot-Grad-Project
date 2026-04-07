@@ -38,9 +38,14 @@ Planning session lifecycle
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import re
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
@@ -258,6 +263,10 @@ def _preprocess_and_run(
     # "ready" or "passthrough" — we have a clean query
     clean_query = result.clean_query or message
 
+    sub_queries = _analyze_and_split(clean_query)
+    if len(sub_queries) > 1:
+        return _split_and_run(student_id, clean_query, sub_queries, history)
+
     from agent import BNUAdvisorAgent
     agent = BNUAdvisorAgent(student_id=student_id)
     return agent.run(query=clean_query, history=history)
@@ -281,11 +290,198 @@ def _resolve_ambiguity_reply(
     pre    = get_preprocessor()
     result = pre.resolve_ambiguity(pending, reply)
 
+    # Another course in the original query was also ambiguous — ask again
+    if result.status == "ambiguous":
+        _ambiguity_sessions[student_id] = result.pending
+        return result.clarification
+
     clean_query = result.clean_query or pending.original_query
+
+    sub_queries = _analyze_and_split(clean_query)
+    if len(sub_queries) > 1:
+        return _split_and_run(student_id, clean_query, sub_queries, pending.history)
 
     from agent import BNUAdvisorAgent
     agent = BNUAdvisorAgent(student_id=student_id)
     return agent.run(query=clean_query, history=pending.history)
+
+
+def _analyze_and_split(clean_query: str) -> List[str]:
+    """
+    Ask the utility LLM to decompose the query into atomic sub-queries.
+
+    Handles all combinatorial cases:
+      - N courses                  → N sub-queries
+      - 1 course × M programs      → M sub-queries
+      - N courses × M programs     → N×M sub-queries
+      - mixed (course + bylaw)     → one per independent topic
+      - already atomic             → [clean_query] unchanged
+
+    Returns a list of sub-query strings.  If only one element, no split
+    is performed and the normal single-agent path is taken.
+    """
+    from llm_client import llm_call_json
+
+    try:
+        raw = llm_call_json(
+            system=(
+                "You decompose student academic advisor queries into the minimum set "
+                "of independent atomic sub-queries, each requiring exactly one "
+                "focused database lookup."
+            ),
+            prompt=(
+                "Decompose the query below into atomic sub-queries.\n\n"
+                "Rules:\n"
+                "  1. N courses, no specific program  → N sub-queries (one per course)\n"
+                "  2. 1 course × M programs           → M sub-queries (one per program)\n"
+                "  3. N courses × M programs          → N×M sub-queries (cartesian product)\n"
+                "  4. Independent questions (course + bylaw, etc.) → one sub-query each\n"
+                "  5. Already atomic (1 course, 1 program, or no entities) → return as-is\n\n"
+                "Examples:\n"
+                '  "when can I take field training (1) and field training (2)?"\n'
+                '  → ["when can I take field training (1)?",\n'
+                '     "when can I take field training (2)?"]\n\n'
+                '  "when can I take ML at AI and SAD?"\n'
+                '  → ["when can I take ML at AI?",\n'
+                '     "when can I take ML at SAD?"]\n\n'
+                '  "when can I take NLP and image processing at AI and SAD?"\n'
+                '  → ["when can I take NLP at AI?",\n'
+                '     "when can I take NLP at SAD?",\n'
+                '     "when can I take image processing at AI?",\n'
+                '     "when can I take image processing at SAD?"]\n\n'
+                '  "what are ML prerequisites and what is the graduation GPA?"\n'
+                '  → ["what are the prerequisites for ML?",\n'
+                '     "what is the graduation GPA requirement?"]\n\n'
+                '  "what is ML about?"  →  ["what is ML about?"]\n\n'
+                f'Query: "{clean_query}"\n\n'
+                'Return JSON only: {"sub_queries": ["..."]}'
+            ),
+        )
+        # llm_call_json returns a raw string — extract the JSON object robustly
+        raw = raw.strip()
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not match:
+            raise ValueError(f"No JSON object found in LLM response: {raw!r}")
+        data = json.loads(match.group(0))
+        sub_queries = [q.strip() for q in data.get("sub_queries", []) if q.strip()]
+
+        from debug_box import box as _box
+        _box(
+            "🔀  QUERY SPLIT DECISION",
+            [f"Input  : {clean_query}"]
+            + [f"Sub [{i+1}]: {q}" for i, q in enumerate(sub_queries)],
+            force=True,
+        )
+
+        if sub_queries:
+            return sub_queries
+    except Exception as exc:
+        from debug_box import box as _box
+        _box("🔀  QUERY SPLIT DECISION", [f"ERROR: {exc}", f"Input: {clean_query}"], force=True)
+        logger.warning("_analyze_and_split failed (%s) — using original query", exc)
+
+    return [clean_query]
+
+
+def _split_and_run(
+    student_id:  str,
+    clean_query: str,
+    sub_queries: List[str],
+    history:     list,
+    verbose:     bool = False,
+) -> str:
+    """
+    Run the agent pipeline once per sub-query to collect tool context,
+    then synthesise ONE final answer from the combined context.
+
+    When verbose=True each sub-query run streams its debug boxes so the
+    user can follow tool selection, results, and judge verdicts.
+    """
+    from agent import BNUAdvisorAgent
+    from llm_client import llm_call_text
+    from debug_box import box as _box, is_verbose as _is_verbose
+
+    verbose = verbose or _is_verbose()
+
+    if len(sub_queries) == 1:
+        agent = BNUAdvisorAgent(student_id=student_id)
+        return agent.run(query=sub_queries[0], history=history, verbose=verbose)
+
+    # Collect tool context for every sub-query
+    all_contexts: List[str] = []
+    for i, sub_query in enumerate(sub_queries, 1):
+        if verbose:
+            _box(
+                f"🔀  SUB-QUERY {i} / {len(sub_queries)}",
+                [sub_query],
+                force=True,
+            )
+        agent = BNUAdvisorAgent(student_id=student_id)
+        ctx = agent.run_and_get_context(sub_query, history, verbose=verbose)
+        all_contexts.extend(ctx)
+
+    if not all_contexts:
+        # No tool results at all — fall back to a single agent run
+        agent = BNUAdvisorAgent(student_id=student_id)
+        return agent.run(query=clean_query, history=history, verbose=verbose)
+
+    # ── Planning special case ─────────────────────────────────────────────
+    # If start_course_planning was called in any sub-query, the planning
+    # session is now cached in _planning_sessions[student_id].  We must
+    # surface the planning output directly so the student sees the
+    # interactive prompt and the session continues normally on the next turn.
+    _PLANNING_SIG = "STUDENT COURSE PLANNING SYSTEM"
+    planning_ctxs    = [c for c in all_contexts if _PLANNING_SIG in c]
+    non_planning_ctxs = [c for c in all_contexts if _PLANNING_SIG not in c]
+
+    if planning_ctxs:
+        planning_output = planning_ctxs[0]
+        if non_planning_ctxs:
+            # Synthesise the non-planning parts first, then append the
+            # planning prompt so the student gets both pieces of info.
+            if verbose:
+                _box("✅  ANSWER NODE  →  generating final response", [], force=True)
+            other_answer = llm_call_text(
+                system=(
+                    "You are the BNU Academic Advisor. "
+                    "Write a clear, helpful answer using ONLY the provided database context. "
+                    "Use **bold** for key terms, bullet points for lists. "
+                    "Do NOT cite source or tool names."
+                ),
+                user=(
+                    f"Student question: {clean_query}\n\n"
+                    f"Information from the BNU database:\n"
+                    + "\n\n---\n\n".join(non_planning_ctxs)
+                    + "\n\nAnswer only the non-planning part of the question."
+                ),
+            )
+            return f"{other_answer}\n\n---\n\n{planning_output}"
+        # Only planning context — return it directly
+        return planning_output
+
+    if verbose:
+        _box("✅  ANSWER NODE  →  generating final response", [], force=True)
+
+    # One final synthesis from all collected context
+    combined = "\n\n---\n\n".join(all_contexts)
+    return llm_call_text(
+        system=(
+            "You are the BNU Academic Advisor. "
+            "Write a clear, helpful answer to the student's question using ONLY the "
+            "provided database context. "
+            "Match answer length to the question: short for simple queries, detailed "
+            "for complex ones. "
+            "Use **bold** for key terms, bullet points for lists. "
+            "Do NOT cite article numbers, source names, or tool names. "
+            "If the context is insufficient, say so and suggest the student contact "
+            "the registrar's office."
+        ),
+        user=(
+            f"Student question: {clean_query}\n\n"
+            f"Information from the BNU database:\n{combined}\n\n"
+            "Answer the question clearly and concisely based on the information above."
+        ),
+    )
 
 
 def _advance_planning(student_id: str, reply: str, state: Any) -> str:
@@ -339,15 +535,18 @@ def _advance_planning(student_id: str, reply: str, state: Any) -> str:
 # still wiring up the multi-turn planning lifecycle correctly.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _start_and_cache_planning(student_id: str) -> str:
+def _start_and_cache_planning() -> str:
     """
     Start a PlanningOrchestrator session, cache the state, return first message.
     This replaces the default start_course_planning tool implementation.
+    Student ID is read from tools._ACTIVE_STUDENT_ID (same as all other tools).
     """
     try:
         from planning_service import PlanningOrchestrator, PlanStep
         from chatbot_connector import ChatbotConnector
+        import tools as _tools
 
+        student_id               = _tools._get_student_id()
         supabase_client          = ChatbotConnector().client
         first_message, state     = PlanningOrchestrator.start(student_id, supabase_client)
 

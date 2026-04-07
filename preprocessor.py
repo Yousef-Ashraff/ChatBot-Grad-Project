@@ -206,6 +206,7 @@ class PendingAmbiguity:
     ambiguous_term:   str                    # the term the student typed, e.g. "soft"
     candidates:       List[Dict]             # [{name, code, confidence}, ...]
     resolved_courses: Dict[str, str]         # already-resolved course mappings so far
+    pending_courses:  Dict[str, str]         # remaining courses not yet mapped (original→deduped)
     resolved_tracks:  Dict[str, str]         # already-resolved track mappings
     history:          List[Dict]             # conversation history at time of query
 
@@ -213,10 +214,11 @@ class PendingAmbiguity:
 @dataclass
 class PreprocessResult:
     """Return value of QueryPreprocessor.process()."""
-    status:        str                       # "ready" | "ambiguous" | "passthrough"
-    clean_query:   str          = ""         # fully resolved query (when ready/passthrough)
-    clarification: str          = ""         # question to show student (when ambiguous)
-    pending:       Optional[PendingAmbiguity] = None
+    status:           str                       # "ready" | "ambiguous" | "passthrough"
+    clean_query:      str          = ""         # fully resolved query (when ready/passthrough)
+    clarification:    str          = ""         # question to show student (when ambiguous)
+    pending:          Optional[PendingAmbiguity] = None
+    resolved_courses: Dict[str, str] = field(default_factory=dict)  # original → canonical
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -458,12 +460,18 @@ class QueryPreprocessor:
                     )
                 box("📝  STEP 3 — Course Mapping", course_debug_lines)
 
+                # Collect courses after this one in iteration order
+                items_list  = list(course_orig_to_dedup.items())
+                cur_idx     = list(course_orig_to_dedup.keys()).index(original)
+                remaining   = dict(items_list[cur_idx + 1:])
+
                 pending       = PendingAmbiguity(
                     original_query   = query,
                     dereferenced     = resolved,        # use resolved version
                     ambiguous_term   = original,        # ORIGINAL term
                     candidates       = result["candidates"],
                     resolved_courses = resolved_courses,
+                    pending_courses  = remaining,
                     resolved_tracks  = {},
                     history          = history,
                 )
@@ -552,7 +560,7 @@ class QueryPreprocessor:
             [f"Original : {query}", f"Clean    : {clean}"],
         )
 
-        return PreprocessResult(status="ready", clean_query=clean)
+        return PreprocessResult(status="ready", clean_query=clean, resolved_courses=resolved_courses)
 
     def resolve_ambiguity(
         self,
@@ -581,6 +589,34 @@ class QueryPreprocessor:
         # Merge chosen course (key = ORIGINAL ambiguous term)
         all_courses = dict(pending.resolved_courses)
         all_courses[pending.ambiguous_term] = chosen
+
+        # Process remaining courses that were skipped when this ambiguity was hit
+        for rem_orig, rem_deduped in pending.pending_courses.items():
+            rem_result = self._map_course(rem_deduped)
+            if rem_result["status"] == "resolved":
+                all_courses[rem_orig] = rem_result["canonical"]
+            elif rem_result["status"] == "ambiguous":
+                # Chain: another course is ambiguous — ask the student again
+                rem_items   = list(pending.pending_courses.items())
+                rem_idx     = list(pending.pending_courses.keys()).index(rem_orig)
+                next_rem    = dict(rem_items[rem_idx + 1:])
+                new_pending = PendingAmbiguity(
+                    original_query   = pending.original_query,
+                    dereferenced     = pending.dereferenced,
+                    ambiguous_term   = rem_orig,
+                    candidates       = rem_result["candidates"],
+                    resolved_courses = all_courses,
+                    pending_courses  = next_rem,
+                    resolved_tracks  = {},
+                    history          = pending.history,
+                )
+                clarification = self._build_clarification(rem_orig, rem_result["candidates"])
+                return PreprocessResult(
+                    status        = "ambiguous",
+                    clarification = clarification,
+                    pending       = new_pending,
+                )
+            # else "not_found": leave it for the agent to handle
 
         # Re-run track mapping on the original query
         _, raw_tracks = self._extract_entities(pending.original_query)
@@ -617,7 +653,7 @@ class QueryPreprocessor:
             ],
         )
 
-        return PreprocessResult(status="ready", clean_query=clean)
+        return PreprocessResult(status="ready", clean_query=clean, resolved_courses=all_courses)
 
     # ── Step 1: Reference resolution ─────────────────────────────────────
 
@@ -989,11 +1025,15 @@ Examples:
             pattern = re.compile(re.escape(term), re.IGNORECASE)
             result  = pattern.sub(canonical, result)
 
-        # If the result still contains an unresolved original term, use LLM
-        # (handles partial matches like "soft eng" -> "software engineering")
+        # Fall back to LLM if any canonical name is missing from the result.
+        # This handles two failure modes:
+        #   1. Partial matches: "soft eng" → "software engineering" (original still in result)
+        #   2. Implied terms: "training 1 and 2" → entity "training 2" never existed as a
+        #      literal substring, so regex substitution silently did nothing.
         still_unreplaced = any(
-            term.lower() in result.lower() and term.lower() != canonical.lower()
+            canonical.lower() not in result.lower()
             for term, canonical in all_replacements.items()
+            if term.lower() != canonical.lower()
         )
         if still_unreplaced:
             result = self._llm_rewrite(query, all_replacements)

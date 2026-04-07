@@ -402,12 +402,14 @@ def _make_judge_node():
                 or "Could not start course planning" in full_planning_ctx
             )
             logger.warning("[Judge] planning_failed=%s", planning_failed)
-            if not planning_failed:
-                return {
-                    "satisfied":             True,
-                    "judge_missing":         "",
-                    "judge_tools_this_round": tools_used,
-                }
+            # Always short-circuit when planning was called — whether it
+            # succeeded or failed, the planning output IS the answer.
+            # Falling through would waste tool rounds on an unrelated LLM judge.
+            return {
+                "satisfied":             True,
+                "judge_missing":         "",
+                "judge_tools_this_round": tools_used,
+            }
 
 
         context = "\n\n---\n\n".join(accum_ctx) if accum_ctx else "(no data collected yet)"
@@ -1122,6 +1124,89 @@ class BNUAdvisorAgent:
                 "Please try again in a moment."
             )
 
+    def run_and_get_context(
+        self,
+        query:   str,
+        history: Optional[List[Dict]] = None,
+        verbose: bool = False,
+    ) -> List[str]:
+        """
+        Run the full judging loop for one sub-query and return the
+        accumulated tool context (list of raw tool-result strings) WITHOUT
+        generating a final answer text.
+
+        Used by chatbot_api._split_and_run() to collect context from
+        multiple sub-queries before synthesising one combined answer.
+        """
+        history = history or []
+        history_slice = history[-6:]
+
+        messages: List[BaseMessage] = []
+        for turn in history_slice:
+            role    = turn.get("role", "")
+            content = turn.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+        messages.append(HumanMessage(content=query))
+
+        initial_state: AgentState = {
+            "messages":                messages,
+            "accumulated_context":     [],
+            "called_tools":            [],
+            "previous_reformulations": [],
+            "tool_calls_this_round":   0,
+            "query_reformulations":    0,
+            "original_query":          query,
+            "current_query":           query,
+            "satisfied":               False,
+            "judge_missing":           "",
+            "judge_tools_this_round":  0,
+        }
+
+        run_config = {
+            "configurable": {"student_id": self.student_id},
+            "recursion_limit": (
+                (MAX_REFORMULATIONS + 1) * MAX_TOOL_CALLS_PER_ROUND * 6
+                + MAX_REFORMULATIONS + 10
+            ),
+        }
+
+        app = _get_app()
+        from tools import set_active_student_id
+        set_active_student_id(self.student_id)
+
+        try:
+            if verbose:
+                # Stream and print debug boxes for tool-selection/judging nodes,
+                # but SKIP the answer/clarify nodes — a single combined answer
+                # will be synthesised from all sub-query contexts after the loop.
+                _SKIP_IN_SUBQUERY = {"answer", "clarify"}
+                all_context: List[str] = []
+                for event in app.stream(
+                    initial_state, config=run_config, stream_mode="updates"
+                ):
+                    for node_name, node_output in event.items():
+                        if node_name not in _SKIP_IN_SUBQUERY:
+                            _print_step(
+                                node_name,
+                                node_output,
+                                original_query=query,
+                                verbose=True,
+                            )
+                        if node_name == "collect":
+                            all_context.extend(
+                                node_output.get("accumulated_context", [])
+                            )
+                return all_context
+            else:
+                final_state = app.invoke(initial_state, config=run_config)
+                return final_state.get("accumulated_context", [])
+        except Exception as exc:
+            logger.error("run_and_get_context error: %s", exc, exc_info=True)
+            return []
+
     # ── Execution modes ───────────────────────────────────────────────────
 
     def _run_blocking(self, app, initial_state, config) -> str:
@@ -1239,6 +1324,14 @@ if __name__ == "__main__":
     session_history: List[Dict] = []
     pending_ambiguity = None
 
+    # Import planning session routing (monkey-patch applied on chatbot_api import)
+    try:
+        import chatbot_api as _chatbot_api
+        from planning_service import PlanningOrchestrator, PlanStep
+        _planning_available = True
+    except Exception:
+        _planning_available = False
+
     print()
     print("=" * 60)
     print("  🎓  BNU Academic Advisor  (LangGraph  ·  Judging Loop)")
@@ -1280,29 +1373,56 @@ if __name__ == "__main__":
             break
 
         try:
-            from preprocessor import get_preprocessor
-            pre = get_preprocessor()
-
-            # ── Resolve pending ambiguity ─────────────────────────────────
-            if pending_ambiguity is not None:
-                result          = pre.resolve_ambiguity(pending_ambiguity, user_input)
-                pending_ambiguity = None
+            # ── Route to active planning session first ────────────────────
+            if (
+                _planning_available
+                and student_id in _chatbot_api._planning_sessions
+            ):
+                state = _chatbot_api._planning_sessions[student_id]
+                response, state = PlanningOrchestrator.advance(state, user_input)
+                if state.current_step == PlanStep.COMPLETE:
+                    del _chatbot_api._planning_sessions[student_id]
             else:
-                result = pre.process(user_input, session_history)
+                from preprocessor import get_preprocessor
+                pre = get_preprocessor()
 
-            # ── Route based on preprocessor outcome ──────────────────────
-            if result.status == "ambiguous":
-                pending_ambiguity = result.pending
-                response          = result.clarification
-            else:
-                clean_query = result.clean_query or user_input
-                if args.verbose:
-                    print()   # blank line before agent boxes
-                response = agent.run(
-                    query   = clean_query,
-                    history = session_history,
-                    verbose = args.verbose,
-                )
+                # ── Resolve pending ambiguity ─────────────────────────────
+                if pending_ambiguity is not None:
+                    result          = pre.resolve_ambiguity(pending_ambiguity, user_input)
+                    pending_ambiguity = None
+                else:
+                    result = pre.process(user_input, session_history)
+
+                # ── Route based on preprocessor outcome ──────────────────
+                if result.status == "ambiguous":
+                    pending_ambiguity = result.pending
+                    response          = result.clarification
+                else:
+                    clean_query = result.clean_query or user_input
+                    if args.verbose:
+                        print()   # blank line before agent boxes
+
+                    # Decompose into sub-queries if the query asks about
+                    # multiple independent topics (two courses, course + bylaw, etc.)
+                    split_done = False
+                    if _planning_available:
+                        sub_queries = _chatbot_api._analyze_and_split(clean_query)
+                        if len(sub_queries) > 1:
+                            response   = _chatbot_api._split_and_run(
+                                student_id  = student_id,
+                                clean_query = clean_query,
+                                sub_queries = sub_queries,
+                                history     = session_history,
+                                verbose     = args.verbose,
+                            )
+                            split_done = True
+
+                    if not split_done:
+                        response = agent.run(
+                            query   = clean_query,
+                            history = session_history,
+                            verbose = args.verbose,
+                        )
 
         except Exception as exc:
             pending_ambiguity = None   # clear stale state on error
