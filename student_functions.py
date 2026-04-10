@@ -3,6 +3,7 @@ Student-related functions that interact with Supabase backend
 """
 
 from chatbot_connector import ChatbotConnector
+from eligibility import TRACK_MAP as _TRACK_MAP
 import os
 
 def get_student_details(student_id = os.getenv("STUDENT_ID")):
@@ -32,7 +33,8 @@ def get_student_details(student_id = os.getenv("STUDENT_ID")):
                 # ── Identity fields (name, track) ─────────────────────────
                 "first_name":        student_data.get("first_name", "")        if student_data else "",
                 "last_name":         student_data.get("last_name",  "")        if student_data else "",
-                "track":             student_data.get("track",      "")        if student_data else "",
+                "track":             _TRACK_MAP.get((student_data.get("track") or "").strip().upper(),
+                                               student_data.get("track", "")) if student_data else "",
                 "university_year":   student_data.get("university_year", None) if student_data else None,
                 # ── Academic progress fields ──────────────────────────────
                 "gpa":               academic_details.get("gpa",               0.0),

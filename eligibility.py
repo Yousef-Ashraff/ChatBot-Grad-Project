@@ -39,10 +39,18 @@ logger = logging.getLogger(__name__)
 # ── Program code → canonical Neo4j name ──────────────────────────────────────
 
 TRACK_MAP: Dict[str, str] = {
-    "SAD": "software and application development",
-    "AIM": "artificial intelligence and machine learning",
-    "DS":  "data science",
+    "SAD": "software & application development",
+    "AIM": "artificial intelligence & machine learning",
+    "DAS": "data science",
 }
+
+
+def _norm(name: str) -> str:
+    """Normalize course name for comparison: canonical form uses '&'.
+    Handles OCR/Supabase data that may store either ' and ' or ' & '.
+    Safe: requires spaces on both sides so words like 'understanding' are unaffected.
+    """
+    return name.replace(" and ", " & ")
 
 
 # ── Supabase client (lazy singleton) ─────────────────────────────────────────
@@ -126,7 +134,7 @@ def get_student_context(student_id: str) -> dict:
     courses_degrees = row.get("courses_degrees") or []
 
     completed_courses = [
-        course["name"].lower()
+        _norm(course["name"].lower())
         for course in courses_degrees
         if isinstance(course, dict) and course.get("name")
     ]

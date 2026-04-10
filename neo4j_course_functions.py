@@ -97,7 +97,6 @@ def normalize_semester(semester):
         return None
     key = semester if isinstance(semester, int) else semester.lower().strip()
     normalized = SEMESTER_MAP.get(key)
-    print(normalized)
     if not normalized:
         raise ValueError(f"Invalid semester: '{semester}'. Use 1/2 or 'First'/'Second'.")
     return normalized
@@ -132,8 +131,8 @@ def get_courses_by_term(level, semester=None, program_name=None):
     # Handle program filter
     if program_name is None:
         program_names = [
-            'artificial intelligence and machine learning',
-            'software and application development',
+            'artificial intelligence & machine learning',
+            'software & application development',
             'data science'
         ]
     elif isinstance(program_name, str):
@@ -304,8 +303,8 @@ def get_course_dependencies(course_name, program_name=None):
     if course_name == 'graduation project (1)':
         return {
             "prerequisites": [{'Required_Credit_Hours': '100',
-                'tracks': ['software and application development',
-                   'artificial intelligence and machine learning',
+                'tracks': ['software & application development',
+                   'artificial intelligence & machine learning',
                    'data science']}],
             "dependents": get_course_closes(course_name)
         }
@@ -313,8 +312,8 @@ def get_course_dependencies(course_name, program_name=None):
     elif course_name == 'field training (1)':
         return {
             "prerequisites": [{'Required_Credit_Hours': '60',
-                'tracks': ['software and application development',
-                   'artificial intelligence and machine learning',
+                'tracks': ['software & application development',
+                   'artificial intelligence & machine learning',
                    'data science']}],
             "dependents": []
         }
@@ -322,8 +321,8 @@ def get_course_dependencies(course_name, program_name=None):
     elif course_name == 'field training (2)':
         return {
             "prerequisites": [{'Required_Credit_Hours': '90',
-                'tracks': ['software and application development',
-                   'artificial intelligence and machine learning',
+                'tracks': ['software & application development',
+                   'artificial intelligence & machine learning',
                    'data science']}],
             "dependents": []
         }
@@ -493,7 +492,7 @@ def get_course_closes(course_name, program_name=None):
     # Convert to lowercase to match the KG format
     course_name = course_name.lower()
     if program_name is None:
-        program_name = ['artificial intelligence and machine learning','software and application development', 'data science']
+        program_name = ['artificial intelligence & machine learning','software & application development', 'data science']
     # Handle both string and list inputs
     if isinstance(program_name, str):
         program_names = [program_name.lower()]
@@ -660,7 +659,7 @@ def get_course_timing(course_name, program_name=None):
         for offering in info['program_offerings']:
             if offering['program']:  # Only include if program is not None
                 if offering['course_type'] == 'yes':
-                    if offering['program'] == 'data science' or offering['program'] == 'software and application development':
+                    if offering['program'] == 'data science' or offering['program'] == 'software & application development':
                           offering['semester'] =  ', '.join(sad_das_elective_slots)
                     else:
                         offering['semester'] = ', '.join(ai_elective_slots)
@@ -691,9 +690,9 @@ def get_elective_slots_time(program_name=None):
     # Define elective slots for each program
     ['Third Year / Second Sem', 'Fourth Year / First Sem', 'Fourth Year / Second Sem']
     elective_slots = {
-        'software and application development':['Third Year / Second Sem', 'Fourth Year / First Sem', 'Fourth Year / Second Sem'],
+        'software & application development':['Third Year / Second Sem', 'Fourth Year / First Sem', 'Fourth Year / Second Sem'],
         'data science':['Third Year / Second Sem', 'Fourth Year / First Sem', 'Fourth Year / Second Sem'],
-        'artificial intelligence and machine learning':['Fourth Year / First Sem', 'Fourth Year / Second Sem']
+        'artificial intelligence & machine learning':['Fourth Year / First Sem', 'Fourth Year / Second Sem']
     }
 
     # If no program specified, return all
@@ -733,8 +732,8 @@ def get_all_electives_by_program(program_name=None):
     """
     # Handle program filter
     if program_name is None:
-        program_names = ['artificial intelligence and machine learning',
-                        'software and application development',
+        program_names = ['artificial intelligence & machine learning',
+                        'software & application development',
                         'data science']
     elif isinstance(program_name, str):
         program_names = [program_name.lower()]
@@ -750,7 +749,7 @@ def get_all_electives_by_program(program_name=None):
         WHERE r.elective = 'yes'
         RETURN
             c.name AS course_name,
-            c.code AS course_code
+            c.code AS course_code,
             c.description AS description,
             c.credit_hours AS credit_hours
         ORDER BY c.code
@@ -899,8 +898,8 @@ def filter_courses(filters=None, course_types=None, return_fields=None, program_
     # Default programs
     if program_name is None:
         program_names = [
-            'artificial intelligence and machine learning',
-            'software and application development',
+            'artificial intelligence & machine learning',
+            'software & application development',
             'data science',
         ]
     elif isinstance(program_name, str):
@@ -980,6 +979,86 @@ def filter_courses(filters=None, course_types=None, return_fields=None, program_
 
     full_query = "\n".join(query_parts)
     return run_cypher_query(full_query, params)
+
+
+def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True) -> dict:
+    """
+    Get comprehensive information about a specific program/track.
+
+    Args:
+        prg:         Program name or alias (e.g. "AIM", "data science", "SAD").
+        course_info: If True, include curriculum data:
+                     - Core + elective courses for years 3 and 4 (from Neo4j)
+                     - Hardcoded year-1/2 courses that differ between tracks
+                     - Elective slot schedule
+                     - Full elective catalogue
+        desc_info:   Reserved for future use (description/program overview).
+
+    Returns:
+        Dict with keys populated based on the flags set.
+    """
+
+    
+    if prg is None:
+        return {"error": f"Unknown program: '{prg}'. Use 'AIM', 'SAD', or 'data science'."}
+
+    result: dict = {"program": prg}
+
+    # ── Course information ────────────────────────────────────────────────────
+    if course_info:
+        # Year 3 + 4 courses from the knowledge graph
+        terms_3_4 = [
+            {"level": 3, "semester": 1},
+            {"level": 3, "semester": 2},
+            {"level": 4, "semester": 1},
+            {"level": 4, "semester": 2},
+        ]
+        curriculum_3_4 = get_courses_by_multiple_terms(terms_3_4, program_name=prg)
+
+        # Hardcoded year-1/2 courses that differ between programs.
+        # All programs share the same year-1 and year-2 curriculum EXCEPT:
+        #   • "data science" has "fundamentals of data science"
+        #     which is absent from AIM and SAD.
+        #   • AIM and SAD have "technical report writing"
+        #     which is absent from data science.
+        UNIQUE_YEAR12_COURSES: dict[str, list[dict]] = {
+            "artificial intelligence & machine learning": [
+                {
+                    "course_name": "technical report writing",
+                    "note": "present in AIM and SAD only (not in data science)",
+                }
+            ],
+            "software & application development": [
+                {
+                    "course_name": "technical report writing",
+                    "note": "present in AIM and SAD only (not in data science)",
+                }
+            ],
+            "data science": [
+                {
+                    "course_name": "fundamentals of data science",
+                    "note": "present in data science only (not in AIM or SAD)",
+                }
+            ],
+        }
+
+        result["curriculum"] = {
+            "years_3_and_4": curriculum_3_4,
+            "unique_year_1_2_courses": UNIQUE_YEAR12_COURSES.get(prg, []),
+        }
+
+        # Elective slot schedule
+        result["elective_slots"] = get_elective_slots_time(prg)
+
+        # Full elective catalogue
+        result["electives"] = get_all_electives_by_program(prg)
+
+    # ── Description / program overview (reserved) ─────────────────────────────
+    if desc_info:
+        # Placeholder — will be implemented in a future iteration.
+        result["desc_info"] = None
+
+    return result
 
 
 def interactive_eligibility_check(course_name, program_name=None, student_id=os.getenv("STUDENT_ID")):

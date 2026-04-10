@@ -185,8 +185,8 @@ def get_course_prerequisites(
     Args:
         course_name:  Course name or abbreviation. Fuzzy matching is applied.
         program_name: Student's program/track (optional). Improves accuracy.
-                      E.g. "artificial intelligence and machine learning",
-                      "software and application development", "data science".
+                      E.g. "artificial intelligence & machine learning",
+                      "software & application development", "data science".
     """
     try:
         from neo4j_course_functions import get_course_dependencies
@@ -348,7 +348,7 @@ def get_all_electives(program_name: str) -> str:
 
     Args:
         program_name: The student's program/track. E.g. "artificial
-                      intelligence and machine learning", "software and
+                      intelligence & machine learning", "software &
                       application development", "data science".
     """
     try:

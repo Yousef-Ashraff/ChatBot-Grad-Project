@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
+from eligibility import TRACK_MAP as _TRACK_MAP
 
 load_dotenv()
 
@@ -155,7 +156,8 @@ def get_student_info(student_id: str) -> Dict[str, Any]:
             "student_id":        student_id,
             "first_name":        student.get("first_name",       ""),
             "last_name":         student.get("last_name",        ""),
-            "track":             student.get("track",            ""),
+            "track":             _TRACK_MAP.get((student.get("track") or "").strip().upper(),
+                                             student.get("track", "")),
             "university_year":   student.get("university_year",  0),
             "gpa":               academic.get("gpa",             0.0),
             "earned_credits":    academic.get("earned_credits",  0),
@@ -251,9 +253,22 @@ def _preprocess_and_run(
     On the student's next message, _resolve_ambiguity_reply() picks up.
     """
     from preprocessor import get_preprocessor
+    from chatbot_connector import ChatbotConnector
 
-    pre   = get_preprocessor()
-    result = pre.process(message, history)
+    # Fetch the student's enrolled track so the preprocessor can use it as
+    # a secondary hint when resolving track-vs-course conflicts.
+    student_track: Optional[str] = None
+    try:
+        student_data  = ChatbotConnector().get_student_data(student_id)
+        if student_data:
+            student_track = _TRACK_MAP.get(
+                (student_data.get("track") or "").strip().upper(), None
+            )
+    except Exception:
+        pass  # heuristic only — safe to skip on error
+
+    pre    = get_preprocessor()
+    result = pre.process(message, history, student_track=student_track)
 
     if result.status == "ambiguous":
         # Store the pending state and ask the student to clarify
@@ -331,24 +346,44 @@ def _analyze_and_split(clean_query: str) -> List[str]:
             ),
             prompt=(
                 "Decompose the query below into atomic sub-queries.\n\n"
-                "Rules:\n"
+                "RULES:\n"
                 "  1. N courses, no specific program  → N sub-queries (one per course)\n"
                 "  2. 1 course × M programs           → M sub-queries (one per program)\n"
                 "  3. N courses × M programs          → N×M sub-queries (cartesian product)\n"
                 "  4. Independent questions (course + bylaw, etc.) → one sub-query each\n"
                 "  5. Already atomic (1 course, 1 program, or no entities) → return as-is\n\n"
+                "OUTPUT RULES (STRICT):\n"
+                "  • Copy words EXACTLY from the input — do NOT rephrase, reformat, or change anything.\n"
+                "  • NEVER convert 'and' to '&' or '&' to 'and' in output.\n"
+                "  • NEVER merge two separate items into one.\n\n"
+                "PROGRAM NAME PROTECTION:\n"
+                "The three canonical program names contain '&' and must NEVER be split:\n"
+                "  • artificial intelligence & machine learning\n"
+                "  • software & application development\n"
+                "  • data science\n"
+                "ONLY treat a phrase as a program name when the query is clearly about the program/track itself\n"
+                "(contains words like: track, program, major, curriculum, electives in, courses in).\n"
+                "When the query is about individual COURSES, treat each course name independently.\n\n"
                 "Examples:\n"
+                '  "what is artificial intelligence and machine learning"\n'
+                '  → ["what is artificial intelligence", "what is machine learning"]\n\n'
                 '  "when can I take field training (1) and field training (2)?"\n'
                 '  → ["when can I take field training (1)?",\n'
                 '     "when can I take field training (2)?"]\n\n'
-                '  "when can I take ML at AI and SAD?"\n'
-                '  → ["when can I take ML at AI?",\n'
-                '     "when can I take ML at SAD?"]\n\n'
-                '  "when can I take NLP and image processing at AI and SAD?"\n'
-                '  → ["when can I take NLP at AI?",\n'
-                '     "when can I take NLP at SAD?",\n'
-                '     "when can I take image processing at AI?",\n'
-                '     "when can I take image processing at SAD?"]\n\n'
+                '  "what courses are in artificial intelligence & machine learning track?"\n'
+                '  → ["what courses are in artificial intelligence & machine learning track?"]\n\n'
+                '  "when can I take ML at artificial intelligence & machine learning and software & application development?"\n'
+                '  → ["when can I take ML at artificial intelligence & machine learning?",\n'
+                '     "when can I take ML at software & application development?"]\n\n'
+                '  "when can I take NLP and image processing at artificial intelligence & machine learning and software & application development?"\n'
+                '  → ["when can I take NLP at artificial intelligence & machine learning?",\n'
+                '     "when can I take NLP at software & application development?",\n'
+                '     "when can I take image processing at artificial intelligence & machine learning?",\n'
+                '     "when can I take image processing at software & application development?"]\n\n'
+                '  "compare artificial intelligence & machine learning and software & application development and data science"\n'
+                '  → ["what is artificial intelligence & machine learning",\n'
+                '     "what is software & application development",\n'
+                '     "what is data science"]\n\n'
                 '  "what are ML prerequisites and what is the graduation GPA?"\n'
                 '  → ["what are the prerequisites for ML?",\n'
                 '     "what is the graduation GPA requirement?"]\n\n'
@@ -357,12 +392,15 @@ def _analyze_and_split(clean_query: str) -> List[str]:
                 'Return JSON only: {"sub_queries": ["..."]}'
             ),
         )
-        # llm_call_json returns a raw string — extract the JSON object robustly
+        # llm_call_json returns a raw string — extract the JSON object robustly.
+        # Use raw_decode so we stop at the first complete JSON object and ignore
+        # any trailing text (extra objects, explanatory notes, etc.).
         raw = raw.strip()
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if not match:
+        # Find the first '{' to start decoding from
+        brace = raw.find('{')
+        if brace == -1:
             raise ValueError(f"No JSON object found in LLM response: {raw!r}")
-        data = json.loads(match.group(0))
+        data, _ = json.JSONDecoder().raw_decode(raw, brace)
         sub_queries = [q.strip() for q in data.get("sub_queries", []) if q.strip()]
 
         from debug_box import box as _box

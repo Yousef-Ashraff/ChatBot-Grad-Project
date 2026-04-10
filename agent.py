@@ -430,6 +430,11 @@ def _make_judge_node():
             f'2. satisfied = false ONLY if the key data is completely absent or wrong.\n'
             f'3. Tool errors and missing student_id do NOT make satisfied = false '
             f'   if other results already answer the query.\n'
+            f'4. MULTI-ENTITY RULE: If the query mentions N courses or N programs, '
+            f'   satisfied = true ONLY when data for ALL N entities is present. '
+            f'   Count each entity in the query and verify each one appears in the '
+            f'   collected data. If even one is missing, set satisfied = false and '
+            f'   name the missing entity in "missing".\n'
             f'\n'
             f'Respond with ONLY valid JSON, nothing else:\n'
             f'{{"satisfied": true}}  OR  '
@@ -549,6 +554,7 @@ def _make_reformulate_node():
         accum_ctx             = state.get("accumulated_context", [])
         reformulations        = state.get("query_reformulations", 0)
         previous_reforms      = state.get("previous_reformulations", [])
+        judge_missing         = state.get("judge_missing", "").strip()
 
         # All queries tried so far (original + every previous reformulation)
         all_tried_set = {q.lower().strip() for q in [original_query] + list(previous_reforms)}
@@ -561,15 +567,27 @@ def _make_reformulate_node():
             for c in accum_ctx[:3]
         ) or "  (none)"
 
-        # Pick the next unused angle from the fixed list
-        # This guarantees variety even if the LLM ignores the instruction
-        next_angle = None
-        for angle in reformulate_node._ANGLES:
-            if not any(angle.split()[0] in tried.lower() for tried in all_tried):
-                next_angle = angle
-                break
-        if next_angle is None:
-            next_angle = "provide any information available about this topic"
+        # If the judge told us what is missing, use that directly as the angle.
+        # Otherwise fall back to the fixed angle list.
+        if judge_missing:
+            next_angle = judge_missing
+        else:
+            # Pick the next unused angle from the fixed list
+            # This guarantees variety even if the LLM ignores the instruction
+            next_angle = None
+            for angle in reformulate_node._ANGLES:
+                if not any(angle.split()[0] in tried.lower() for tried in all_tried):
+                    next_angle = angle
+                    break
+            if next_angle is None:
+                next_angle = "provide any information available about this topic"
+
+        # Label the angle source for clarity in the prompt
+        angle_label = (
+            "What the judge says is still missing (focus on THIS):"
+            if judge_missing
+            else "Suggested new angle to explore:"
+        )
 
         prompt = (
             "The student's original query (already reference-resolved): \n"
@@ -578,8 +596,8 @@ def _make_reformulate_node():
             f"{tried_block}\n\n"
             "Context collected so far (to understand what is already known):\n"
             f"{ctx_summary}\n\n"
-            f"Suggested new angle to explore: {next_angle}\n\n"
-            "Rewrite the original query to focus on this new angle.\n"
+            f"{angle_label} {next_angle}\n\n"
+            "Rewrite the original query to directly target the missing information above.\n"
             "Return ONLY the rewritten query as one plain sentence."
         )
 
@@ -709,6 +727,7 @@ def _print_step(
     node_output:    dict,
     original_query: str = "",
     verbose:        bool = True,
+    state:          dict = None,
 ) -> None:
     """
     Print a debug box for one graph node execution.
@@ -716,6 +735,9 @@ def _print_step(
     node_output is the raw state delta returned by the node (not the full
     accumulated state), so accumulated_context contains only the NEW items
     added in this step, and integers reflect the updated values.
+
+    state (optional) is the full accumulated state — used by nodes that need
+    fields set by a prior node (e.g. reformulate reading judge_missing).
     """
     if not verbose:
         return
@@ -799,10 +821,13 @@ def _print_step(
     elif node_name == "reformulate":
         new_query      = node_output.get("current_query", "?")
         reformulations = node_output.get("query_reformulations", 0)
-        prev_list      = node_output.get("previous_reformulations", [])
+        # Read judge_missing from state (not node_output — reformulate doesn't echo it)
+        judge_missing_val = state.get("judge_missing", "") if state else ""
         body = [f"Original     : {original_query}"]
         if reformulations > 1:
             body.append(f"Previous     : (see above attempts)")
+        if judge_missing_val:
+            body.append(f"Judge said   : {judge_missing_val}")
         body.append(f"New query    : {new_query}")
         _box(
             f"🔄  REFORMULATION  (attempt {reformulations} / {MAX_REFORMULATIONS})",
@@ -1184,16 +1209,20 @@ class BNUAdvisorAgent:
                 # will be synthesised from all sub-query contexts after the loop.
                 _SKIP_IN_SUBQUERY = {"answer", "clarify"}
                 all_context: List[str] = []
+                _last_judge_missing = ""
                 for event in app.stream(
                     initial_state, config=run_config, stream_mode="updates"
                 ):
                     for node_name, node_output in event.items():
+                        if node_name == "judge":
+                            _last_judge_missing = node_output.get("judge_missing", "")
                         if node_name not in _SKIP_IN_SUBQUERY:
                             _print_step(
                                 node_name,
                                 node_output,
                                 original_query=query,
                                 verbose=True,
+                                state={"judge_missing": _last_judge_missing},
                             )
                         if node_name == "collect":
                             all_context.extend(
@@ -1225,6 +1254,7 @@ class BNUAdvisorAgent:
           - node_output["tool_calls_this_round"] = current total value
         """
         last_ai_answer = None
+        _last_judge_missing = ""
 
         for event in app.stream(
             initial_state,
@@ -1234,12 +1264,17 @@ class BNUAdvisorAgent:
             for node_name, node_output in event.items():
                 new_messages = node_output.get("messages", [])
 
+                # Track judge_missing so reformulate debug box can show it
+                if node_name == "judge":
+                    _last_judge_missing = node_output.get("judge_missing", "")
+
                 # Print debug box for this node
                 _print_step(
                     node_name,
                     node_output,
                     original_query=original_query,
                     verbose=True,
+                    state={"judge_missing": _last_judge_missing},
                 )
 
                 # Capture the final AI answer (from answer or clarify nodes)

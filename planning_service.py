@@ -291,7 +291,7 @@ class PlanningOrchestrator:
             _register_input_handler(tid, handle_input)
 
             try:
-                result = planning(student_id)
+                result = planning(student_id, supabase_client)
                 buffered = router.flush_buffer(tid)
                 state.result = result
                 state.current_step = PlanStep.COMPLETE
