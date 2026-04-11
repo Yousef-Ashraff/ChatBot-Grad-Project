@@ -981,6 +981,29 @@ def filter_courses(filters=None, course_types=None, return_fields=None, program_
     return run_cypher_query(full_query, params)
 
 
+def get_credit_hour_distribution() -> dict:
+    """
+    Return the faculty-wide credit hour distribution shared by all programs.
+
+    This breakdown is identical across all three tracks (AIM, SAD, Data Science).
+    Call this function once when credit distribution info is needed — do NOT
+    call it once per program as it is program-agnostic.
+
+    Returns:
+        Dict with category → credit hours mapping and a total.
+    """
+    return {
+        "distribution": {
+            "humanities": 12,
+            "mathematics and basic sciences": 24,
+            "basic computing sciences": 36,
+            "applied / specialized courses": 51,
+            "field training": 6,
+            "graduation projects": 7,
+        }
+    }
+
+
 def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True) -> dict:
     """
     Get comprehensive information about a specific program/track.
@@ -992,17 +1015,22 @@ def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True)
                      - Hardcoded year-1/2 courses that differ between tracks
                      - Elective slot schedule
                      - Full elective catalogue
-        desc_info:   Reserved for future use (description/program overview).
+        desc_info:   If True, fetch the program description from Neo4j.
 
     Returns:
         Dict with keys populated based on the flags set.
+        Always includes credit_hour_distribution (shared across all programs).
     """
 
     
     if prg is None:
-        return {"error": f"Unknown program: '{prg}'. Use 'AIM', 'SAD', or 'data science'."}
+        return {"error": "Program name must be provided. Use 'AIM', 'SAD', or 'data science'."}
 
-    result: dict = {"program": prg}
+
+    result: dict = {
+        "program": prg,
+        "credit_hour_distribution": get_credit_hour_distribution(),
+    }
 
     # ── Course information ────────────────────────────────────────────────────
     if course_info:
@@ -1021,7 +1049,7 @@ def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True)
         #     which is absent from AIM and SAD.
         #   • AIM and SAD have "technical report writing"
         #     which is absent from data science.
-        UNIQUE_YEAR12_COURSES: dict[str, list[dict]] = {
+        _UNIQUE_YEAR12: dict = {
             "artificial intelligence & machine learning": [
                 {
                     "course_name": "technical report writing",
@@ -1044,19 +1072,17 @@ def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True)
 
         result["curriculum"] = {
             "years_3_and_4": curriculum_3_4,
-            "unique_year_1_2_courses": UNIQUE_YEAR12_COURSES.get(prg, []),
+            "unique_year_1_2_courses": _UNIQUE_YEAR12.get(prg, []),
         }
 
-        # Elective slot schedule
         result["elective_slots"] = get_elective_slots_time(prg)
-
-        # Full elective catalogue
         result["electives"] = get_all_electives_by_program(prg)
 
-    # ── Description / program overview (reserved) ─────────────────────────────
+    # ── Description / program overview ───────────────────────────────────────
     if desc_info:
-        # Placeholder — will be implemented in a future iteration.
-        result["desc_info"] = None
+        query = "MATCH (p:Program {name: $program_name}) RETURN p.description AS description"
+        rows = run_cypher_query(query, {"program_name": prg})
+        result["description"] = rows[0]["description"] if rows else None
 
     return result
 

@@ -257,15 +257,17 @@ _COURSE_INTENT_PATTERNS: List[Tuple[str, float]] = [
 ]
 
 _TRACK_INTENT_PATTERNS: List[Tuple[str, float]] = [
-    (r"\b(tracks?|programs?|majors?)\b",         1.00),
-    (r"\belectives?\b",                         0.87),
-    (r"\bcurriculum\b",                         0.87),
-    (r"\bcourses?\s+in\b",                      0.87),
-    (r"\bstudents?\b",                          0.85),
-    (r"\bi'?m\s+(in|enrolled)\b",               0.85),
-    (r"\benrolled\s+in\b",                      0.85),
-    (r"\bgraduat",                              0.80),
-    (r"\bin\s+the\b",                           0.78),
+    (r"\b(tracks?|programs?|majors?)\b",                      1.00),
+    (r"\belectives?\b",                                       0.87),
+    (r"\bcurriculum\b",                                       0.87),
+    (r"\bcourses?\s+in\b",                                    0.87),
+    (r"\bcourses?\s+(?:\w+\s+){0,3}in\b",                     0.87),  # "courses are in", "courses offered in", "courses available in"
+    (r"\bcourses?\s+(?:\w+\s+){0,3}of\b",                    0.87),  # "courses of SAD", "courses part of"
+    (r"\bstudents?\b",                                        0.85),
+    (r"\bi'?m\s+(in|enrolled)\b",                             0.85),
+    (r"\benrolled\s+in\b",                                    0.85),
+    (r"\bgraduat",                                            0.80),
+    (r"\bin\s+the\b",                                         0.78),
 ]
 
 
@@ -649,14 +651,68 @@ class QueryPreprocessor:
             deduped = course_orig_to_dedup.pop(orig)
             track_orig_to_dedup[orig] = deduped
 
+        # ── Process terms resolved as "course" in Part B ──────────────────────
+        # Now that we know intent is "course", determine which course(s) the term
+        # refers to.  Three outcomes:
+        #   • 1 candidate  → auto-resolve (no question needed)
+        #   • N candidates → ask user which course they meant
+        #   • 0 candidates → fall back to Step 3 fuzzy mapping
+        step25_course_resolutions:  Dict[str, str]  = {}   # orig → canonical (single winner)
+        unresolved_courses: List[Tuple[str, str, List[Dict]]] = []  # (orig, deduped, candidates)
+
         for orig in to_move_to_course:
-            deduped = track_orig_to_dedup.pop(orig)
-            course_orig_to_dedup[orig] = deduped
+            ded = track_orig_to_dedup.pop(orig)
+            track_can, _ = self._map_track_with_method(ded)
+            candidates   = self._get_course_candidates(ded, track_can)
+
+            if len(candidates) == 1:
+                step25_course_resolutions[orig] = candidates[0]["name"]
+                conflict_debug.append(
+                    f'"{orig}"  →  auto-resolved course "{candidates[0]["name"]}"  [COURSE-AUTO]'
+                )
+            elif len(candidates) > 1:
+                unresolved_courses.append((orig, ded, candidates))
+                conflict_debug.append(
+                    f'"{orig}"  →  {len(candidates)} possible courses  [COURSE-AMBIGUOUS]'
+                )
+            else:
+                # No course found at all — let Step 3 handle it
+                course_orig_to_dedup[orig] = ded
 
         if conflict_debug:
             box("📝  STEP 2.5 — Track/Course Conflict", conflict_debug)
 
-        # Return ambiguity for the first unresolvable conflict
+        # ── Handle multi-course ambiguity (term resolved as "course" but many matches) ──
+        if unresolved_courses:
+            orig0, ded0, cands0 = unresolved_courses[0]
+            rest_courses = unresolved_courses[1:]
+
+            # Collect remaining course terms for chained processing
+            remaining_courses = {
+                orig: ded for orig, ded in course_orig_to_dedup.items()
+            }
+            # Add the other unresolved_courses terms to pending as well
+            for r_orig, r_ded, _ in rest_courses:
+                remaining_courses[r_orig] = r_ded
+
+            pending = PendingAmbiguity(
+                original_query   = query,
+                dereferenced     = resolved,
+                ambiguous_term   = orig0,
+                candidates       = cands0,
+                resolved_courses = step25_course_resolutions,
+                pending_courses  = remaining_courses,
+                resolved_tracks  = {},
+                history          = history,
+            )
+            clarification = self._build_clarification(orig0, cands0)
+            return PreprocessResult(
+                status        = "ambiguous",
+                clarification = clarification,
+                pending       = pending,
+            )
+
+        # Return ambiguity for the first unresolvable track-vs-course conflict
         if unresolved:
             orig0, ded0, course0, track0, clarif0 = unresolved[0]
             rest = unresolved[1:]
@@ -700,8 +756,12 @@ class QueryPreprocessor:
         # resolved_courses: original_term → canonical_name
         # This ensures _rewrite_query replaces the exact substring in query.
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        resolved_courses: Dict[str, str] = {}  # original → canonical
-        course_debug_lines: List[str] = []
+        # Carry forward any single-winner courses already resolved at Step 2.5.
+        resolved_courses: Dict[str, str] = dict(step25_course_resolutions)
+        course_debug_lines: List[str] = [
+            f'"{orig}"  →  "{canon}"  [from Step 2.5]'
+            for orig, canon in step25_course_resolutions.items()
+        ]
 
         for original, deduped in course_orig_to_dedup.items():
             result = self._map_course(deduped)
@@ -1373,6 +1433,58 @@ Examples:
             return result["candidates"][0]["name"]
         return None
 
+    def _get_course_candidates(
+        self,
+        deduped:     str,
+        track_canon: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        Return the full list of course candidates for a term that Step 2.5 has
+        decided is a course reference.  Checked in order:
+          1. COURSE_ALIASES            → single winner
+          2. KNOWN_CONFLICT_COURSES    → all listed candidates
+          3. fuzzy _map_course(deduped)
+          4. fuzzy _map_course(track_canon)  (when deduped itself matched nothing)
+        Returns [] when no course match exists.
+        """
+        ded_lower = deduped.lower().strip()
+
+        if ded_lower in COURSE_ALIASES:
+            return [{"name": COURSE_ALIASES[ded_lower], "code": "", "confidence": 1.0}]
+
+        if ded_lower in KNOWN_CONFLICT_COURSES:
+            return list(KNOWN_CONFLICT_COURSES[ded_lower])
+
+        result = self._map_course(deduped)
+        if result["status"] == "resolved":
+            return [{"name": result["canonical"], "code": result.get("code", ""), "confidence": 1.0}]
+        if result["status"] == "ambiguous":
+            return result["candidates"]
+
+        # deduped itself matched nothing — try the resolved track name
+        if track_canon and track_canon.lower().strip() != ded_lower:
+            tc_lower = track_canon.lower().strip()
+            if tc_lower in COURSE_ALIASES:
+                return [{"name": COURSE_ALIASES[tc_lower], "code": "", "confidence": 1.0}]
+            if tc_lower in KNOWN_CONFLICT_COURSES:
+                return list(KNOWN_CONFLICT_COURSES[tc_lower])
+            # Check if any individual word of the track name has a KNOWN_CONFLICT_COURSES
+            # entry (e.g. "software & application development" → word "software" → 10 courses).
+            # This catches track abbreviations like "sad"/"das" that map to a track whose
+            # name contains a known ambiguous course keyword.
+            for word in tc_lower.split():
+                if word in KNOWN_CONFLICT_COURSES:
+                    return list(KNOWN_CONFLICT_COURSES[word])
+            # Last resort: fuzzy match against the track's canonical name.
+            # We deliberately do NOT return a single fuzzy "resolved" hit as an
+            # auto-resolved winner here, because a track abbreviation typed as a
+            # course query warrants confirmation even when one fuzzy result exists.
+            result2 = self._map_course(track_canon)
+            if result2["status"] == "ambiguous":
+                return result2["candidates"]
+
+        return []
+
     def _detect_intent_signal(self, term: str, query: str) -> Tuple[str, float]:
         """
         Detect whether `term` is used as a course or track reference in `query`.
@@ -1398,6 +1510,13 @@ Examples:
                 positions.append(i)
 
         WINDOW = 6
+
+        # Structural check: term immediately follows a preposition → strong track signal.
+        # Covers "courses in SAD", "courses at year 3 of SAD", "courses from AIM", etc.
+        # This runs before the window scoring so it can short-circuit obvious cases.
+        preposition_re = r'\b(?:of|in|at|from|for)\s+' + re.escape(t_lower) + r'\b'
+        if re.search(preposition_re, q_lower):
+            return "track", 0.92
 
         if positions:
             best_c, best_t = 0.0, 0.0

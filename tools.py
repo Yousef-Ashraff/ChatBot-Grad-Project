@@ -436,6 +436,34 @@ def filter_courses(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Program / track info ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def get_program_total_credits(program_name: str) -> str:
+    """
+    Return the total number of credit hours required to graduate from a
+    specific program (track).
+
+    Use this when the student asks:
+    - "How many credits do I need to graduate?"
+    - "What is the total credit requirement for the AI track?"
+    - "How many credit hours are required in my program?"
+    - "What are the total credits needed for data science?"
+
+    Args:
+        program_name: The program/track name. E.g. "artificial intelligence
+                      & machine learning", "software & application
+                      development", "data science".
+    """
+    try:
+        from neo4j_track_functions import get_program_total_credits as _fn
+        return _to_str(_fn(program_name))
+    except Exception as exc:
+        return f"Error fetching program credit requirement: {exc}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ── BNU bylaws / regulations (RAG) ───────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -499,6 +527,165 @@ def start_course_planning() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Program / track info ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def get_program_info(
+    prg: str,
+    course_info: bool = True,
+    desc_info: bool = True,
+) -> str:
+    """
+    Get comprehensive information about a specific academic program/track.
+
+    Returns any combination of:
+    - Program description (from Neo4j)
+    - Credit hour distribution (always included — shared across all programs)
+    - Full curriculum for years 3 and 4 (core + elective courses)
+    - Hardcoded year-1/2 courses that differ between tracks
+    - Elective slot schedule (which year/semester electives are offered)
+    - Full elective course catalogue
+
+    Use this for questions like:
+    - "What is the AI / SAD / Data Science program?" (description / overview)
+    - "Tell me about the artificial intelligence track" (description)
+    - "Compare the AI and SAD programs" (call once per program)
+
+    Do NOT use this for curriculum questions — use the dedicated tools instead:
+    - Full curriculum (all years)  → get_all_core_courses
+    - Years 3–4 / specialization   → get_specialized_core_courses
+    - Years 1–2 / foundation       → get_general_core_courses
+    - Electives catalogue          → get_all_electives
+    - Elective slot schedule       → get_elective_slots
+
+    Args:
+        prg:         Program name 'full names'.
+        course_info: Set False to skip curriculum/elective data (e.g. when
+                     only the description is needed).
+        desc_info:   Set False to skip the program description.
+    """
+    try:
+        from neo4j_track_functions import get_program_info as _fn
+        return _to_str(_fn(prg, course_info=course_info, desc_info=desc_info))
+    except Exception as exc:
+        return f"Error fetching program info: {exc}"
+
+
+@tool
+def get_credit_hour_distribution() -> str:
+    """
+    Return the faculty-wide credit hour distribution shared by ALL programs.
+
+    This breakdown is identical across all three tracks (AIM, SAD, Data Science)
+    and should be called ONCE — not once per program.
+
+    Use this for questions like:
+    - "How are credit hours distributed?"
+    - "How many humanities credits are required?"
+    - "What is the breakdown of the 136 credit hours?"
+    - "How many credits are for field training / graduation project?"
+    """
+    try:
+        from neo4j_track_functions import get_credit_hour_distribution as _fn
+        return _to_str(_fn())
+    except Exception as exc:
+        return f"Error fetching credit hour distribution: {exc}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Curriculum breakdown tools ───────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def get_specialized_core_courses(program_name: str) -> str:
+    """
+    Return the specialized (upper-level) curriculum for a program.
+
+    Covers:
+    - All core courses in Years 3 and 4 (the main specialization years).
+    - One program-specific course that appears earlier but is unique to the track:
+        • data science  → "fundamentals of data science" (Year 2, Sem 2)
+        • AIM / SAD     → "technical report writing"      (Year 1, Sem 2)
+    - The elective slot schedule (which semesters electives can be taken).
+
+    Use this for questions like:
+    - "What specialised courses are in Year 3 of SAD?"
+      (call this tool — the LLM will filter to Year 3 from the result)
+    - "What advanced courses does the AI track have?"
+    - "Show me the upper-level curriculum for data science"
+    - "What do students study in years 3 and 4 of my program?"
+
+    Args:
+        program_name: Full canonical program name, e.g.
+                      "artificial intelligence & machine learning",
+                      "software & application development", "data science".
+    """
+    try:
+        from neo4j_track_functions import get_specialized_core_courses as _fn
+        return _to_str(_fn(program_name))
+    except Exception as exc:
+        return f"Error fetching specialized core courses: {exc}"
+
+
+@tool
+def get_general_core_courses(program_name: str) -> str:
+    """
+    Return the general (foundational) core curriculum for a program.
+
+    Covers all courses in Years 1 and 2, which form the shared foundation
+    across all tracks.  Includes notes about the two courses that differ
+    between programs:
+    - "fundamentals of data science" (Year 2, Sem 2) — data science ONLY
+    - "technical report writing"     (Year 1, Sem 2) — AIM and SAD ONLY
+
+    Use this for questions like:
+    - "What courses do students take in the first two years?"
+    - "What is the foundational curriculum for the AI track?"
+    - "What general courses are in SAD?"
+    - "What do first- and second-year students study in data science?"
+
+    Args:
+        program_name: Full canonical program name.
+    """
+    try:
+        from neo4j_track_functions import get_general_core_courses as _fn
+        return _to_str(_fn(program_name))
+    except Exception as exc:
+        return f"Error fetching general core courses: {exc}"
+
+
+@tool
+def get_all_core_courses(program_name: str) -> str:
+    """
+    Return the COMPLETE core curriculum for a program (Years 1–4) in one call.
+
+    Combines the general core (Years 1–2) and specialized core (Years 3–4)
+    into a single structured response.  Also includes the elective slot
+    schedule and any program-specific courses unique to the track.
+
+    Use this for questions like:
+    - "What courses are in the data science program?"
+    - "Show me the full curriculum for the AI track"
+    - "What do students study throughout the entire SAD program?"
+    - "Give me a complete overview of the AIM curriculum"
+
+    Prefer this over calling get_general_core_courses + get_specialized_core_courses
+    separately when the student wants the full picture in one answer.
+
+    Args:
+        program_name: Full canonical program name, e.g.
+                      "artificial intelligence & machine learning",
+                      "software & application development", "data science".
+    """
+    try:
+        from neo4j_track_functions import get_all_core_courses as _fn
+        return _to_str(_fn(program_name))
+    except Exception as exc:
+        return f"Error fetching all core courses: {exc}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tool list exported to agent.py
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -513,6 +700,12 @@ ALL_TOOLS = [
     get_all_electives,
     get_elective_slots,
     filter_courses,
+    get_program_total_credits,
     answer_academic_question,
     start_course_planning,
+    get_program_info,
+    get_credit_hour_distribution,
+    get_specialized_core_courses,
+    get_general_core_courses,
+    get_all_core_courses,
 ]
