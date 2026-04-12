@@ -12,6 +12,556 @@ from neo4j_course_functions import (
     get_all_electives_by_program,
 )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Program metadata
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Canonical program name → course code prefix
+PROGRAM_CODE_PREFIX = {
+    "artificial intelligence & machine learning": "AIM",
+    "software & application development": "SAD",
+    "data science": "DAS",
+}
+
+
+
+def _query_courses_by_code_prefix(
+    code_prefix: str,
+    elective: str = None,
+    program_name: str = None,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> list:
+    """
+    Query courses from Neo4j whose code starts with *code_prefix*.
+
+    Args:
+        code_prefix:   Course-code prefix to match (e.g. 'AIM', 'GEN', 'BAS', 'BCS').
+        elective:      'yes' → elective only, 'no' → core only, None → both.
+        program_name:  If given, restrict to that program; else deduplicate across all.
+        year_flag:     Add 'year' field to each returned course dict.
+        sem_flag:      Add 'semester' field to each returned course dict.
+
+    Returns:
+        List of course dicts (course_name, course_code, credit_hours, [year], [semester]).
+    """
+    conditions = ["(c.code STARTS WITH $code_prefix OR r.code STARTS WITH $code_prefix)"]
+    params: dict = {"code_prefix": code_prefix}
+
+    if elective is not None:
+        conditions.append("r.elective = $elective")
+        params["elective"] = elective
+
+    if program_name is not None:
+        conditions.append("toLower(p.name) = $program_name")
+        params["program_name"] = program_name.lower()
+
+    where_clause = " AND ".join(conditions)
+
+    # Always fetch year/sem from DB so we can populate the flags;
+    # we just won't include them in the output dict if the flags are off.
+    query = f"""
+    MATCH (c:Course)-[r:BELONGS_TO]->(p:Program)
+    WHERE {where_clause}
+    RETURN c.name AS course_name,
+           COALESCE(c.code, r.code) AS course_code,
+           c.credit_hours AS credit_hours,
+           r.year_name AS year,
+           r.semester AS semester
+    ORDER BY COALESCE(c.code, r.code)
+    """
+
+    rows = run_cypher_query(query, params)
+
+    courses = []
+    seen_codes: set = set()
+    for row in rows:
+        code = row["course_code"]
+        # When no program filter, deduplicate by course code (same course appears
+        # for each program it belongs to; year/sem are identical across programs
+        # for GEN/BAS courses, so the first row is fine).
+        if program_name is None and code in seen_codes:
+            continue
+        seen_codes.add(code)
+
+        course: dict = {
+            "course_name": row["course_name"],
+            "course_code": row["course_code"],
+            "credit_hours": row["credit_hours"],
+        }
+        if year_flag:
+            course["year"] = row.get("year")
+        if sem_flag:
+            course["semester"] = row.get("semester")
+        courses.append(course)
+
+    return courses
+
+
+def _parse_elective_slot(slot_str: str) -> dict:
+    """
+    Parse a slot string such as 'Third Year / Second Sem' into its parts.
+
+    Returns a dict with keys 'year' (e.g. 'Third Year') and
+    'semester' (e.g. 'Second').  Unknown formats yield None values.
+    """
+    # Expected format: "{Ordinal} Year / {First|Second} Sem"
+    try:
+        left, right = slot_str.split(" / ", 1)
+        year = left.strip()                          # "Third Year"
+        semester = right.strip().replace(" Sem", "").strip()  # "Second"
+        return {"year": year, "semester": semester}
+    except (ValueError, AttributeError):
+        return {"year": None, "semester": None}
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public course-category functions
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_specialized_core_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return specialized **core** (non-elective) courses for *prg*, plus the
+    elective slot entries appended at the end of the courses list.
+
+    Identified by: code starts with the program prefix (AIM / SAD / DAS)
+                   AND r.elective = 'no'.
+
+    Each elective slot in the program's schedule is included as a course
+    entry with course_name='Elective Slot' and course_code='ELECTIVE'.
+    When year_flag / sem_flag is True, the slot's year and semester (parsed
+    from get_elective_slots_time) are added to that entry exactly as they
+    are added for every real course.
+
+    These map to the "applied / specialized courses" (51 cr) category.
+
+    Args:
+        prg:       Program name or alias.
+        year_flag: Include 'year' field in each course dict (real + slot entries).
+        sem_flag:  Include 'semester' field in each course dict (real + slot entries).
+    """
+    code_prefix = PROGRAM_CODE_PREFIX.get(prg)
+    if not code_prefix:
+        return {"error": f"Unknown program '{prg}'. Valid: {list(PROGRAM_CODE_PREFIX.keys())}"}
+
+    # ── Real core courses ────────────────────────────────────────────────────
+    courses = _query_courses_by_code_prefix(
+        code_prefix=code_prefix,
+        elective="no",
+        program_name=prg,
+        year_flag=year_flag,
+        sem_flag=sem_flag,
+    )
+
+    # ── Elective slot entries ────────────────────────────────────────────────
+    slot_credit_hours = 3
+    slots = get_elective_slots_time(prg)           # list of "Year / Sem" strings
+    if not isinstance(slots, list):
+        slots = []
+
+    for slot_str in slots:
+        parsed = _parse_elective_slot(slot_str)
+        slot_entry: dict = {
+            "course_name": "Elective Slot",
+            "course_code": "ELECTIVE",
+            "credit_hours": slot_credit_hours,
+            "slot_schedule": slot_str,             # always keep the raw string
+        }
+        if year_flag:
+            slot_entry["year"] = parsed["year"]
+        if sem_flag:
+            slot_entry["semester"] = parsed["semester"]
+        courses.append(slot_entry)
+
+    total_credits = sum(c["credit_hours"] or 0 for c in courses)
+
+    return {
+        "program": prg,
+        "type": "specialized_core",
+        "total_credits": total_credits,
+        "courses": courses,
+    }
+
+
+def get_specialized_elective_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return specialized **elective** courses available in *prg*.
+
+    Identified by: code starts with the program prefix (AIM / SAD / DAS)
+                   AND r.elective = 'yes'.
+
+    When year_flag / sem_flag is True the elective *slot* schedule is
+    returned instead of per-course year/semester values (elective courses
+    have no fixed placement in the curriculum — only the slots do).
+
+    Args:
+        prg:       Program name or alias.
+        year_flag: Include elective slot year info.
+        sem_flag:  Include elective slot semester info.
+    """
+    code_prefix = PROGRAM_CODE_PREFIX.get(prg)
+    if not code_prefix:
+        return {"error": f"Unknown program '{prg}'. Valid: {list(PROGRAM_CODE_PREFIX.keys())}"}
+
+    courses = _query_courses_by_code_prefix(
+        code_prefix=code_prefix,
+        elective="yes",
+        program_name=prg,
+        year_flag=False,   # no fixed year/sem per elective course
+        sem_flag=False,
+    )
+    total_credits = sum(c["credit_hours"] or 0 for c in courses)
+
+    result: dict = {
+        "program": prg,
+        "type": "specialized_elective",
+        "total_credits": total_credits,
+        "courses": courses,
+    }
+
+    if year_flag or sem_flag:
+        result["elective_slots"] = get_elective_slots_time(prg)
+        result["note"] = (
+            "Elective courses have no fixed year/semester. "
+            "'elective_slots' shows when students may fill these slots."
+        )
+
+    return result
+
+
+def get_all_specialized_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return **all** specialized courses (core + elective) for *prg*.
+
+    Combines get_specialized_core_courses + get_specialized_elective_courses.
+    The applied/specialized category totals 51 credits.
+
+    Args:
+        prg:       Program name or alias.
+        year_flag: Include year for core courses; elective slot years for electives.
+        sem_flag:  Include semester for core courses; elective slot sems for electives.
+    """
+
+    core_data = get_specialized_core_courses(prg, year_flag=year_flag, sem_flag=sem_flag)
+    if "error" in core_data:
+        return core_data
+
+    elective_data = get_specialized_elective_courses(prg, year_flag=year_flag, sem_flag=sem_flag)
+
+    total_credits = (core_data["total_credits"] or 0) + (elective_data["total_credits"] or 0)
+
+    result: dict = {
+        "program": prg,
+        "type": "all_specialized",
+        "total_credits": total_credits,
+        "core_courses": {
+            "count": len(core_data["courses"]),
+            "total_credits": core_data["total_credits"],
+            "courses": core_data["courses"],
+        },
+        "elective_courses": {
+            "count": len(elective_data["courses"]),
+            "total_credits": elective_data["total_credits"],
+            "courses": elective_data["courses"],
+        },
+    }
+
+    if year_flag or sem_flag:
+        result["elective_slots"] = elective_data.get("elective_slots")
+        result["note"] = elective_data.get("note")
+
+    return result
+
+
+def get_general_courses(
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return humanities / general courses (code prefix: GEN).
+
+    These are **identical across all three programs** (12 credits total).
+
+    Args:
+        year_flag: Include 'year' field in each course dict.
+        sem_flag:  Include 'semester' field in each course dict.
+    """
+    courses = _query_courses_by_code_prefix(
+        code_prefix="GEN",
+        elective=None,
+        program_name=None,
+        year_flag=year_flag,
+        sem_flag=sem_flag,
+    )
+    total_credits = sum(c["credit_hours"] or 0 for c in courses)
+
+    return {
+        "type": "general (humanities)",
+        "note": "Same for all programs — 12 credits",
+        "total_credits": total_credits,
+        "courses": courses,
+    }
+
+
+def get_MathAndBasicScience_courses(
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return mathematics and basic sciences courses (code prefix: BAS).
+
+    These are **identical across all three programs** (24 credits total).
+
+    Args:
+        year_flag: Include 'year' field in each course dict.
+        sem_flag:  Include 'semester' field in each course dict.
+    """
+    courses = _query_courses_by_code_prefix(
+        code_prefix="BAS",
+        elective=None,
+        program_name=None,
+        year_flag=year_flag,
+        sem_flag=sem_flag,
+    )
+    total_credits = sum(c["credit_hours"] or 0 for c in courses)
+
+    return {
+        "type": "mathematics and basic sciences",
+        "note": "Same for all programs — 24 credits",
+        "total_credits": total_credits,
+        "courses": courses,
+    }
+
+
+def get_BasicComputingSciences_courses(
+    prg: str = None,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return basic computing sciences courses (code prefix: BCS).
+
+    Mostly identical across programs (36 credits), with one program-specific
+    difference:
+    - Data Science has **"Fundamentals of Data Science"** (absent from AIM/SAD).
+    - AIM and SAD have **"Technical Report Writing"** (absent from Data Science).
+
+    When *prg* is provided the returned list is filtered to that program's
+    BCS courses, which naturally handles the difference above.
+    When *prg* is None, all BCS courses are returned (with the note above).
+
+    Args:
+        prg:       Program name or alias (optional).
+        year_flag: Include 'year' field in each course dict.
+        sem_flag:  Include 'semester' field in each course dict.
+    """
+
+    courses = _query_courses_by_code_prefix(
+        code_prefix="BCS",
+        elective=None,
+        program_name=prg,
+        year_flag=year_flag,
+        sem_flag=sem_flag,
+    )
+    total_credits = sum(c["credit_hours"] or 0 for c in courses)
+
+    note = (
+        f"BCS courses for program: {prg}"
+        if prg
+        else (
+            "BCS courses (all programs). Note: Data Science has "
+            "'Fundamentals of Data Science' in place of 'Technical Report Writing' "
+            "which exists in AIM and SAD."
+        )
+    )
+
+    return {
+        "type": "basic computing sciences",
+        "program": prg,
+        "note": note,
+        "total_credits": total_credits,
+        "courses": courses,
+    }
+
+
+def get_all_types_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return ALL course categories for *prg* — every course in the curriculum.
+
+    Combines (with expected credit totals from the curriculum):
+      • Applied / specialized courses  — 51 cr  (get_all_specialized_courses)
+      • Humanities / general           — 12 cr  (get_general_courses)
+      • Mathematics & basic sciences   — 24 cr  (get_MathAndBasicScience_courses)
+      • Basic computing sciences       — 36 cr  (get_BasicComputingSciences_courses)
+      • Field training                 —  6 cr  (note only — no course list)
+      • Graduation projects            —  7 cr  (note only — no course list)
+      ─────────────────────────────────────────
+      Total degree requirement         136 cr
+
+    Args:
+        prg:       Program name or alias.
+        year_flag: Include year for each course.
+        sem_flag:  Include semester for each course.
+    """
+
+    specialized = get_all_specialized_courses(prg, year_flag=year_flag, sem_flag=sem_flag)
+    general = get_general_courses(year_flag=year_flag, sem_flag=sem_flag)
+    math_sci = get_MathAndBasicScience_courses(year_flag=year_flag, sem_flag=sem_flag)
+    bcs = get_BasicComputingSciences_courses(prg=prg, year_flag=year_flag, sem_flag=sem_flag)
+
+    courses_total = (
+        (specialized.get("total_credits") or 0)
+        + (general.get("total_credits") or 0)
+        + (math_sci.get("total_credits") or 0)
+        + (bcs.get("total_credits") or 0)
+    )
+
+    return {
+        "program": prg,
+        "type": "all_types",
+        "total_credits_in_courses": courses_total,
+        "full_degree_total_credits": 136,
+        "note": (
+            "Field training (6 cr) and graduation projects (7 cr) are not listed "
+            "as courses here but count toward the 136-credit degree requirement."
+        ),
+        "specialized_courses": specialized,
+        "general_courses": general,
+        "math_and_basic_sciences": math_sci,
+        "basic_computing_sciences": bcs,
+    }
+
+
+def get_all_core_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return all **core (non-elective)** courses for *prg* across all categories.
+
+    Combines:
+      • Specialized core               — 51 cr  (get_specialized_core_courses)
+      • Humanities / general           — 12 cr  (get_general_courses)
+      • Mathematics & basic sciences   — 24 cr  (get_MathAndBasicScience_courses)
+      • Basic computing sciences       — 36 cr  (get_BasicComputingSciences_courses)
+      • Field training                 —  6 cr  (note only)
+      • Graduation projects            —  7 cr  (note only)
+      ─────────────────────────────────────────
+      Total degree requirement         136 cr
+
+    Args:
+        prg:       Program name or alias.
+        year_flag: Include year for each course.
+        sem_flag:  Include semester for each course.
+    """
+
+    spec_core = get_specialized_core_courses(prg, year_flag=year_flag, sem_flag=sem_flag)
+    if "error" in spec_core:
+        return spec_core
+
+    general = get_general_courses(year_flag=year_flag, sem_flag=sem_flag)
+    math_sci = get_MathAndBasicScience_courses(year_flag=year_flag, sem_flag=sem_flag)
+    bcs = get_BasicComputingSciences_courses(prg=prg, year_flag=year_flag, sem_flag=sem_flag)
+
+    courses_total = (
+        (spec_core.get("total_credits") or 0)
+        + (general.get("total_credits") or 0)
+        + (math_sci.get("total_credits") or 0)
+        + (bcs.get("total_credits") or 0)
+    )
+
+    return {
+        "program": prg,
+        "type": "all_core",
+        "total_credits_in_courses": courses_total,
+        "full_degree_total_credits": 136,
+        "note": (
+            "Elective courses are excluded. "
+            "Field training (6 cr) and graduation projects (7 cr) are not listed "
+            "as courses here but count toward the 136-credit degree requirement."
+        ),
+        "specialized_core": spec_core,
+        "general_courses": general,
+        "math_and_basic_sciences": math_sci,
+        "basic_computing_sciences": bcs,
+    }
+
+
+def get_all_not_specialized_courses(
+    prg: str = None,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> dict:
+    """
+    Return all courses that are **shared across programs** (non-specialized).
+
+    Combines:
+      • Humanities / general           — 12 cr  (get_general_courses)
+      • Mathematics & basic sciences   — 24 cr  (get_MathAndBasicScience_courses)
+      • Basic computing sciences       — 36 cr  (get_BasicComputingSciences_courses)
+      ─────────────────────────────────────────
+      Subtotal                          72 cr
+      Field training + grad projects   +13 cr  (note only)
+      ─────────────────────────────────────────
+      Non-specialized degree total      85 cr
+
+    When *prg* is provided, the BCS list is filtered to that program
+    (handles the Data-Science-specific vs AIM/SAD-specific BCS difference).
+
+    Args:
+        prg:       Program name or alias (optional).
+        year_flag: Include year for each course.
+        sem_flag:  Include semester for each course.
+    """
+
+    general = get_general_courses(year_flag=year_flag, sem_flag=sem_flag)
+    math_sci = get_MathAndBasicScience_courses(year_flag=year_flag, sem_flag=sem_flag)
+    bcs = get_BasicComputingSciences_courses(prg=prg, year_flag=year_flag, sem_flag=sem_flag)
+
+    courses_total = (
+        (general.get("total_credits") or 0)
+        + (math_sci.get("total_credits") or 0)
+        + (bcs.get("total_credits") or 0)
+    )
+
+    result: dict = {
+        "type": "all_not_specialized",
+        "total_credits_in_courses": courses_total,
+        "non_specialized_degree_total": 85,
+        "note": (
+            "These courses are common to all programs. "
+            "Field training (6 cr) and graduation projects (7 cr) bring the "
+            "non-specialized total to 85 cr out of the 136-credit degree."
+        ),
+        "general_courses": general,
+        "math_and_basic_sciences": math_sci,
+        "basic_computing_sciences": bcs,
+    }
+
+    if prg:
+        result["program"] = prg
+
+    return result
+
 
 def get_credit_hour_distribution() -> dict:
     """
@@ -115,184 +665,6 @@ def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True)
         result["description"] = rows[0]["description"] if rows else None
 
     return result
-
-
-def get_specialized_core_courses(prg: str) -> dict:
-    """
-    Return the specialized (upper-level) core curriculum for a program.
-
-    "Specialized" courses are:
-    - All core and elective courses in Years 3 and 4 (from Neo4j).
-    - Program-specific early courses that are unique to the track, even though
-      they appear in Years 1–2:
-        • data science           → "fundamentals of data science" (Year 2, Sem 2)
-        • AIM / SAD              → "technical report writing"      (Year 1, Sem 2)
-    - Elective slot schedule for the program.
-
-    Args:
-        prg: Canonical program name, e.g.
-             "artificial intelligence & machine learning",
-             "software & application development",
-             "data science".
-
-    Returns:
-        Dict with keys:
-          - program
-          - years_3_and_4          : output of get_courses_by_multiple_terms
-          - program_specific_early  : dict describing the unique early course
-          - elective_slots          : output of get_elective_slots_time
-    """
-    prg = prg.lower().strip()
-
-    # ── Year 3 & 4 from the knowledge graph ──────────────────────────────────
-    terms_3_4 = [
-        {"level": 3, "semester": 1},
-        {"level": 3, "semester": 2},
-        {"level": 4, "semester": 1},
-        {"level": 4, "semester": 2},
-    ]
-    curriculum_3_4 = get_courses_by_multiple_terms(terms_3_4, program_name=prg)
-
-    # ── Program-specific early specialization course ──────────────────────────
-    # These courses appear in Years 1–2 but are unique to a specific track.
-    # Use get_courses_by_multiple_terms for year 2 sem 2 to get live KG data
-    # for the data science case.
-    if prg == "data science":
-        y2_t2_data = get_courses_by_multiple_terms(
-            [{"level": 2, "semester": 2}], program_name=prg
-        )
-        program_specific_early = {
-            "course_name": "fundamentals of data science",
-            "year": 2,
-            "semester": 2,
-            "note": "unique to data science — not offered in AIM or SAD",
-            "term_data": y2_t2_data,
-        }
-    elif prg in (
-        "artificial intelligence & machine learning",
-        "software & application development",
-    ):
-        program_specific_early = {
-            "course_name": "technical report writing",
-            "year": 1,
-            "semester": 2,
-            "note": "unique to AIM and SAD — not offered in data science",
-        }
-    else:
-        program_specific_early = None
-
-    return {
-        "program": prg,
-        "years_3_and_4": curriculum_3_4,
-        "program_specific_early": program_specific_early,
-        "elective_slots": get_elective_slots_time(prg),
-    }
-
-
-def get_general_core_courses(prg: str) -> dict:
-    """
-    Return the general (foundational) core curriculum for a program.
-
-    "General" courses are all courses in Years 1 and 2.  Almost all of these
-    are shared across every track; the only exceptions are:
-      • "fundamentals of data science" (Year 2, Sem 2) — data science ONLY
-      • "technical report writing"     (Year 1, Sem 2) — AIM and SAD ONLY
-
-    Notes about these track-specific courses are appended so the LLM can
-    communicate them accurately to the student.
-
-    Args:
-        prg: Canonical program name.
-
-    Returns:
-        Dict with keys:
-          - program
-          - years_1_and_2        : output of get_courses_by_multiple_terms
-          - program_specific_notes: list of dicts describing unique courses
-    """
-    prg = prg.lower().strip()
-
-    # ── Year 1 & 2 from the knowledge graph ──────────────────────────────────
-    terms_1_2 = [
-        {"level": 1, "semester": 1},
-        {"level": 1, "semester": 2},
-        {"level": 2, "semester": 1},
-        {"level": 2, "semester": 2},
-    ]
-    curriculum_1_2 = get_courses_by_multiple_terms(terms_1_2, program_name=prg)
-
-    # ── Notes about program-specific courses in Years 1–2 ────────────────────
-    if prg == "data science":
-        program_specific_notes = [
-            {
-                "course_name": "fundamentals of data science",
-                "year": 2,
-                "semester": 2,
-                "note": "present in data science only — not offered in AIM or SAD",
-            }
-        ]
-    elif prg in (
-        "artificial intelligence & machine learning",
-        "software & application development",
-    ):
-        program_specific_notes = [
-            {
-                "course_name": "technical report writing",
-                "year": 1,
-                "semester": 2,
-                "note": "present in AIM and SAD only — not offered in data science",
-            }
-        ]
-    else:
-        program_specific_notes = [
-            {
-                "note": (
-                    "fundamentals of data science (Year 2, Sem 2) exists only in "
-                    "data science; technical report writing (Year 1, Sem 2) exists "
-                    "only in AIM and SAD."
-                )
-            }
-        ]
-
-    return {
-        "program": prg,
-        "years_1_and_2": curriculum_1_2,
-        "program_specific_notes": program_specific_notes,
-    }
-
-
-def get_all_core_courses(prg: str) -> dict:
-    """
-    Return the complete core curriculum for a program (Years 1–4) in one call.
-
-    Combines get_general_core_courses (Years 1–2) and
-    get_specialized_core_courses (Years 3–4) into a single, structured result.
-
-    Args:
-        prg: Canonical program name.
-
-    Returns:
-        Dict with keys:
-          - program
-          - general_core           : years 1 & 2 curriculum
-          - general_program_notes  : track-specific notes for years 1–2
-          - specialized_core       : years 3 & 4 curriculum
-          - program_specific_early : unique early specialization course entry
-          - elective_slots         : when electives are available
-    """
-    prg = prg.lower().strip()
-
-    general = get_general_core_courses(prg)
-    specialized = get_specialized_core_courses(prg)
-
-    return {
-        "program": prg,
-        "general_core (years 1-2)": general["years_1_and_2"],
-        "general_program_notes (years 1-2)": general["program_specific_notes"],
-        "specialized_core (years 3-4)": specialized["years_3_and_4"],
-        "program_specific_early_course": specialized["program_specific_early"],
-        "elective_slots": specialized["elective_slots"],
-    }
 
 
 def get_program_total_credits(program_name: str) -> dict:

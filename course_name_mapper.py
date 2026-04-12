@@ -52,7 +52,9 @@ class CourseNameMapper:
     def _load_courses(self):
         query = """
         MATCH (c:Course)
-        RETURN c.name AS name, c.code AS code
+        OPTIONAL MATCH (c)-[r:BELONGS_TO]->(:Program)
+        WITH c, collect(r.code)[0] AS rel_code
+        RETURN c.name AS name, COALESCE(c.code, rel_code) AS code
         ORDER BY c.name
         """
         try:

@@ -41,7 +41,8 @@ project/
 ├── tools.py                   # 12 LangChain tool definitions
 ├── preprocessor.py            # Query preprocessing pipeline (5 steps)
 ├── course_name_mapper.py      # Fuzzy course name → Neo4j canonical name
-├── neo4j_course_functions.py  # All Neo4j/KG query functions
+├── neo4j_course_functions.py  # Core Neo4j/KG query functions + _resolve_code()
+├── neo4j_track_functions.py   # Program/track-level KG functions (credit distribution, program info)
 ├── eligibility.py             # Prerequisite + credit-hour eligibility checker
 ├── rag_service.py             # RAG pipeline (Pinecone + HF + Groq)
 ├── planning.py                # Interactive course planning function
@@ -192,6 +193,8 @@ Runs before every agent invocation. Five steps:
 
 **Fuzzy scoring:** `score = max(code_exact→1.0, similarity*0.6 + keyword_overlap*0.4, prefix_score)`; threshold=0.30; ambiguity_delta=0.08 (two candidates within 0.08 → ask user)
 
+**`_load_courses()` query** (internal cache used for entity extraction): `MATCH (c:Course) OPTIONAL MATCH (c)-[r:BELONGS_TO]->(:Program) WITH c, collect(r.code)[0] AS rel_code RETURN c.name AS name, COALESCE(c.code, rel_code) AS code ORDER BY c.name` — the OPTIONAL MATCH ensures the 6 affected courses (whose `c.code` is null) still get a code for code-string matching in the preprocessor entity blocklist and alias checks.
+
 **COURSE_ALIASES examples:** `"ml"→"machine learning"`, `"os"→"operating systems"`, `"oop"→"object oriented programming"`, `"dsa"→"data structures and algorithms"`, course codes like `"bcs311"→"artificial intelligence"`
 
 **TRACK_ALIASES:** `"aim"/"ai"/"aiml"→"artificial intelligence and machine learning"`, `"sad"/"software"/"sw"→"software and application development"`, `"das"/"ds"/"data science"→"data science"`
@@ -207,6 +210,8 @@ Runs before every agent invocation. Five steps:
 ## Tools (`tools.py`) — 12 Tools
 
 Student ID injected via module-level `_ACTIVE_STUDENT_ID` (set by `set_active_student_id()` before each graph run). All tools return plain strings. Course name fuzzy matching applied automatically via `_normalize_course()`.
+
+The inline electives Cypher query inside `get_all_electives` uses `COALESCE(c.code, r.code) AS course_code` and `ORDER BY COALESCE(c.code, r.code)` (Case 1 — program is always provided).
 
 | Tool | When to use |
 |---|---|
@@ -228,20 +233,47 @@ Student ID injected via module-level `_ACTIVE_STUDENT_ID` (set by `set_active_st
 ### Neo4j Knowledge Graph
 
 ```
-Nodes:    (Course) — name, code, description, credit_hours
+Nodes:    (Course) — name, code*, description, credit_hours
           (Program) — name
           (GraphEmbedding) — embedding [indexed]
 
-Rels:     (Course)-[:BELONGS_TO]->(Program)        rel props: elective='yes'/'no', year_level, semester
-          (Course)-[:HAS_PREREQUISITE]->(Course)
+Rels:     (Course)-[:BELONGS_TO]->(Program)        rel props: elective='yes'/'no', year_level, semester, code*
+          (Course)-[:HAS_PREREQUISITE]->(Course)   rel props: track (optional, restricts to specific programs)
           (Course)-[:PREREQUISITE_OF]->(Course)
           (Course)-[:SIMILAR_TO]->(Course)
 ```
 
-**Programs (3 tracks):** `artificial intelligence and machine learning` (AIM), `software and application development` (SAD), `data science` (DAS)
+**Programs (3 tracks):** `artificial intelligence & machine learning` (AIM), `software & application development` (SAD), `data science` (DAS)
 
 **Year levels:** `First Year`, `Second Year`, `Third Year`, `Fourth Year`
 **Semesters:** `First`, `Second`
+
+#### Course Code Schema (IMPORTANT)
+
+The `code` property is split across two locations depending on the course:
+
+- **Code on the Course node** (`c.code`) — courses that belong to one program, or multiple programs all sharing the **same** code. The vast majority of courses.
+- **Code on the BELONGS_TO relationship** (`r.code`) — courses that belong to multiple programs with a **different** code per program. The node's `code` property is `null` for these courses.
+
+**6 affected courses (code lives on `BELONGS_TO`, not on the node):**
+- `machine learning`
+- `natural language processing`
+- `image processing`
+- `deep learning`
+- `computer vision`
+- `data mining`
+
+**3-case resolution rule** applied in every Cypher query that reads a course code:
+
+| Case | Condition | Cypher pattern | Python result |
+|---|---|---|---|
+| **1 / 2** | Program context available (required or passed) | `COALESCE(c.code, r.code) AS code` | plain `str` |
+| **3** | No program context (`program_name=None`) | `CASE WHEN c.code IS NOT NULL THEN [{program: null, code: c.code}] ELSE collect({program: p.name, code: r.code}) END` | `str` if single node code; `[{program, code}, …]` if relationship codes |
+
+**`_resolve_code(codes)`** (module-level helper in `neo4j_course_functions.py`) unwraps the Case-3 list:
+- `[{program: None, code: "X"}]` → `"X"` (plain string)
+- `[{program: "aim", code: "AIM304"}, …]` → returns the list as-is
+- `None / []` → `None`
 
 ### Supabase (PostgreSQL) — `students` table
 
@@ -375,10 +407,65 @@ Port 8000, CORS open (`"*"`).
 - Optionally logs to Google Sheets (buffers user msg, logs complete turn on assistant reply)
 - `clear_chat_history(student_id)` → new `conversation_id`, clears messages
 
+## Neo4j Course Functions (`neo4j_course_functions.py`)
+
+Core KG query layer. All functions accept lowercase course/program names. Code resolution follows the 3-case rule above.
+
+**`_resolve_code(codes)`** — module-level helper. Unwraps the Case-3 `[{program, code}]` structure into a plain string (single node code) or a list of per-program dicts (relationship codes). Always call this on Case-3 query results before returning to callers.
+
+**Key functions and their code-resolution case:**
+
+| Function | Program param | Case | Code return type |
+|---|---|---|---|
+| `get_courses_by_term(level, semester, program_name)` | optional, defaults to all 3 | 2 | `str` via `COALESCE` |
+| `get_course_info(course_name, program_name)` | optional | 2 if given → `str`; 3 if None → `str` or `list` |
+| `get_course_dependencies(course_name, program_name)` | optional | 2 if given → `str`; 3 if None → `str` or `list` per prereq |
+| `get_course_closes(course_name, program_name)` | optional, defaults to all 3 | smart: single code if all programs agree, `list` if codes differ |
+| `get_all_electives_by_program(program_name)` | required | 1 | `str` via `COALESCE` |
+| `filter_courses(filters, course_types, return_fields, program_name)` | optional, defaults to all 3 | 2 | `str` via `COALESCE` |
+
+**`get_course_closes()` smart code derivation:** The query embeds `COALESCE(c.code, bc.code)` per program inside `program_details`. Python then collects all per-program codes; if all are identical (or only one program) → returns a plain string (Case 2); if they differ (the 6 affected courses queried across multiple programs) → returns `[{program, code}, …]` (Case 3 behaviour).
+
+**`get_course_dependencies()` general branch (no program):** Collects `{program, code}` pairs from all `bp:BELONGS_TO` relationships, filters them with the same track/intersection logic used for `program_details`, then returns a `CASE WHEN prereq.code IS NOT NULL` structure. `_resolve_code()` applied in the Python serializer.
+
+**`get_course_info()` no-program branch:** Collects `{program, code}` pairs from all `r:BELONGS_TO` relationships, then `CASE WHEN c.code IS NOT NULL THEN [{program: null, code: c.code}] ELSE rel_codes END`. `_resolve_code()` applied before returning.
+
+**`get_credit_hour_distribution()`** — returns the faculty-wide credit breakdown (same for all programs): humanities 12 cr, math/sci 24 cr, basic computing 36 cr, applied/specialized 51 cr, field training 6 cr, grad projects 7 cr = 136 cr total.
+
+**`get_program_info(prg, course_info, desc_info)`** — comprehensive program data: credit distribution, years-3/4 curriculum, unique year-1/2 courses, elective slots, elective catalogue, program description.
+
+## Neo4j Track Functions (`neo4j_track_functions.py`)
+
+Program/track-level query layer. Imports from `neo4j_course_functions`. All code resolution uses Case 1/2 (program prefix always known).
+
+**`PROGRAM_CODE_PREFIX`** — maps canonical program name → course code prefix: `"artificial intelligence & machine learning"→"AIM"`, `"software & application development"→"SAD"`, `"data science"→"DAS"`.
+
+**`_query_courses_by_code_prefix(code_prefix, elective, program_name, year_flag, sem_flag)`**
+- WHERE condition: `(c.code STARTS WITH $code_prefix OR r.code STARTS WITH $code_prefix)` — checks both node and relationship code so the 6 affected courses (whose codes live on `BELONGS_TO`) are found correctly.
+- RETURN: `COALESCE(c.code, r.code) AS course_code`
+- Python deduplication (when no `program_name`): by `course_code` value; safe because shared courses (GEN/BAS) always have `c.code` on the node.
+
+**Course category functions** (all return `{program, type, total_credits, courses:[…]}`):
+- `get_specialized_core_courses(prg)` — AIM/SAD/DAS core courses + elective slot placeholders
+- `get_specialized_elective_courses(prg)` — AIM/SAD/DAS elective courses
+- `get_all_specialized_courses(prg)` — combines the two above (51 cr)
+- `get_general_courses()` — GEN prefix, identical across all programs (12 cr)
+- `get_MathAndBasicScience_courses()` — BAS prefix, identical across all programs (24 cr)
+- `get_BasicComputingSciences_courses(prg)` — BCS prefix; Data Science has "Fundamentals of Data Science" instead of "Technical Report Writing" (36 cr)
+- `get_all_types_courses(prg)` — all 4 categories combined
+- `get_all_core_courses(prg)` — all non-elective courses
+- `get_all_not_specialized_courses(prg)` — GEN + BAS + BCS only (72 cr)
+
+**`get_credit_hour_distribution()`** — same as the one in `neo4j_course_functions.py` (duplicate, kept for callers that import from this module).
+
+**`get_program_info(prg, course_info, desc_info)`** — same as the one in `neo4j_course_functions.py` (canonical version; `neo4j_track_functions` re-exports it).
+
+**`get_program_total_credits(program_name)`** — queries `p.total_credits_required` from the Program node.
+
 ## Course Name Mapper (`course_name_mapper.py`)
 
 Lazy-initialized class `CourseNameMapper`:
-- Loads all `(Course)` nodes from Neo4j at init (cached)
+- Loads all `(Course)` nodes from Neo4j at init (cached) using an OPTIONAL MATCH fallback: `MATCH (c:Course) OPTIONAL MATCH (c)-[r:BELONGS_TO]->(:Program) WITH c, collect(r.code)[0] AS rel_code RETURN c.name, COALESCE(c.code, rel_code) AS code` — ensures the 6 affected courses get a code (any one of their program codes) for fuzzy matching by code string.
 - Scores each course: exact match (1.0), code match (0.9–1.0), prefix score (0.50–0.90), sequence+keyword (0.0–1.0)
 - `find_best_match(user_input)` → single best match or None
 - `find_ambiguous_matches(user_input)` → candidates when top scores within `ambiguity_delta=0.08`
@@ -466,3 +553,4 @@ DEBUG_LEVEL=
 11. **Planning in split queries** — when `start_course_planning` fires as a sub-query of a split, its output is surfaced directly (not summarised) so the interactive session continues correctly. Any co-located non-planning answer is prepended.
 12. **Chat history is a sliding window** — only last 3 user + 3 assistant messages stored in Supabase and passed to agent.
 13. **Authoritative credit count from DB** — `total_hours_earned` read directly from Supabase, never recomputed from `courses_degrees`.
+14. **Course code split across node vs. relationship** — six courses (`machine learning`, `natural language processing`, `image processing`, `deep learning`, `computer vision`, `data mining`) have program-specific codes that differ per program. Their `code` property was removed from the Course node and migrated to the `BELONGS_TO` relationship (`r.code`). All Cypher queries follow a 3-case rule: (1/2) program context available → `COALESCE(c.code, r.code)` returning a plain string; (3) no program context → `CASE WHEN c.code IS NOT NULL` returning a `[{program, code}]` list, unwrapped by `_resolve_code()`. The `_query_courses_by_code_prefix()` filter in `neo4j_track_functions.py` uses `(c.code STARTS WITH $prefix OR r.code STARTS WITH $prefix)` so these courses are still found by prefix. The fuzzy code matchers (`course_name_mapper.py`, `preprocessor.py`) use `OPTIONAL MATCH + collect(r.code)[0]` to get any one code for matching, which is sufficient for string-identity matching.

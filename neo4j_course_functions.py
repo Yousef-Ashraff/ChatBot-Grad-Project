@@ -57,6 +57,31 @@ SEMESTER_MAP = {
 }
 
 
+def _resolve_code(codes):
+    """
+    Deserialize the Case-3 code structure produced by no-program-context queries.
+
+    Cypher queries that run without a single Program context return code as:
+      [{program: null, code: "X"}]         → code lives on the Course node
+                                             → returns "X"  (plain string)
+      [{program: "aim", code: "A"}, ...]   → code lives on BELONGS_TO relationships
+                                             → returns the list as-is
+
+    Args:
+        codes: list of {program, code} dicts from the Cypher CASE expression, or None.
+
+    Returns:
+        str   – when there is exactly one entry and its program key is None
+        list  – when multiple per-program entries are present
+        None  – when codes is empty / None
+    """
+    if not codes:
+        return None
+    if len(codes) == 1 and codes[0].get("program") is None:
+        return codes[0]["code"]
+    return codes
+
+
 def test_connection():
     """Test the connection to Neo4j Aura database."""
     with driver.session(database="neo4j") as session:
@@ -152,10 +177,10 @@ def get_courses_by_term(level, semester=None, program_name=None):
             r.semester AS semester,
             p.name AS program,
             c.name AS course_name,
-            c.code AS course_code,
+            COALESCE(c.code, r.code) AS course_code,
             c.credit_hours AS credit_hours,
             r.elective AS course_type
-        ORDER BY p.name, c.code
+        ORDER BY p.name, COALESCE(c.code, r.code)
         """
         params = {
             "year_name": normalized_level,
@@ -172,10 +197,10 @@ def get_courses_by_term(level, semester=None, program_name=None):
             r.semester AS semester,
             p.name AS program,
             c.name AS course_name,
-            c.code AS course_code,
+            COALESCE(c.code, r.code) AS course_code,
             c.credit_hours AS credit_hours,
             r.elective AS course_type
-        ORDER BY p.name, r.semester, c.code
+        ORDER BY p.name, r.semester, COALESCE(c.code, r.code)
         """
         params = {
             "year_name": normalized_level,
@@ -354,13 +379,14 @@ def get_course_dependencies(course_name, program_name=None):
              collect(DISTINCT {
                  program: input_prog.name,
                  course_type: bc.elective
-             }) AS program_details
+             }) AS program_details,
+             collect(DISTINCT bp.code)[0] AS rel_code
 
         WHERE size(program_details) > 0
 
         RETURN
             prereq.name AS prerequisite_name,
-            prereq.code AS prerequisite_code,
+            COALESCE(prereq.code, rel_code) AS prerequisite_code,
             prereq.credit_hours AS credit_hours,
             program_details
         ORDER BY prereq.name
@@ -426,24 +452,37 @@ def get_course_dependencies(course_name, program_name=None):
              collect(DISTINCT {
                  program:     prereq_prog.name,
                  course_type: CASE WHEN bp.elective = 'yes' THEN 'elective' ELSE 'mandatory' END
-             }) AS all_prereq_details
+             }) AS all_prereq_details,
+             collect(DISTINCT {program: prereq_prog.name, code: bp.code}) AS all_rel_codes
 
         // Keep only the program entries where the prereq relationship actually applies:
         //   - track-specific (r.track set)  → program must appear in r.track string
         //   - track-agnostic (r.track null)  → program must be shared by both courses
-        WITH prereq,
+        WITH prereq, all_rel_codes,
              [detail IN all_prereq_details WHERE
                  detail.program IS NOT NULL AND (
                      (r.track IS NOT NULL AND r.track CONTAINS detail.program)
                      OR  (r.track IS NULL   AND detail.program IN main_prog_names)
                  )
-             ] AS program_details
+             ] AS program_details,
+             [rc IN all_rel_codes WHERE
+                 rc.program IS NOT NULL AND (
+                     (r.track IS NOT NULL AND r.track CONTAINS rc.program)
+                     OR  (r.track IS NULL   AND rc.program IN main_prog_names)
+                 )
+             ] AS filtered_rel_codes
 
         WHERE size(program_details) > 0
 
+        // Case 3: no program context.
+        // code is on the node  → [{program: null, code: prereq.code}]
+        // code is on BELONGS_TO → filtered_rel_codes (one entry per valid program)
         RETURN
             prereq.name  AS prerequisite_name,
-            prereq.code  AS prerequisite_code,
+            CASE WHEN prereq.code IS NOT NULL
+                 THEN [{program: null, code: prereq.code}]
+                 ELSE filtered_rel_codes
+            END AS prerequisite_code,
             prereq.credit_hours AS credit_hours,
             program_details
         ORDER BY prereq.name
@@ -456,12 +495,15 @@ def get_course_dependencies(course_name, program_name=None):
         # Get courses that this course closes/opens up (dependents)
         dependent_result = get_course_closes(course_name, program_name)
 
-        # Build prerequisites list — same dict-track format as the program-specific path
+        # Build prerequisites list — same dict-track format as the program-specific path.
+        # _resolve_code() unwraps the Case-3 code structure:
+        #   [{program: null, code: "X"}] → "X"  (node-level code, plain string)
+        #   [{program: "aim", code: ...}, ...] → list of per-program dicts
         prerequisites = []
         for record in preq_result:
             prereq_data = {
                 "name":         record["prerequisite_name"],
-                "code":         record["prerequisite_code"],
+                "code":         _resolve_code(record["prerequisite_code"]),
                 "credit_hours": record["credit_hours"],
                 "tracks":       [],
             }
@@ -498,7 +540,11 @@ def get_course_closes(course_name, program_name=None):
         program_names = [program_name.lower()]
     else:
         program_names = [name.lower() for name in program_name]
-    # Get program-specific courses that require this prerequisite
+    # Get program-specific courses that require this prerequisite.
+    # Each program_details entry carries the per-program COALESCE(c.code, bc.code)
+    # so the Python layer can derive the correct code for Case 2 (single program →
+    # plain string) and Case 3 (no program → string when unique, list when multiple
+    # different codes exist, which happens for the 6 relationship-code courses).
     query = """
     MATCH (prereq:Course {name: $course_name})<-[r:HAS_PREREQUISITE]-(c:Course)
     // Get programs for the courses that have this prerequisite
@@ -509,13 +555,13 @@ def get_course_closes(course_name, program_name=None):
        OR (r.track IS NULL)
     WITH c,
          collect(DISTINCT {
-             program: prog.name,
-             course_type: bc.elective
+             program:     prog.name,
+             course_type: bc.elective,
+             code:        COALESCE(c.code, bc.code)
          }) AS program_details
     WHERE size(program_details) > 0
     RETURN
         c.name AS course_name,
-        c.code AS course_code,
         c.credit_hours AS credit_hours,
         program_details
     ORDER BY c.name
@@ -523,16 +569,31 @@ def get_course_closes(course_name, program_name=None):
     params = {"course_name": course_name, "program_names": program_names}
     # Execute query on Neo4j
     result = run_cypher_query(query, params)
-    # Return list of courses with their program details
+    # Return list of courses with their program details.
+    # Derive the top-level "code" field from per-program codes:
+    #   - All programs agree on the same code (or only one program) → plain string
+    #   - Programs have different codes (relationship-code courses)  → list of
+    #     {program, code} dicts (Case 3 behaviour)
     output = []
     for record in result:
+        details = record["program_details"]
+        all_codes = [d["code"] for d in details if d and d.get("code") is not None]
+        unique_codes = list(dict.fromkeys(all_codes))   # deduplicate, preserve order
+
+        if not unique_codes:
+            code = None
+        elif len(unique_codes) == 1:
+            code = unique_codes[0]
+        else:
+            code = [{"program": d["program"], "code": d.get("code")} for d in details if d]
+
         course_data = {
             "name": record["course_name"],
-            "code": record["course_code"],
+            "code": code,
             "credit_hours": record["credit_hours"],
             "tracks": []
         }
-        for detail in record["program_details"]:
+        for detail in details:
             if detail and detail.get("program"):
                 course_data["tracks"].append({
                     "program": detail["program"],
@@ -569,49 +630,65 @@ def get_course_info(course_name, program_name=None):
         query = """
         MATCH (c:Course {name: $course_name})-[r:BELONGS_TO]->(p:Program)
         WHERE p.name IN $program_names
+        WITH c,
+             collect(DISTINCT {
+                 program: p.name,
+                 year: r.year_name,
+                 semester: r.semester,
+                 course_type: r.elective,
+                 min_academic_load: r.min_academic_load,
+                 max_standard_academic_load: r.max_standard_academic_load,
+                 required_core_credits: r.required_core_credits
+             }) AS program_offerings,
+             collect(r.code)[0] AS rel_code
         RETURN
             c.name AS course_name,
-            c.code AS course_code,
+            COALESCE(c.code, rel_code) AS course_code,
             c.credit_hours AS credit_hours,
             c.description AS description,
             c.motivation AS motivation,
             c.min_hours_to_enroll AS min_hours_to_enroll,
-            collect(DISTINCT {
-                program: p.name,
-                year: r.year_name,
-                semester: r.semester,
-                course_type: r.elective,  // 'yes' for elective, 'no' for mandatory
-                min_academic_load: r.min_academic_load,
-                max_standard_academic_load: r.max_standard_academic_load,
-                required_core_credits: r.required_core_credits
-            }) AS program_offerings
+            program_offerings
         """
         params = {"course_name": course_name, "program_names": program_names}
     else:
-        # Get general course information across all programs
+        # Case 3: no program context — return code as structured list so the caller
+        # can distinguish a single node-level code from per-program relationship codes.
         query = """
         MATCH (c:Course {name: $course_name})
         OPTIONAL MATCH (c)-[r:BELONGS_TO]->(p:Program)
+        WITH c,
+             collect(DISTINCT {
+                 program: p.name,
+                 year: r.year_name,
+                 semester: r.semester,
+                 course_type: r.elective,
+                 min_academic_load: r.min_academic_load,
+                 max_standard_academic_load: r.max_standard_academic_load,
+                 required_core_credits: r.required_core_credits
+             }) AS program_offerings,
+             collect(DISTINCT {program: p.name, code: r.code}) AS rel_codes
         RETURN
             c.name AS course_name,
-            c.code AS course_code,
+            CASE WHEN c.code IS NOT NULL
+                 THEN [{program: null, code: c.code}]
+                 ELSE rel_codes
+            END AS course_code,
             c.credit_hours AS credit_hours,
             c.description AS description,
             c.motivation AS motivation,
             c.min_hours_to_enroll AS min_hours_to_enroll,
-            collect(DISTINCT {
-                program: p.name,
-                year: r.year_name,
-                semester: r.semester,
-                course_type: r.elective,  // 'yes' for elective, 'no' for mandatory
-                min_academic_load: r.min_academic_load,
-                max_standard_academic_load: r.max_standard_academic_load,
-                required_core_credits: r.required_core_credits
-            }) AS program_offerings
+            program_offerings
         """
         params = {"course_name": course_name}
 
     result = run_cypher_query(query, params)
+
+    if not program_name:
+        # Unwrap the Case-3 code structure: plain string when code is on the node,
+        # list of {program, code} dicts when code lives on BELONGS_TO relationships.
+        for row in result:
+            row['course_code'] = _resolve_code(row['course_code'])
 
     return result
 
@@ -749,10 +826,10 @@ def get_all_electives_by_program(program_name=None):
         WHERE r.elective = 'yes'
         RETURN
             c.name AS course_name,
-            c.code AS course_code,
+            COALESCE(c.code, r.code) AS course_code,
             c.description AS description,
             c.credit_hours AS credit_hours
-        ORDER BY c.code
+        ORDER BY COALESCE(c.code, r.code)
         """
 
         params = {"program_name": prog}
@@ -960,20 +1037,36 @@ def filter_courses(filters=None, course_types=None, return_fields=None, program_
     base_fields = [f for f in return_fields if f != 'program_details']
 
     if include_program_details:
-        query_parts.append(
-            "WITH c, collect(DISTINCT {"
-            "program: p.name, "
-            "course_type: CASE WHEN b.elective = 'yes' THEN 'elective' ELSE 'core' END"
-            "}) AS program_details"
-        )
-        return_list = ", ".join([f"c.{field} AS {field}" for field in base_fields])
+        if 'code' in base_fields:
+            query_parts.append(
+                "WITH c, collect(DISTINCT {"
+                "program: p.name, "
+                "course_type: CASE WHEN b.elective = 'yes' THEN 'elective' ELSE 'core' END"
+                "}) AS program_details, collect(b.code)[0] AS rel_code"
+            )
+        else:
+            query_parts.append(
+                "WITH c, collect(DISTINCT {"
+                "program: p.name, "
+                "course_type: CASE WHEN b.elective = 'yes' THEN 'elective' ELSE 'core' END"
+                "}) AS program_details"
+            )
+        return_parts = [
+            "COALESCE(c.code, rel_code) AS code" if field == 'code' else f"c.{field} AS {field}"
+            for field in base_fields
+        ]
+        return_list = ", ".join(return_parts)
         query_parts.append(f"RETURN {return_list}, program_details")
     else:
-        return_clause = ", ".join([f"c.{field} AS {field}" for field in base_fields])
+        return_parts = [
+            "COALESCE(c.code, b.code) AS code" if field == 'code' else f"c.{field} AS {field}"
+            for field in base_fields
+        ]
+        return_clause = ", ".join(return_parts)
         query_parts.append(f"RETURN DISTINCT {return_clause}")
 
     if 'code' in base_fields:
-        query_parts.append("ORDER BY c.code")
+        query_parts.append("ORDER BY code")
     elif 'name' in base_fields:
         query_parts.append("ORDER BY c.name")
 

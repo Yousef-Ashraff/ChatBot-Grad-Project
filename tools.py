@@ -362,10 +362,10 @@ def get_all_electives(program_name: str) -> str:
         WHERE r.elective = 'yes'
         RETURN
             c.name AS course_name,
-            c.code AS course_code,
+            COALESCE(c.code, r.code) AS course_code,
             c.description AS description,
             c.credit_hours AS credit_hours
-        ORDER BY c.code
+        ORDER BY COALESCE(c.code, r.code)
         """
         result = run_cypher_query(query, {"program_name": prog})
         return _to_str(result)
@@ -548,16 +548,9 @@ def get_program_info(
     - Full elective course catalogue
 
     Use this for questions like:
-    - "What is the AI / SAD / Data Science program?" (description / overview)
-    - "Tell me about the artificial intelligence track" (description)
+    - "What is the AI / SAD / Data Science program?"
+    - "Tell me about the artificial intelligence track"
     - "Compare the AI and SAD programs" (call once per program)
-
-    Do NOT use this for curriculum questions — use the dedicated tools instead:
-    - Full curriculum (all years)  → get_all_core_courses
-    - Years 3–4 / specialization   → get_specialized_core_courses
-    - Years 1–2 / foundation       → get_general_core_courses
-    - Electives catalogue          → get_all_electives
-    - Elective slot schedule       → get_elective_slots
 
     Args:
         prg:         Program name 'full names'.
@@ -594,95 +587,293 @@ def get_credit_hour_distribution() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ── Curriculum breakdown tools ───────────────────────────────────────────────
+# ── Course-category tools ────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
 @tool
-def get_specialized_core_courses(program_name: str) -> str:
+def get_specialized_core_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
     """
-    Return the specialized (upper-level) curriculum for a program.
+    Return the specialized **core** (non-elective) courses for a program.
 
-    Covers:
-    - All core courses in Years 3 and 4 (the main specialization years).
-    - One program-specific course that appears earlier but is unique to the track:
-        • data science  → "fundamentals of data science" (Year 2, Sem 2)
-        • AIM / SAD     → "technical report writing"      (Year 1, Sem 2)
-    - The elective slot schedule (which semesters electives can be taken).
+    These are courses whose code starts with the program's prefix
+    (AIM / SAD / DAS) and are mandatory (not elective).
+    They correspond to the "applied / specialized courses" (51 cr) category.
 
-    Use this for questions like:
-    - "What specialised courses are in Year 3 of SAD?"
-      (call this tool — the LLM will filter to Year 3 from the result)
-    - "What advanced courses does the AI track have?"
-    - "Show me the upper-level curriculum for data science"
-    - "What do students study in years 3 and 4 of my program?"
+    Use this when the student asks:
+    - "What specialized courses are NOT elective in the SAD program?"
+    - "What mandatory specialized courses does AIM have?"
+    - "List the core courses specific to the data science track"
 
     Args:
-        program_name: Full canonical program name, e.g.
-                      "artificial intelligence & machine learning",
-                      "software & application development", "data science".
+        prg:       Program name. E.g. "artificial intelligence & machine learning",
+                   "software & application development", "data science" (or aliases
+                   like "AIM", "SAD", "DS").
+        year_flag: Set True to include the year level for each course.
+        sem_flag:  Set True to include the semester for each course.
     """
     try:
         from neo4j_track_functions import get_specialized_core_courses as _fn
-        return _to_str(_fn(program_name))
+        return _to_str(_fn(prg, year_flag=year_flag, sem_flag=sem_flag))
     except Exception as exc:
         return f"Error fetching specialized core courses: {exc}"
 
 
 @tool
-def get_general_core_courses(program_name: str) -> str:
+def get_specialized_elective_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
     """
-    Return the general (foundational) core curriculum for a program.
+    Return the specialized **elective** courses available in a program.
 
-    Covers all courses in Years 1 and 2, which form the shared foundation
-    across all tracks.  Includes notes about the two courses that differ
-    between programs:
-    - "fundamentals of data science" (Year 2, Sem 2) — data science ONLY
-    - "technical report writing"     (Year 1, Sem 2) — AIM and SAD ONLY
+    These are courses whose code starts with the program's prefix
+    (AIM / SAD / DAS) and are elective (students choose some of them).
+    When year_flag or sem_flag is True the elective *slot schedule* is
+    returned (the semesters when students may fill elective slots), since
+    individual elective courses have no fixed placement in the curriculum.
 
-    Use this for questions like:
-    - "What courses do students take in the first two years?"
-    - "What is the foundational curriculum for the AI track?"
-    - "What general courses are in SAD?"
-    - "What do first- and second-year students study in data science?"
+    Use this when the student asks:
+    - "What electives does the AI track offer?"
+    - "What program-specific electives are in data science?"
+    - "Show me elective options for SAD"
 
     Args:
-        program_name: Full canonical program name.
+        prg:       Program name or alias.
+        year_flag: Set True to include the elective slot year schedule.
+        sem_flag:  Set True to include the elective slot semester schedule.
     """
     try:
-        from neo4j_track_functions import get_general_core_courses as _fn
-        return _to_str(_fn(program_name))
+        from neo4j_track_functions import get_specialized_elective_courses as _fn
+        return _to_str(_fn(prg, year_flag=year_flag, sem_flag=sem_flag))
     except Exception as exc:
-        return f"Error fetching general core courses: {exc}"
+        return f"Error fetching specialized elective courses: {exc}"
 
 
 @tool
-def get_all_core_courses(program_name: str) -> str:
+def get_all_specialized_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
     """
-    Return the COMPLETE core curriculum for a program (Years 1–4) in one call.
+    Return ALL specialized courses (core + elective) for a program.
 
-    Combines the general core (Years 1–2) and specialized core (Years 3–4)
-    into a single structured response.  Also includes the elective slot
-    schedule and any program-specific courses unique to the track.
+    These are courses unique to that track, identified by the program code
+    prefix (AIM / SAD / DAS).  Combines both mandatory and elective courses.
+    The applied/specialized category totals 51 credits.
 
-    Use this for questions like:
-    - "What courses are in the data science program?"
-    - "Show me the full curriculum for the AI track"
-    - "What do students study throughout the entire SAD program?"
-    - "Give me a complete overview of the AIM curriculum"
-
-    Prefer this over calling get_general_core_courses + get_specialized_core_courses
-    separately when the student wants the full picture in one answer.
+    Use this when the student asks:
+    - "What courses are special to the data science program?"
+    - "What courses are in the data science program but not in others?"
+    - "What specialised courses does SAD offer?"
+    - "What courses differ between AIM and SAD?" (call once per program)
+    - "What specialised courses are in year 3 of SAD?" (return all, LLM filters by year)
 
     Args:
-        program_name: Full canonical program name, e.g.
-                      "artificial intelligence & machine learning",
-                      "software & application development", "data science".
+        prg:       Program name or alias.
+        year_flag: Include year for core courses; elective slot years for electives.
+        sem_flag:  Include semester for core courses; elective slot semesters for electives.
+    """
+    try:
+        from neo4j_track_functions import get_all_specialized_courses as _fn
+        return _to_str(_fn(prg, year_flag=year_flag, sem_flag=sem_flag))
+    except Exception as exc:
+        return f"Error fetching all specialized courses: {exc}"
+
+
+@tool
+def get_general_courses(
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
+    """
+    Return the humanities / general education courses (code prefix: GEN).
+
+    These courses are **identical across all three programs** and total 12 credits.
+
+    Use this when the student asks:
+    - "What general courses are there?"
+    - "What humanities courses do I take?"
+    - "What GEN courses are in the curriculum?"
+    - "What general courses are in the data science program?" (same for all)
+
+    Args:
+        year_flag: Set True to include the year level for each course.
+        sem_flag:  Set True to include the semester for each course.
+    """
+    try:
+        from neo4j_track_functions import get_general_courses as _fn
+        return _to_str(_fn(year_flag=year_flag, sem_flag=sem_flag))
+    except Exception as exc:
+        return f"Error fetching general courses: {exc}"
+
+
+@tool
+def get_math_and_basic_science_courses(
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
+    """
+    Return the mathematics and basic sciences courses (code prefix: BAS).
+
+    These courses are **identical across all three programs** and total 24 credits.
+
+    Use this when the student asks:
+    - "What math courses are there?"
+    - "What mathematics and basic science courses do I study?"
+    - "Show me BAS courses"
+    - "What math courses are in the data science program?" (same for all)
+
+    Args:
+        year_flag: Set True to include the year level for each course.
+        sem_flag:  Set True to include the semester for each course.
+    """
+    try:
+        from neo4j_track_functions import get_MathAndBasicScience_courses as _fn
+        return _to_str(_fn(year_flag=year_flag, sem_flag=sem_flag))
+    except Exception as exc:
+        return f"Error fetching math and basic science courses: {exc}"
+
+
+@tool
+def get_basic_computing_sciences_courses(
+    prg: str = None,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
+    """
+    Return the basic computing sciences courses (code prefix: BCS).
+
+    Mostly identical across programs (36 credits), with one difference:
+    - Data Science has **"Fundamentals of Data Science"** (not in AIM/SAD).
+    - AIM and SAD have **"Technical Report Writing"** (not in Data Science).
+
+    Provide *prg* to get the exact BCS list for that program.
+    Omit *prg* to get all BCS courses (with a note about the difference).
+
+    Use this when the student asks:
+    - "What computing science courses are there?"
+    - "What BCS courses does the AI track have?"
+    - "List basic computing sciences courses for data science"
+
+    Args:
+        prg:       Program name or alias (optional).
+        year_flag: Set True to include the year level for each course.
+        sem_flag:  Set True to include the semester for each course.
+    """
+    try:
+        from neo4j_track_functions import get_BasicComputingSciences_courses as _fn
+        return _to_str(_fn(prg=prg, year_flag=year_flag, sem_flag=sem_flag))
+    except Exception as exc:
+        return f"Error fetching basic computing sciences courses: {exc}"
+
+
+@tool
+def get_all_types_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
+    """
+    Return every course in the curriculum for a program, grouped by category.
+
+    Covers all four course categories:
+      • Applied / specialized (51 cr)  — core + elective, program-specific
+      • Humanities / general  (12 cr)  — GEN prefix, same for all programs
+      • Math & basic sciences (24 cr)  — BAS prefix, same for all programs
+      • Basic computing sci.  (36 cr)  — BCS prefix, mostly shared
+    (Field training 6 cr and graduation projects 7 cr bring the full degree
+    to 136 credits; those are noted but not listed as courses.)
+
+    Use this when the student asks:
+    - "What courses are in the data science program?"
+    - "Show me the full curriculum for AIM"
+    - "What do students study in the SAD track?"
+
+    Args:
+        prg:       Program name or alias.
+        year_flag: Include year level for each course.
+        sem_flag:  Include semester for each course.
+    """
+    try:
+        from neo4j_track_functions import get_all_types_courses as _fn
+        return _to_str(_fn(prg, year_flag=year_flag, sem_flag=sem_flag))
+    except Exception as exc:
+        return f"Error fetching all course types: {exc}"
+
+
+@tool
+def get_all_core_courses(
+    prg: str,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
+    """
+    Return all **core (non-elective)** courses for a program, grouped by category.
+
+    Covers:
+      • Specialized core (51 cr)  — mandatory program-specific courses
+      • Humanities / general (12 cr)
+      • Math & basic sciences (24 cr)
+      • Basic computing sciences (36 cr)
+    (Field training 6 cr and graduation projects 7 cr noted but not listed.)
+    Total degree: 136 credits.
+
+    Use this when the student asks:
+    - "What are the core courses in data science?"
+    - "What courses are NOT elective in the AIM program?"
+    - "Show me only mandatory courses for SAD"
+
+    Args:
+        prg:       Program name or alias.
+        year_flag: Include year level for each course.
+        sem_flag:  Include semester for each course.
     """
     try:
         from neo4j_track_functions import get_all_core_courses as _fn
-        return _to_str(_fn(program_name))
+        return _to_str(_fn(prg, year_flag=year_flag, sem_flag=sem_flag))
     except Exception as exc:
         return f"Error fetching all core courses: {exc}"
+
+
+@tool
+def get_all_not_specialized_courses(
+    prg: str = None,
+    year_flag: bool = False,
+    sem_flag: bool = False,
+) -> str:
+    """
+    Return the courses that are **shared across all programs** (non-specialized).
+
+    Covers:
+      • Humanities / general  (12 cr)  — GEN prefix
+      • Math & basic sciences (24 cr)  — BAS prefix
+      • Basic computing sci.  (36 cr)  — BCS prefix (mostly shared)
+    Total: 72 cr in courses + 13 cr field training/grad projects = 85 cr non-specialized.
+
+    Provide *prg* to get the BCS list specific to that program (handles the
+    DS vs AIM/SAD one-course difference).
+
+    Use this when the student asks:
+    - "What courses are NOT special to the data science program?"
+    - "What courses are shared between all programs?"
+    - "What courses would I take regardless of which track I choose?"
+
+    Args:
+        prg:       Program name or alias (optional).
+        year_flag: Include year level for each course.
+        sem_flag:  Include semester for each course.
+    """
+    try:
+        from neo4j_track_functions import get_all_not_specialized_courses as _fn
+        return _to_str(_fn(prg=prg, year_flag=year_flag, sem_flag=sem_flag))
+    except Exception as exc:
+        return f"Error fetching non-specialized courses: {exc}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -705,7 +896,14 @@ ALL_TOOLS = [
     start_course_planning,
     get_program_info,
     get_credit_hour_distribution,
+    # Course-category tools
     get_specialized_core_courses,
-    get_general_core_courses,
+    get_specialized_elective_courses,
+    get_all_specialized_courses,
+    get_general_courses,
+    get_math_and_basic_science_courses,
+    get_basic_computing_sciences_courses,
+    get_all_types_courses,
     get_all_core_courses,
+    get_all_not_specialized_courses,
 ]

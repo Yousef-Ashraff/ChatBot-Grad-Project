@@ -413,7 +413,9 @@ def _load_courses() -> List[Dict]:
     try:
         from neo4j_course_functions import run_cypher_query
         rows = run_cypher_query(
-            "MATCH (c:Course) RETURN c.name AS name, c.code AS code ORDER BY c.name"
+            "MATCH (c:Course) OPTIONAL MATCH (c)-[r:BELONGS_TO]->(:Program) "
+            "WITH c, collect(r.code)[0] AS rel_code "
+            "RETURN c.name AS name, COALESCE(c.code, rel_code) AS code ORDER BY c.name"
         )
         _COURSE_CACHE = [
             {"name": r["name"], "code": r["code"] or "",
