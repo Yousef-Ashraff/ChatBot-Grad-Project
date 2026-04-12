@@ -133,23 +133,29 @@ def get_student_info() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @tool
-def get_course_info(course_name: str) -> str:
+def get_course_info(course_name: str, program_name: Optional[str] = None) -> str:
     """
     Get general information about a specific course.
-    Returns: full course name, description, credit hours, and course type
+    Returns: full course name, description, credit hours, course code, and course type
     (core / elective).
 
     Use this when the student wants to know what a course is about,
-    how many credits it gives, or whether it is core or elective.
-    Examples: "What is Machine Learning about?", "How many credits is SE?"
+    how many credits it gives, its course code, or whether it is core or elective.
+    Examples: "What is Machine Learning about?", "How many credits is SE?",
+              "What is the code for Machine Learning in the AIM program?"
 
     Args:
         course_name: Course name, abbreviation, or partial name. Fuzzy
                      matching is applied automatically (e.g. "ml", "soft eng").
+        program_name: (optional) Full program name to get program-specific info
+                      such as the correct course code. Required for courses whose
+                      code differs per program (e.g. Machine Learning, Deep Learning).
+                      Examples: "artificial intelligence and machine learning",
+                                "software and application development", "data science".
     """
     try:
         from neo4j_course_functions import get_course_info as _fn
-        return _to_str(_fn(_normalize_course(course_name)))
+        return _to_str(_fn(_normalize_course(course_name), program_name=program_name))
     except Exception as exc:
         return f"Error fetching course info: {exc}"
 
@@ -374,10 +380,10 @@ def get_all_electives(program_name: str) -> str:
 
 
 @tool
-def get_elective_slots(program_name: str) -> str:
+def get_elective_slots_time_and_occ(program_name: str) -> str:
     """
     Get the elective slot schedule for a program: which year/semester
-    students can take electives and how many slots are available.
+    students can take electives and how many slots are available at each time.
 
     Use this for questions like:
     - "When can I take electives?"
@@ -388,8 +394,8 @@ def get_elective_slots(program_name: str) -> str:
         program_name: The student's program/track.
     """
     try:
-        from neo4j_course_functions import get_elective_slots_time
-        return _to_str(get_elective_slots_time(program_name))
+        from neo4j_course_functions import get_elective_slots_time_and_occ as _fn
+        return _to_str(_fn(program_name))
     except Exception as exc:
         return f"Error fetching elective slots: {exc}"
 
@@ -889,7 +895,7 @@ ALL_TOOLS = [
     get_courses_by_term,
     get_courses_by_multiple_terms,
     get_all_electives,
-    get_elective_slots,
+    get_elective_slots_time_and_occ,
     filter_courses,
     get_program_total_credits,
     answer_academic_question,

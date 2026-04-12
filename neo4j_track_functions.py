@@ -8,7 +8,8 @@ for program-level (track) data, such as total credits required per program.
 from neo4j_course_functions import (
     run_cypher_query,
     get_courses_by_multiple_terms,
-    get_elective_slots_time,
+    get_elective_slots_time_and_occ,
+    get_elective_slots_time,          # backward-compat alias used by get_program_info
     get_all_electives_by_program,
 )
 
@@ -161,17 +162,20 @@ def get_specialized_core_courses(
 
     # ── Elective slot entries ────────────────────────────────────────────────
     slot_credit_hours = 3
-    slots = get_elective_slots_time(prg)           # list of "Year / Sem" strings
+    slots = get_elective_slots_time_and_occ(prg)   # list of {"slot": "Year / Sem", "count": N}
     if not isinstance(slots, list):
         slots = []
 
-    for slot_str in slots:
+    for slot_info in slots:
+        slot_str = slot_info["slot"]
+        count = slot_info["count"]
         parsed = _parse_elective_slot(slot_str)
         slot_entry: dict = {
             "course_name": "Elective Slot",
             "course_code": "ELECTIVE",
-            "credit_hours": slot_credit_hours,
-            "slot_schedule": slot_str,             # always keep the raw string
+            "credit_hours": slot_credit_hours * count,   # total credits for this time position
+            "count": count,                              # number of slots at this time
+            "slot_schedule": slot_str,
         }
         if year_flag:
             slot_entry["year"] = parsed["year"]
@@ -220,17 +224,17 @@ def get_specialized_elective_courses(
         year_flag=False,   # no fixed year/sem per elective course
         sem_flag=False,
     )
-    total_credits = sum(c["credit_hours"] or 0 for c in courses)
+    # total_credits = sum(c["credit_hours"] or 0 for c in courses)
 
     result: dict = {
         "program": prg,
         "type": "specialized_elective",
-        "total_credits": total_credits,
+        "total_credits": 0,
         "courses": courses,
     }
 
     if year_flag or sem_flag:
-        result["elective_slots"] = get_elective_slots_time(prg)
+        result["elective_slots"] = get_elective_slots_time_and_occ(prg)
         result["note"] = (
             "Elective courses have no fixed year/semester. "
             "'elective_slots' shows when students may fill these slots."
@@ -593,17 +597,16 @@ def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True)
     Args:
         prg:         Program name or alias (e.g. "AIM", "data science", "SAD").
         course_info: If True, include curriculum data:
-                     - Core + elective courses for years 3 and 4 (from Neo4j)
-                     - Hardcoded year-1/2 courses that differ between tracks
-                     - Elective slot schedule
-                     - Full elective catalogue
+                     - All specialized courses (core + elective) via get_all_specialized_courses
+                     - Elective slot schedule (with occurrence counts)
+                     - Note about shared course types across all programs
         desc_info:   If True, fetch the program description from Neo4j.
 
     Returns:
         Dict with keys populated based on the flags set.
         Always includes credit_hour_distribution (shared across all programs).
     """
-   
+
     if prg is None:
         return {"error": "Program name must be provided. Use 'AIM', 'SAD', or 'data science'."}
 
@@ -614,49 +617,16 @@ def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True)
 
     # ── Course information ────────────────────────────────────────────────────
     if course_info:
-        # Year 3 + 4 courses from the knowledge graph
-        terms_3_4 = [
-            {"level": 3, "semester": 1},
-            {"level": 3, "semester": 2},
-            {"level": 4, "semester": 1},
-            {"level": 4, "semester": 2},
-        ]
-        curriculum_3_4 = get_courses_by_multiple_terms(terms_3_4, program_name=prg)
+        result["specialized_courses"] = get_all_specialized_courses(prg)
 
-        # Hardcoded year-1/2 courses that differ between programs.
-        # All programs share the same year-1 and year-2 curriculum EXCEPT:
-        #   • "data science" has "fundamentals of data science"
-        #     which is absent from AIM and SAD.
-        #   • AIM and SAD have "technical report writing"
-        #     which is absent from data science.
-        _UNIQUE_YEAR12: dict = {
-            "artificial intelligence & machine learning": [
-                {
-                    "course_name": "technical report writing",
-                    "note": "present in AIM and SAD only (not in data science)",
-                }
-            ],
-            "software & application development": [
-                {
-                    "course_name": "technical report writing",
-                    "note": "present in AIM and SAD only (not in data science)",
-                }
-            ],
-            "data science": [
-                {
-                    "course_name": "fundamentals of data science",
-                    "note": "present in data science only (not in AIM or SAD)",
-                }
-            ],
-        }
-
-        result["curriculum"] = {
-            "years_3_and_4": curriculum_3_4,
-            "unique_year_1_2_courses": _UNIQUE_YEAR12.get(prg, []),
-        }
-
-        result["elective_slots"] = get_elective_slots_time(prg)
-        result["electives"] = get_all_electives_by_program(prg)
+        result["shared_courses_note"] = (
+            "All three programs (AIM, SAD, Data Science) share the same courses in the "
+            "following categories: General Courses (humanities), Math & Basic Science, and "
+            "Basic Computing Sciences — EXCEPT in Basic Computing Sciences: "
+            "'data science' has 'Fundamentals of Data Science' which is absent from "
+            "AIM and SAD; AIM and SAD have 'Technical Report Writing' which is absent "
+            "from Data Science."
+        )
 
     # ── Description / program overview ───────────────────────────────────────
     if desc_info:

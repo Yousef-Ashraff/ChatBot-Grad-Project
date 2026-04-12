@@ -753,23 +753,33 @@ def get_course_timing(course_name, program_name=None):
     return timing_info
 
 
-def get_elective_slots_time(program_name=None):
+def get_elective_slots_time_and_occ(program_name=None):
     """
-    Get elective course slots for each program.
+    Get elective course slots with occurrence counts for each program.
 
     Args:
         program_name: Optional program name (string) or list of program names
 
     Returns:
-        Dictionary with elective slots by program
+        For a single program: list of dicts [{"slot": "Year / Sem", "count": N}, ...]
+        For multiple/all programs: dict mapping program name -> list of dicts
     """
 
-    # Define elective slots for each program
-    ['Third Year / Second Sem', 'Fourth Year / First Sem', 'Fourth Year / Second Sem']
     elective_slots = {
-        'software & application development':['Third Year / Second Sem', 'Fourth Year / First Sem', 'Fourth Year / Second Sem'],
-        'data science':['Third Year / Second Sem', 'Fourth Year / First Sem', 'Fourth Year / Second Sem'],
-        'artificial intelligence & machine learning':['Fourth Year / First Sem', 'Fourth Year / Second Sem']
+        'software & application development': [
+            {"slot": "Third Year / Second Sem", "count": 1},
+            {"slot": "Fourth Year / First Sem",  "count": 2},
+            {"slot": "Fourth Year / Second Sem", "count": 2},
+        ],
+        'data science': [
+            {"slot": "Third Year / Second Sem", "count": 1},
+            {"slot": "Fourth Year / First Sem",  "count": 2},
+            {"slot": "Fourth Year / Second Sem", "count": 2},
+        ],
+        'artificial intelligence & machine learning': [
+            {"slot": "Fourth Year / First Sem",  "count": 2},
+            {"slot": "Fourth Year / Second Sem", "count": 3},
+        ],
     }
 
     # If no program specified, return all
@@ -795,6 +805,10 @@ def get_elective_slots_time(program_name=None):
         return list(result.values())[0]
 
     return result
+
+
+# backward-compat alias — keep until get_program_info is recreated
+get_elective_slots_time = get_elective_slots_time_and_occ
 
 
 def get_all_electives_by_program(program_name=None):
@@ -1095,89 +1109,6 @@ def get_credit_hour_distribution() -> dict:
             "graduation projects": 7,
         }
     }
-
-
-def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True) -> dict:
-    """
-    Get comprehensive information about a specific program/track.
-
-    Args:
-        prg:         Program name or alias (e.g. "AIM", "data science", "SAD").
-        course_info: If True, include curriculum data:
-                     - Core + elective courses for years 3 and 4 (from Neo4j)
-                     - Hardcoded year-1/2 courses that differ between tracks
-                     - Elective slot schedule
-                     - Full elective catalogue
-        desc_info:   If True, fetch the program description from Neo4j.
-
-    Returns:
-        Dict with keys populated based on the flags set.
-        Always includes credit_hour_distribution (shared across all programs).
-    """
-
-    
-    if prg is None:
-        return {"error": "Program name must be provided. Use 'AIM', 'SAD', or 'data science'."}
-
-
-    result: dict = {
-        "program": prg,
-        "credit_hour_distribution": get_credit_hour_distribution(),
-    }
-
-    # ── Course information ────────────────────────────────────────────────────
-    if course_info:
-        # Year 3 + 4 courses from the knowledge graph
-        terms_3_4 = [
-            {"level": 3, "semester": 1},
-            {"level": 3, "semester": 2},
-            {"level": 4, "semester": 1},
-            {"level": 4, "semester": 2},
-        ]
-        curriculum_3_4 = get_courses_by_multiple_terms(terms_3_4, program_name=prg)
-
-        # Hardcoded year-1/2 courses that differ between programs.
-        # All programs share the same year-1 and year-2 curriculum EXCEPT:
-        #   • "data science" has "fundamentals of data science"
-        #     which is absent from AIM and SAD.
-        #   • AIM and SAD have "technical report writing"
-        #     which is absent from data science.
-        _UNIQUE_YEAR12: dict = {
-            "artificial intelligence & machine learning": [
-                {
-                    "course_name": "technical report writing",
-                    "note": "present in AIM and SAD only (not in data science)",
-                }
-            ],
-            "software & application development": [
-                {
-                    "course_name": "technical report writing",
-                    "note": "present in AIM and SAD only (not in data science)",
-                }
-            ],
-            "data science": [
-                {
-                    "course_name": "fundamentals of data science",
-                    "note": "present in data science only (not in AIM or SAD)",
-                }
-            ],
-        }
-
-        result["curriculum"] = {
-            "years_3_and_4": curriculum_3_4,
-            "unique_year_1_2_courses": _UNIQUE_YEAR12.get(prg, []),
-        }
-
-        result["elective_slots"] = get_elective_slots_time(prg)
-        result["electives"] = get_all_electives_by_program(prg)
-
-    # ── Description / program overview ───────────────────────────────────────
-    if desc_info:
-        query = "MATCH (p:Program {name: $program_name}) RETURN p.description AS description"
-        rows = run_cypher_query(query, {"program_name": prg})
-        result["description"] = rows[0]["description"] if rows else None
-
-    return result
 
 
 def interactive_eligibility_check(course_name, program_name=None, student_id=os.getenv("STUDENT_ID")):

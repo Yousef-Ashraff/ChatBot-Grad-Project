@@ -133,7 +133,11 @@ _ANSWER_SYSTEM = (
     "Use **bold** for key terms, bullet points for lists. "
     "Do NOT cite article numbers, source names, or tool names. "
     "If the context is insufficient, say so and suggest the student contact "
-    "the registrar's office."
+    "the registrar's office. "
+    "IMPORTANT: When listing courses, always include 'Elective Slot' entries "
+    "exactly like any other course — do NOT skip or omit them. An elective slot "
+    "is a scheduled course position (not a specific elective course itself) and "
+    "must appear in the list."
 )
 
 
