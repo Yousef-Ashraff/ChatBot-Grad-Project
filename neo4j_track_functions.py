@@ -620,11 +620,11 @@ def get_program_info(prg: str, course_info: bool = True, desc_info: bool = True)
         result["specialized_courses"] = get_all_specialized_courses(prg)
 
         result["shared_courses_note"] = (
-            "All three programs (AIM, SAD, Data Science) share the same courses in the "
+            "All three programs (artificial intelligence & machine learning, software & application development, Data Science) share the same courses in the "
             "following categories: General Courses (humanities), Math & Basic Science, and "
             "Basic Computing Sciences — EXCEPT in Basic Computing Sciences: "
             "'data science' has 'Fundamentals of Data Science' which is absent from "
-            "AIM and SAD; AIM and SAD have 'Technical Report Writing' which is absent "
+            " artificial intelligence & machine learning and software & application development; artificial intelligence & machine learning and software & application development have 'Technical Report Writing' which is absent "
             "from Data Science."
         )
 
@@ -643,8 +643,8 @@ def get_program_total_credits(program_name: str) -> dict:
 
     Args:
         program_name: Canonical program name, e.g.
-                      "artificial intelligence and machine learning",
-                      "software and application development",
+                      "artificial intelligence & machine learning",
+                      "software & application development",
                       "data science".
 
     Returns:

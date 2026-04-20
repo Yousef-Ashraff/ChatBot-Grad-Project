@@ -333,16 +333,30 @@ class PendingAmbiguity:
     ambiguous_term:   str                    # the term the student typed, e.g. "ai"
     candidates:       List[Dict]             # [{name, code, confidence}, ...] — course_name type
     resolved_courses: Dict[str, str]         # already-resolved course mappings so far
-    pending_courses:  Dict[str, str]         # remaining courses not yet mapped (original→deduped)
+    pending_courses:  List[Tuple[str, int, str]]  # remaining course occurrences not yet mapped: [(original, char_pos, deduped), ...]
     resolved_tracks:  Dict[str, str]         # already-resolved track mappings
     history:          List[Dict]             # conversation history at time of query
+    term_position:    int = -1               # char position of ambiguous_term in dereferenced query (-1 = unknown)
     # ── New fields (all optional with defaults for backward compatibility) ──
     ambiguity_type:   str = "course_name"    # "course_name" | "course_vs_track"
     course_canonical: Optional[str] = None  # for course_vs_track: the course option
     track_canonical:  Optional[str] = None  # for course_vs_track: the track option
     student_track:    Optional[str] = None  # student's enrolled canonical track (for heuristic)
-    pending_track_course_conflicts: Dict[str, Tuple[str, str]] = field(default_factory=dict)
-    # ^ remaining unresolved course-vs-track conflicts: {original: (course_canon, track_canon)}
+    pending_track_course_conflicts: List[Tuple[str, int, str, str]] = field(default_factory=list)
+    # ^ remaining unresolved course-vs-track conflicts: [(original, char_pos, course_canon, track_canon)]
+    #   List (not dict) so two occurrences of the same surface text at different positions
+    #   are stored independently.
+    resolved_course_occ: List[Tuple[str, int, str]] = field(default_factory=list)
+    # ^ (original_term, char_pos, canonical_course_name) for every occurrence resolved as a course
+    #   used for position-aware skip checks and positional rewriting
+    pending_track_occurrences: List[Tuple[str, int, str]] = field(default_factory=list)
+    # ^ (original_term, char_pos, deduped_term) for track occurrences still needing Step 4 mapping
+    #   populated when process() returns early so the mapping happens post-disambiguation
+
+    def __post_init__(self) -> None:
+        """Normalize None → safe defaults (guards against accidental None assignment)."""
+        if self.term_position is None:          # type: ignore[comparison-overlap]
+            self.term_position = -1
 
 
 @dataclass
@@ -528,7 +542,10 @@ class QueryPreprocessor:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Step 1 — Entity extraction  (runs on resolved query)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Returns List[Tuple[str, int]] per category — one entry per
+        # OCCURRENCE: the same term appearing twice → two independent entries.
         raw_courses, raw_tracks = self._extract_entities(resolved)
+        # raw_courses / raw_tracks: [(term, char_pos), ...]
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Step 2 — Entity filtering + Char deduplication
@@ -536,27 +553,29 @@ class QueryPreprocessor:
         # Filter: discard any term whose lowercase form is in ENTITY_BLOCKLIST
         # (generic words like "electives", "semester", "year" that are not
         # actual course or track names).
+        # Occurrence lists: [(original, char_pos, deduped), ...]
+        # Each occurrence is INDEPENDENT even when the surface text repeats.
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        raw_courses = [t for t in raw_courses if t.lower().strip() not in ENTITY_BLOCKLIST]
-        raw_tracks  = [t for t in raw_tracks  if t.lower().strip() not in ENTITY_BLOCKLIST]
+        raw_courses = [(t, p) for t, p in raw_courses if t.lower().strip() not in ENTITY_BLOCKLIST]
+        raw_tracks  = [(t, p) for t, p in raw_tracks  if t.lower().strip() not in ENTITY_BLOCKLIST]
 
-        # original → deduped (may equal original when no dupe chars found)
-        course_orig_to_dedup: Dict[str, str] = {
-            t: self._dedupe_chars(t) for t in raw_courses
-        }
-        track_orig_to_dedup: Dict[str, str] = {
-            t: self._dedupe_chars(t) for t in raw_tracks
-        }
+        # Build occurrence triples: (original, char_pos, deduped)
+        course_occurrences: List[Tuple[str, int, str]] = [
+            (t, p, self._dedupe_chars(t)) for t, p in raw_courses
+        ]
+        track_occurrences: List[Tuple[str, int, str]] = [
+            (t, p, self._dedupe_chars(t)) for t, p in raw_tracks
+        ]
 
         dedup_notes = (
-            [f'Course  "{o}" -> "{d}"' for o, d in course_orig_to_dedup.items() if o != d]
-            + [f'Track   "{o}" -> "{d}"' for o, d in track_orig_to_dedup.items() if o != d]
+            [f'Course  "{o}" (pos {p}) -> "{d}"' for o, p, d in course_occurrences if o != d]
+            + [f'Track   "{o}" (pos {p}) -> "{d}"' for o, p, d in track_occurrences if o != d]
         )
 
         step12_lines = [
             f"Working query : {resolved}",
-            f"Courses found : {list(course_orig_to_dedup.keys()) or '(none)'}",
-            f"Tracks  found : {list(track_orig_to_dedup.keys())  or '(none)'}",
+            f"Courses found : {[(t, p) for t, p, _ in course_occurrences] or '(none)'}",
+            f"Tracks  found : {[(t, p) for t, p, _ in track_occurrences]  or '(none)'}",
         ]
         if dedup_notes:
             step12_lines += ["", "Char deduplication:"] + [f"  {n}" for n in dedup_notes]
@@ -565,34 +584,29 @@ class QueryPreprocessor:
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Step 2.5 — Track / Course conflict resolution
-        # Detect terms that could be either a course OR a track and resolve
-        # via intent signals before Steps 3 & 4 map them.
+        # Each OCCURRENCE is resolved INDEPENDENTLY using the local ±6-word
+        # context window around that occurrence's position.
+        # Same surface text at different positions may receive different
+        # resolutions (e.g. "ai at pos 25" → track, "ai at pos 44" → course).
         #
         # Two sources of conflict:
-        #   Part A — course terms also in TRACK_ALIASES (e.g. "ai" in both
-        #             COURSE_ALIASES and TRACK_ALIASES).  These stayed in
-        #             course_orig_to_dedup because _extract_entities no longer
-        #             blindly reclassifies dual-alias terms.
-        #   Part B — track terms (from track_orig_to_dedup) that also fuzzy-
-        #             match a course (e.g. "software" → "software engineering").
+        #   Part A — course occurrences also in TRACK_ALIASES
+        #             (e.g. "ai" in both COURSE_ALIASES and TRACK_ALIASES)
+        #   Part B — track occurrences that also fuzzy-match a course
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        conflict_debug:    List[str]                              = []
-        to_move_to_track:  List[str]                              = []
-        to_move_to_course: List[str]                              = []
-        # unresolved: (original, deduped, course_canon, track_canon, clarification)
-        unresolved: List[Tuple[str, str, str, str, str]]          = []
+        conflict_debug: List[str] = []
+        # (original, pos, deduped) occurrences to move between lists
+        to_move_to_track:  List[Tuple[str, int, str]] = []
+        to_move_to_course: List[Tuple[str, int, str]] = []
+        # unresolved: (original, pos, deduped, course_canon, track_canon, clarification)
+        unresolved: List[Tuple[str, int, str, str, str, str]] = []
 
-        # ── Part A: course terms that also match a track ──────────────────────
-        # Two sub-cases:
-        #   A1 — Dual-alias: term is in BOTH COURSE_ALIASES and TRACK_ALIASES
-        #        (e.g. "ai" → course "artificial intelligence" AND track "AIM")
-        #   A2 — Known conflict: term is in KNOWN_CONFLICT_COURSES and also
-        #        fuzzy-matches a track (e.g. "soft" → software courses AND SAD track)
-        for original, deduped in course_orig_to_dedup.items():
+        # ── Part A: course occurrences that also match a track ────────────────
+        for original, pos, deduped in course_occurrences:
             ded_lower = deduped.lower().strip()
 
             if ded_lower in COURSE_ALIASES and ded_lower in TRACK_ALIASES:
-                # A1: explicit dual-alias — use the alias dicts directly (no DB call)
+                # A1: explicit dual-alias
                 course_canon = COURSE_ALIASES[ded_lower]
                 track_canon  = TRACK_ALIASES[ded_lower]
 
@@ -606,146 +620,152 @@ class QueryPreprocessor:
                     continue
 
             else:
-                continue  # no conflict possible for this course term
+                continue  # no conflict possible for this occurrence
 
+            # Resolve using LOCAL context around this specific occurrence
             resolution, _, clarification = self._resolve_track_course_conflict(
-                original, resolved, course_canon, track_canon, student_track
+                original, resolved, course_canon, track_canon, student_track, char_pos=pos
             )
             conflict_debug.append(
-                f'"{original}"  →  course "{course_canon}"  OR  track "{track_canon}"'
+                f'"{original}" @{pos}  →  course "{course_canon}"  OR  track "{track_canon}"'
                 f"  [{resolution.upper()}]"
             )
             if resolution == "track":
-                to_move_to_track.append(original)
+                to_move_to_track.append((original, pos, deduped))
             elif resolution == "ambiguous":
-                unresolved.append((original, deduped, course_canon, track_canon, clarification))
+                unresolved.append((original, pos, deduped, course_canon, track_canon, clarification))
 
-        # ── Part B: track terms that also match a course ───────────────────
-        for original, deduped in track_orig_to_dedup.items():
-            # Skip terms already handled by Part A (in course_orig_to_dedup).
-            # Both dicts may contain the same term when the LLM extraction puts
-            # it in both courses and tracks simultaneously. Part A takes priority.
-            if original in course_orig_to_dedup:
-                continue
+        # ── Part B: track occurrences that also match a course ────────────────
+        course_occurrence_keys = {(o, p) for o, p, _ in course_occurrences}
+        for original, pos, deduped in track_occurrences:
+            if (original, pos) in course_occurrence_keys:
+                continue  # handled by Part A
             track_canon, _ = self._map_track_with_method(deduped)
             if not track_canon:
                 continue
-            # Check course match using both the raw term AND the resolved track name.
-            # e.g. "das" → no course match directly, but "data science" (resolved) IS
-            # in KNOWN_CONFLICT_COURSES as a course name too.
             course_canon = self._has_course_match(deduped) or self._has_course_match(track_canon)
             if not course_canon:
                 continue
+            # Resolve using LOCAL context around this specific occurrence
             resolution, _, clarification = self._resolve_track_course_conflict(
-                original, resolved, course_canon, track_canon, student_track
+                original, resolved, course_canon, track_canon, student_track, char_pos=pos
             )
             conflict_debug.append(
-                f'"{original}"  →  course "{course_canon}"  OR  track "{track_canon}"'
+                f'"{original}" @{pos}  →  course "{course_canon}"  OR  track "{track_canon}"'
                 f"  [{resolution.upper()}]"
             )
             if resolution == "course":
-                to_move_to_course.append(original)
+                to_move_to_course.append((original, pos, deduped))
             elif resolution == "ambiguous":
-                unresolved.append((original, deduped, course_canon, track_canon, clarification))
+                unresolved.append((original, pos, deduped, course_canon, track_canon, clarification))
 
-        # Apply auto-resolutions (must be done after iteration)
-        for orig in to_move_to_track:
-            deduped = course_orig_to_dedup.pop(orig)
-            track_orig_to_dedup[orig] = deduped
+        # Apply auto-resolutions (after iteration to avoid mutation-during-loop)
+        move_to_track_keys  = {(o, p) for o, p, _ in to_move_to_track}
+        move_to_course_keys = {(o, p) for o, p, _ in to_move_to_course}
+        course_occurrences = [
+            (o, p, d) for o, p, d in course_occurrences
+            if (o, p) not in move_to_track_keys
+        ]
+        new_track_occ = [
+            (o, p, d) for o, p, d in track_occurrences
+            if (o, p) not in move_to_course_keys
+        ]
+        for (o, p, d) in to_move_to_track:
+            new_track_occ.append((o, p, d))
+        track_occurrences = new_track_occ
 
-        # ── Process terms resolved as "course" in Part B ──────────────────────
-        # Now that we know intent is "course", determine which course(s) the term
-        # refers to.  Three outcomes:
-        #   • 1 candidate  → auto-resolve (no question needed)
-        #   • N candidates → ask user which course they meant
-        #   • 0 candidates → fall back to Step 3 fuzzy mapping
-        step25_course_resolutions:  Dict[str, str]  = {}   # orig → canonical (single winner)
-        unresolved_courses: List[Tuple[str, str, List[Dict]]] = []  # (orig, deduped, candidates)
+        # ── Process occurrences resolved as "course" in Part B ───────────────
+        # Each was a track term resolved to "course" intent; now find which course.
+        # (original, pos, deduped, canonical) for already-resolved ones
+        step25_resolved_occ: List[Tuple[str, int, str, str]] = []
+        step25_course_resolutions: Dict[str, str] = {}   # orig → canonical
+        # unresolved_courses: (orig, pos, deduped, candidates)
+        unresolved_courses: List[Tuple[str, int, str, List[Dict]]] = []
 
-        for orig in to_move_to_course:
-            ded = track_orig_to_dedup.pop(orig)
+        for (orig, pos, ded) in to_move_to_course:
             track_can, _ = self._map_track_with_method(ded)
             candidates   = self._get_course_candidates(ded, track_can)
 
             if len(candidates) == 1:
-                step25_course_resolutions[orig] = candidates[0]["name"]
+                canon = candidates[0]["name"]
+                step25_course_resolutions[orig] = canon
+                step25_resolved_occ.append((orig, pos, ded, canon))
                 conflict_debug.append(
-                    f'"{orig}"  →  auto-resolved course "{candidates[0]["name"]}"  [COURSE-AUTO]'
+                    f'"{orig}" @{pos}  →  auto-resolved course "{canon}"  [COURSE-AUTO]'
                 )
             elif len(candidates) > 1:
-                unresolved_courses.append((orig, ded, candidates))
+                unresolved_courses.append((orig, pos, ded, candidates))
                 conflict_debug.append(
-                    f'"{orig}"  →  {len(candidates)} possible courses  [COURSE-AMBIGUOUS]'
+                    f'"{orig}" @{pos}  →  {len(candidates)} possible courses  [COURSE-AMBIGUOUS]'
                 )
             else:
-                # No course found at all — let Step 3 handle it
-                course_orig_to_dedup[orig] = ded
+                # No course found — let Step 3 handle it
+                course_occurrences.append((orig, pos, ded))
 
         if conflict_debug:
             box("📝  STEP 2.5 — Track/Course Conflict", conflict_debug)
 
-        # ── Handle multi-course ambiguity (term resolved as "course" but many matches) ──
+        # ── Handle multi-course ambiguity from Part B ─────────────────────────
         if unresolved_courses:
-            orig0, ded0, cands0 = unresolved_courses[0]
+            orig0, pos0, ded0, cands0 = unresolved_courses[0]
             rest_courses = unresolved_courses[1:]
-
-            # Collect remaining course terms for chained processing
-            remaining_courses = {
-                orig: ded for orig, ded in course_orig_to_dedup.items()
-            }
-            # Add the other unresolved_courses terms to pending as well
-            for r_orig, r_ded, _ in rest_courses:
-                remaining_courses[r_orig] = r_ded
-
+            remaining_occ = list(course_occurrences) + [
+                (ro, rp, rd) for ro, rp, rd, _ in rest_courses
+            ]
+            step25_course_occ = [(o, p, c) for o, p, d, c in step25_resolved_occ]
             pending = PendingAmbiguity(
                 original_query   = query,
                 dereferenced     = resolved,
                 ambiguous_term   = orig0,
+                term_position    = pos0,
                 candidates       = cands0,
                 resolved_courses = step25_course_resolutions,
-                pending_courses  = remaining_courses,
+                pending_courses  = remaining_occ,
                 resolved_tracks  = {},
                 history          = history,
+                resolved_course_occ      = step25_course_occ,
+                pending_track_occurrences = list(track_occurrences),
             )
-            clarification = self._build_clarification(orig0, cands0)
             return PreprocessResult(
                 status        = "ambiguous",
-                clarification = clarification,
+                clarification = self._build_clarification(orig0, cands0, resolved, pos0),
                 pending       = pending,
             )
 
-        # Return ambiguity for the first unresolvable track-vs-course conflict
+        # ── Return ambiguity for first unresolvable track-vs-course conflict ──
         if unresolved:
-            orig0, ded0, course0, track0, clarif0 = unresolved[0]
+            orig0, pos0, ded0, course0, track0, clarif0 = unresolved[0]
             rest = unresolved[1:]
-
-            # Remaining course terms still need Step 3 mapping.
-            # Exclude ALL unresolved conflict terms (not just orig0) so that
-            # terms in pending_track_course_conflicts are not also put into
-            # pending_courses (which would trigger a duplicate course-name
-            # disambiguation after the student has already picked "track").
-            unresolved_terms = {r[0] for r in unresolved}
-            remaining_courses = {
-                orig: ded for orig, ded in course_orig_to_dedup.items()
-                if orig not in unresolved_terms
-            }
-
+            unresolved_occ_keys = {(r[0], r[1]) for r in unresolved}
+            remaining_occ = [
+                (o, p, d) for o, p, d in course_occurrences
+                if (o, p) not in unresolved_occ_keys
+            ]
+            # Track occurrences that were auto-resolved as TRACK (not in unresolved)
+            auto_track_occ = [
+                (o, p, d) for o, p, d in track_occurrences
+                if (o, p) not in unresolved_occ_keys
+            ]
+            step25_course_occ = [(o, p, c) for o, p, d, c in step25_resolved_occ]
             pending = PendingAmbiguity(
                 original_query   = query,
                 dereferenced     = resolved,
                 ambiguous_term   = orig0,
+                term_position    = pos0,
                 candidates       = [],
                 resolved_courses = {},
-                pending_courses  = remaining_courses,
+                pending_courses  = remaining_occ,
                 resolved_tracks  = {},
                 history          = history,
                 ambiguity_type   = "course_vs_track",
                 course_canonical = course0,
                 track_canonical  = track0,
                 student_track    = student_track,
-                pending_track_course_conflicts = {
-                    r[0]: (r[2], r[3]) for r in rest
-                },
+                pending_track_course_conflicts = [
+                    (r[0], r[1], r[3], r[4]) for r in rest
+                ],
+                resolved_course_occ      = step25_course_occ,
+                pending_track_occurrences = auto_track_occ,
             )
             return PreprocessResult(
                 status        = "ambiguous",
@@ -754,34 +774,38 @@ class QueryPreprocessor:
             )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # Step 3 — Course mapping
-        # resolved_courses: original_term → canonical_name
-        # This ensures _rewrite_query replaces the exact substring in query.
+        # Step 3 — Course mapping (per-occurrence, independent)
+        # resolved_courses: original_term → canonical (for PreprocessResult)
+        # resolved_course_occ: (term, pos, canonical) for positional rewriting
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # Carry forward any single-winner courses already resolved at Step 2.5.
         resolved_courses: Dict[str, str] = dict(step25_course_resolutions)
+        # Position-keyed: (term, pos, canonical) — accumulates as we map courses
+        resolved_course_occ: List[Tuple[str, int, str]] = [
+            (o, p, c) for o, p, d, c in step25_resolved_occ
+        ]
         course_debug_lines: List[str] = [
             f'"{orig}"  →  "{canon}"  [from Step 2.5]'
             for orig, canon in step25_course_resolutions.items()
         ]
 
-        for original, deduped in course_orig_to_dedup.items():
+        for original, pos, deduped in course_occurrences:
             result = self._map_course(deduped)
 
             if result["status"] == "resolved":
                 canonical = result["canonical"]
                 method    = result.get("method", "fuzzy match")
-                resolved_courses[original] = canonical          # key = ORIGINAL
+                resolved_courses[original] = canonical
+                resolved_course_occ.append((original, pos, canonical))
                 label = "(same)" if deduped.lower() == canonical.lower() else f"→  {canonical}"
                 course_debug_lines.append(
-                    f'"{original}"'
+                    f'"{original}" @{pos}'
                     + (f' [deduped: "{deduped}"]' if original != deduped else "")
                     + f"  {label}  [{method}]"
                 )
 
             elif result["status"] == "ambiguous":
                 course_debug_lines.append(
-                    f'"{original}" (deduped: "{deduped}")  →  AMBIGUOUS — '
+                    f'"{original}" @{pos} (deduped: "{deduped}")  →  AMBIGUOUS — '
                     f"{len(result['candidates'])} close matches found"
                 )
                 for i, c in enumerate(result["candidates"], 1):
@@ -791,90 +815,155 @@ class QueryPreprocessor:
                     )
                 box("📝  STEP 3 — Course Mapping", course_debug_lines)
 
-                # Collect courses after this one in iteration order
-                items_list  = list(course_orig_to_dedup.items())
-                cur_idx     = list(course_orig_to_dedup.keys()).index(original)
-                remaining   = dict(items_list[cur_idx + 1:])
+                # Remaining course occurrences after this one
+                cur_idx = next(
+                    (i for i, (o, p, d) in enumerate(course_occurrences)
+                     if o == original and p == pos),
+                    len(course_occurrences) - 1,
+                )
+                remaining_occ = list(course_occurrences[cur_idx + 1:])
 
-                pending       = PendingAmbiguity(
+                pending = PendingAmbiguity(
                     original_query   = query,
-                    dereferenced     = resolved,        # use resolved version
-                    ambiguous_term   = original,        # ORIGINAL term
+                    dereferenced     = resolved,
+                    ambiguous_term   = original,
+                    term_position    = pos,
                     candidates       = result["candidates"],
                     resolved_courses = resolved_courses,
-                    pending_courses  = remaining,
+                    pending_courses  = remaining_occ,
                     resolved_tracks  = {},
                     history          = history,
+                    resolved_course_occ      = list(resolved_course_occ),
+                    pending_track_occurrences = list(track_occurrences),
                 )
-                clarification = self._build_clarification(original, result["candidates"])
                 return PreprocessResult(
                     status        = "ambiguous",
-                    clarification = clarification,
+                    clarification = self._build_clarification(original, result["candidates"], resolved, pos),
                     pending       = pending,
                 )
             else:
                 course_debug_lines.append(
-                    f'"{original}"'
+                    f'"{original}" @{pos}'
                     + (f' [deduped: "{deduped}"]' if original != deduped else "")
                     + "  →  not found"
                 )
 
-        if course_orig_to_dedup:
+        if course_occurrences:
             box("📝  STEP 3 — Course Mapping", course_debug_lines)
         else:
             box("📝  STEP 3 — Course Mapping", ["No course terms to map."])
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # Step 4 — Track mapping
-        # resolved_tracks: original_term → canonical_name
+        # Step 4 — Track mapping (per-occurrence, independent)
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         resolved_tracks: Dict[str, str] = {}
         track_debug_lines: List[str] = []
 
-        for original, deduped in track_orig_to_dedup.items():
+        for original, pos, deduped in track_occurrences:
             canonical, method = self._map_track_with_method(deduped)
             if canonical:
-                resolved_tracks[original] = canonical           # key = ORIGINAL
+                resolved_tracks[original] = canonical
                 label = "(same)" if deduped.lower() == canonical.lower() else f"→  {canonical}"
                 track_debug_lines.append(
-                    f'"{original}"'
+                    f'"{original}" @{pos}'
                     + (f' [deduped: "{deduped}"]' if original != deduped else "")
                     + f"  {label}  [{method}]"
                 )
             else:
                 track_debug_lines.append(
-                    f'"{original}"'
+                    f'"{original}" @{pos}'
                     + (f' [deduped: "{deduped}"]' if original != deduped else "")
                     + "  →  not found"
                 )
 
-        if track_orig_to_dedup:
+        if track_occurrences:
             box("📝  STEP 4 — Track Mapping", track_debug_lines)
         else:
             box("📝  STEP 4 — Track Mapping", ["No track terms to map."])
 
+        # ── Step 4b: retry failed-track terms as courses ──────────────────
+        # When the LLM puts a term in tracks[] but no track name matches it,
+        # it may actually be a course (LLM misclassified "special topics",
+        # "data visualization", etc.).  Try _map_course() on those terms;
+        # if a course match exists, handle it exactly like Step 3 would have.
+        step4b_debug: List[str] = []
+        step4b_ambiguous: List[Tuple[str, int, str, List[Dict]]] = []
+
+        for original, pos, deduped in track_occurrences:
+            if original in resolved_tracks:
+                continue   # already resolved as track — skip
+            course_result = self._map_course(deduped)
+            if course_result["status"] == "resolved":
+                canonical = course_result["canonical"]
+                resolved_courses[original] = canonical
+                resolved_course_occ.append((original, pos, canonical))
+                step4b_debug.append(
+                    f'"{original}" @{pos}  →  course "{canonical}"  [track-fallback]'
+                )
+            elif course_result["status"] == "ambiguous":
+                step4b_ambiguous.append((original, pos, deduped, course_result["candidates"]))
+                step4b_debug.append(
+                    f'"{original}" @{pos}  →  AMBIGUOUS as course  [track-fallback]'
+                )
+            else:
+                step4b_debug.append(
+                    f'"{original}" @{pos}  →  not a course either  [track-fallback]'
+                )
+
+        if step4b_debug:
+            box("📝  STEP 4b — Track→Course Fallback", step4b_debug)
+
+        # Handle ambiguous track-fallback terms (ask student, chain remaining)
+        if step4b_ambiguous:
+            orig0, pos0, ded0, cands0 = step4b_ambiguous[0]
+            rest_4b = step4b_ambiguous[1:]
+            # remaining pending: the other ambiguous fallback occs
+            remaining_4b = [(ro, rp, rd) for ro, rp, rd, _ in rest_4b]
+            pending = PendingAmbiguity(
+                original_query   = query,
+                dereferenced     = resolved,
+                ambiguous_term   = orig0,
+                term_position    = pos0,
+                candidates       = cands0,
+                resolved_courses = resolved_courses,
+                pending_courses  = remaining_4b,
+                resolved_tracks  = resolved_tracks,
+                history          = history,
+                resolved_course_occ      = list(resolved_course_occ),
+                pending_track_occurrences = [],  # track occs already exhausted
+            )
+            return PreprocessResult(
+                status        = "ambiguous",
+                clarification = self._build_clarification(orig0, cands0, resolved, pos0),
+                pending       = pending,
+            )
+
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Step 5 — Query rewriting
+        # Build suffix-annotated positional replacements from all resolved entities,
+        # then apply them right-to-left so earlier positions are not shifted.
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # Build the full replacement table:
-        #   mapped terms    → canonical name
-        #   unmapped terms  → deduped spelling (minimum cleanup)
-        all_replacements: Dict[str, str] = {}
+        annotated_replacements: List[Tuple[int, int, str]] = []
 
-        # Mapped courses and tracks — add "course"/"program" suffix so the
-        # agent can distinguish entity type at a glance.
-        for k, v in resolved_courses.items():
-            all_replacements[k] = f"{v} course"
-        for k, v in resolved_tracks.items():
-            all_replacements[k] = f"{v} program"
+        # Course occurrences (Step 2.5 auto + Step 3) → " course" suffix
+        for o, p, ded, canon in step25_resolved_occ:
+            annotated_replacements.append((p, p + len(o), f"'{canon}' course"))
+        for original, pos, deduped in course_occurrences:
+            if original in resolved_courses:
+                canon = resolved_courses[original]
+                annotated_replacements.append((pos, pos + len(original), f"'{canon}' course"))
+            elif original != deduped:
+                annotated_replacements.append((pos, pos + len(original), deduped))
 
-        # Unmapped terms that were at least deduped (original != deduped)
-        for original, deduped in {**course_orig_to_dedup, **track_orig_to_dedup}.items():
-            if original not in all_replacements and original != deduped:
-                all_replacements[original] = deduped
+        # Track occurrences (Step 4) → " program" suffix
+        for original, pos, deduped in track_occurrences:
+            if original in resolved_tracks:
+                canon = resolved_tracks[original]
+                annotated_replacements.append((pos, pos + len(original), f"'{canon}' program"))
+            elif original != deduped:
+                annotated_replacements.append((pos, pos + len(original), deduped))
 
-        if not all_replacements:
-            # Even with no name mappings, use the resolved query (refs replaced)
+        if not annotated_replacements:
             if resolved != query:
                 box(
                     "📝  STEP 5 — Clean Query (sent to agent)",
@@ -885,9 +974,27 @@ class QueryPreprocessor:
                 ["Nothing changed — query passed through as-is."])
             return PreprocessResult(status="passthrough", clean_query=query)
 
-        # Rewrite on the resolved text (not the raw query) so the canonical
-        # names are substituted into the dereferenced version
-        clean = self._rewrite_query(resolved, all_replacements)
+        # Apply positional replacements right-to-left
+        clean = self._rewrite_query_positional(resolved, annotated_replacements)
+
+        # LLM fallback: if any expected canonical is still missing from the
+        # result, the term was not literally found in text (implied / abbreviated).
+        dict_replacements: Dict[str, str] = {}
+        for k, v in resolved_courses.items():
+            dict_replacements[k] = f"'{v}' course"
+        for o, p, _d, c in step25_resolved_occ:
+            dict_replacements[o] = f"'{c}' course"
+        for k, v in resolved_tracks.items():
+            if k not in dict_replacements:
+                dict_replacements[k] = f"'{v}' program"
+
+        still_unreplaced = any(
+            replacement.lower() not in clean.lower()
+            for orig, replacement in dict_replacements.items()
+            if orig.lower() != replacement.lower()
+        )
+        if still_unreplaced:
+            clean = self._rewrite_query(resolved, dict_replacements)
 
         box(
             "📝  STEP 5 — Clean Query (sent to agent)",
@@ -919,6 +1026,11 @@ class QueryPreprocessor:
         # 5. Show debug boxes for the resolution.
         chosen = self._pick_from_reply(student_reply, pending.candidates)
 
+        # Student chose to keep original term unchanged
+        is_keep_original = (chosen == self._KEEP_ORIGINAL)
+        if is_keep_original:
+            chosen = pending.ambiguous_term
+
         box(
             "📝  AMBIGUITY RESOLVED",
             [
@@ -931,27 +1043,44 @@ class QueryPreprocessor:
         all_courses = dict(pending.resolved_courses)
         all_courses[pending.ambiguous_term] = chosen
 
-        # Process remaining courses that were skipped when this ambiguity was hit
-        for rem_orig, rem_deduped in pending.pending_courses.items():
+        # Build resolved_course_occ incrementally so every chained PendingAmbiguity
+        # receives the full position-keyed history (critical for correct post-chain
+        # track mapping: prevents a TRACK-resolved occurrence of the same surface
+        # text from being skipped as if it were a course).
+        chain_course_occ: List[Tuple[str, int, str]] = list(pending.resolved_course_occ)
+        # When student chose "keep as is" (option N+1), don't add a positional
+        # replacement — the original term stays verbatim without a 'course' suffix.
+        if pending.term_position >= 0 and not is_keep_original:
+            chain_course_occ.append(
+                (pending.ambiguous_term, pending.term_position, chosen)
+            )
+
+        # Process remaining course occurrences that were skipped when this ambiguity was hit.
+        # pending_courses is now List[Tuple[str, int, str]] = [(original, char_pos, deduped), ...]
+        for idx, (rem_orig, rem_pos, rem_deduped) in enumerate(pending.pending_courses):
             rem_result = self._map_course(rem_deduped)
             if rem_result["status"] == "resolved":
                 all_courses[rem_orig] = rem_result["canonical"]
+                chain_course_occ.append((rem_orig, rem_pos, rem_result["canonical"]))
             elif rem_result["status"] == "ambiguous":
-                # Chain: another course is ambiguous — ask the student again
-                rem_items   = list(pending.pending_courses.items())
-                rem_idx     = list(pending.pending_courses.keys()).index(rem_orig)
-                next_rem    = dict(rem_items[rem_idx + 1:])
+                # Chain: another occurrence is ambiguous — ask the student again
+                next_rem = list(pending.pending_courses[idx + 1:])
                 new_pending = PendingAmbiguity(
                     original_query   = pending.original_query,
                     dereferenced     = pending.dereferenced,
                     ambiguous_term   = rem_orig,
+                    term_position    = rem_pos,
                     candidates       = rem_result["candidates"],
                     resolved_courses = all_courses,
                     pending_courses  = next_rem,
                     resolved_tracks  = {},
                     history          = pending.history,
+                    resolved_course_occ       = list(chain_course_occ),
+                    pending_track_occurrences  = list(pending.pending_track_occurrences),
                 )
-                clarification = self._build_clarification(rem_orig, rem_result["candidates"])
+                clarification = self._build_clarification(
+                    rem_orig, rem_result["candidates"], pending.dereferenced, rem_pos
+                )
                 return PreprocessResult(
                     status        = "ambiguous",
                     clarification = clarification,
@@ -959,30 +1088,45 @@ class QueryPreprocessor:
                 )
             # else "not_found": leave it for the agent to handle
 
+        # chain_pending_track_occ mirrors chain_course_occ for the track side.
+        # Starts from the parent's pending_track_occurrences; if any
+        # pending_track_course_conflicts auto-resolve as TRACK below, those
+        # occurrences are appended so downstream rewriters can map them.
+        chain_pending_track_occ: List[Tuple[str, int, str]] = list(pending.pending_track_occurrences)
+
         # Process any pending_track_course_conflicts forwarded from a previous
         # course_vs_track session (e.g. when student picked "course" for one
         # conflict causing a course_name chain, but more conflicts remain).
         extra_tracks: Dict[str, str] = {}
-        for rem_term, (rem_course, rem_track) in pending.pending_track_course_conflicts.items():
+        for rem_term, rem_pos_c, rem_course, rem_track in pending.pending_track_course_conflicts:
             resolution, _, clarification = self._resolve_track_course_conflict(
-                rem_term, pending.original_query, rem_course, rem_track, pending.student_track
+                rem_term, pending.original_query, rem_course, rem_track, pending.student_track,
+                char_pos=rem_pos_c if rem_pos_c >= 0 else None,
             )
             if resolution == "course":
                 all_courses[rem_term] = rem_course
+                # Track the position so the rewriter includes it
+                if rem_pos_c >= 0 and not any(o == rem_term and p == rem_pos_c for o, p, _ in chain_course_occ):
+                    chain_course_occ.append((rem_term, rem_pos_c, rem_course))
             elif resolution == "track":
                 extra_tracks[rem_term] = rem_track
+                # Add this occurrence to chain_pending_track_occ if not already there
+                deduped_rc = self._dedupe_chars(rem_term)
+                if (rem_term, rem_pos_c) not in {(o, p) for o, p, _ in chain_pending_track_occ}:
+                    chain_pending_track_occ.append((rem_term, rem_pos_c, deduped_rc))
             else:
-                remaining = {
-                    k: v for k, v in pending.pending_track_course_conflicts.items()
-                    if k != rem_term
-                }
+                remaining = [
+                    item for item in pending.pending_track_course_conflicts
+                    if item[0] != rem_term or item[1] != rem_pos_c
+                ]
                 new_pending = PendingAmbiguity(
                     original_query   = pending.original_query,
                     dereferenced     = pending.dereferenced,
                     ambiguous_term   = rem_term,
+                    term_position    = rem_pos_c,
                     candidates       = [],
                     resolved_courses = all_courses,
-                    pending_courses  = {},
+                    pending_courses  = [],
                     resolved_tracks  = {**pending.resolved_tracks, **extra_tracks},
                     history          = pending.history,
                     ambiguity_type   = "course_vs_track",
@@ -990,6 +1134,8 @@ class QueryPreprocessor:
                     track_canonical  = rem_track,
                     student_track    = pending.student_track,
                     pending_track_course_conflicts = remaining,
+                    resolved_course_occ       = list(chain_course_occ),
+                    pending_track_occurrences  = list(chain_pending_track_occ),
                 )
                 return PreprocessResult(
                     status        = "ambiguous",
@@ -997,43 +1143,127 @@ class QueryPreprocessor:
                     pending       = new_pending,
                 )
 
-        # Re-run track mapping on the original query
-        _, raw_tracks = self._extract_entities(pending.original_query)
-        resolved_tracks: Dict[str, str] = dict(extra_tracks)
-        track_debug: List[str] = []
-        for t in raw_tracks:
-            if t in all_courses:
-                track_debug.append(f'"{t}"  →  skipped (resolved as course)')
-                continue
-            deduped = self._dedupe_chars(t)
-            canonical, method = self._map_track_with_method(deduped)
-            if canonical:
-                resolved_tracks[t] = canonical
-                track_debug.append(f'"{t}"  →  {canonical}  [{method}]')
-            else:
-                track_debug.append(f'"{t}"  →  not found')
+        # chain_course_occ already contains every course-resolved occurrence:
+        #   pending.resolved_course_occ  (chain history)
+        #   + current term (added at the top of this function)
+        #   + courses from pending_courses loop above
+        #   + courses from pending_track_course_conflicts auto-resolved as course
+        # Using it directly ensures pending_courses resolutions end up in the
+        # positional replacement list — fixing the bug where "data visualization"
+        # (or any course resolved in the chaining loop) was skipped from rewriting.
+        all_course_occ: List[Tuple[str, int, str]] = chain_course_occ
+        course_resolved_pos = {(o, p) for o, p, _ in all_course_occ}
 
-        if raw_tracks or extra_tracks:
+        # Map remaining track occurrences using pending.pending_track_occurrences
+        # (position-aware so we skip only the specific occurrence resolved as course).
+        # Fall back to _extract_entities if pending_track_occurrences is not populated
+        # (e.g. for PendingAmbiguity objects created before this field was added).
+        if pending.pending_track_occurrences:
+            raw_track_occ = pending.pending_track_occurrences
+        else:
+            _, raw_tracks_fallback = self._extract_entities(pending.original_query)
+            raw_track_occ = [(t, p, self._dedupe_chars(t)) for t, p in raw_tracks_fallback]
+
+        resolved_track_occ: List[Tuple[str, int, str]] = []  # (term, pos, canonical)
+        # Carry forward any extra track resolutions from pending_track_course_conflicts
+        for term, canon in extra_tracks.items():
+            # Find position(s) in the query — use first found
+            for occ_t, occ_p, _ in raw_track_occ:
+                if occ_t == term:
+                    resolved_track_occ.append((term, occ_p, canon))
+                    break
+            else:
+                resolved_track_occ.append((term, -1, canon))  # position unknown
+
+        track_debug: List[str] = []
+        # Track-to-course fallback: collect failed track terms to try as courses
+        track_fallback_ambiguous_pa: List[Tuple[str, int, str, List[Dict]]] = []
+        for orig, pos, ded in raw_track_occ:
+            if (orig, pos) in course_resolved_pos:
+                track_debug.append(f'"{orig}" @{pos}  →  skipped (resolved as course)')
+                continue
+            canonical, method = self._map_track_with_method(ded)
+            if canonical:
+                resolved_track_occ.append((orig, pos, canonical))
+                track_debug.append(f'"{orig}" @{pos}  →  {canonical}  [{method}]')
+            else:
+                # Track mapping failed — try as a course (LLM misclassification)
+                cr = self._map_course(ded)
+                if cr["status"] == "resolved":
+                    all_courses[orig] = cr["canonical"]
+                    all_course_occ.append((orig, pos, cr["canonical"]))
+                    course_resolved_pos = {(o2, p2) for o2, p2, _ in all_course_occ}
+                    track_debug.append(
+                        f'"{orig}" @{pos}  →  course "{cr["canonical"]}"  [track-fallback]'
+                    )
+                elif cr["status"] == "ambiguous":
+                    track_fallback_ambiguous_pa.append((orig, pos, ded, cr["candidates"]))
+                    track_debug.append(f'"{orig}" @{pos}  →  AMBIGUOUS as course  [track-fallback]')
+                else:
+                    track_debug.append(f'"{orig}" @{pos}  →  not found')
+
+        if raw_track_occ or extra_tracks:
             box("📝  TRACK MAPPING (post-disambiguation)", track_debug)
 
-        # Rewrite the original query.
-        # Start with courses; only add a track mapping if the same term was NOT
-        # already resolved as a course (avoids overwriting a course_vs_track
-        # resolution where the user picked "course").
-        all_replacements: Dict[str, str] = {}
-        for k, v in all_courses.items():
-            all_replacements[k] = f"{v} course"
-        for k, v in resolved_tracks.items():
-            if k not in all_replacements:
-                all_replacements[k] = f"{v} program"
-        # Also replace any unmapped deduped terms
-        orig_to_dedup = {t: self._dedupe_chars(t) for t in
-                         list(all_courses.keys()) + list(raw_tracks)}
-        for orig, ded in orig_to_dedup.items():
-            if orig not in all_replacements and orig != ded:
-                all_replacements[orig] = ded
+        # Handle ambiguous track-fallback terms — ask the student, chain remainder
+        if track_fallback_ambiguous_pa:
+            orig0, pos0, ded0, cands0 = track_fallback_ambiguous_pa[0]
+            rest_fb = track_fallback_ambiguous_pa[1:]
+            remaining_fb = [(ro, rp, rd) for ro, rp, rd, _ in rest_fb]
+            new_pending = PendingAmbiguity(
+                original_query   = pending.original_query,
+                dereferenced     = pending.dereferenced,
+                ambiguous_term   = orig0,
+                term_position    = pos0,
+                candidates       = cands0,
+                resolved_courses = all_courses,
+                pending_courses  = remaining_fb,
+                resolved_tracks  = {**pending.resolved_tracks, **extra_tracks,
+                                     **{o2: c2 for o2, p2, c2 in resolved_track_occ}},
+                history          = pending.history,
+                resolved_course_occ      = list(all_course_occ),
+                pending_track_occurrences = [],
+            )
+            return PreprocessResult(
+                status        = "ambiguous",
+                clarification = self._build_clarification(
+                    orig0, cands0, pending.dereferenced, pos0
+                ),
+                pending       = new_pending,
+            )
 
-        clean = self._rewrite_query(pending.original_query, all_replacements)
+        # Build positional replacements — each occurrence replaced independently.
+        pos_replacements: List[Tuple[int, int, str]] = []
+        for o, p, canon in all_course_occ:
+            if p >= 0:
+                pos_replacements.append((p, p + len(o), f"'{canon}' course"))
+        for o, p, canon in resolved_track_occ:
+            if p >= 0:
+                pos_replacements.append((p, p + len(o), f"'{canon}' program"))
+        # Deduped fallback for unresolved terms
+        for o, p, ded in raw_track_occ:
+            if (o, p) not in course_resolved_pos and o != ded and p >= 0:
+                if not any(r[0] == p for r in pos_replacements):  # not already replaced
+                    pos_replacements.append((p, p + len(o), ded))
+
+        if pos_replacements:
+            clean = self._rewrite_query_positional(pending.original_query, pos_replacements)
+            # LLM fallback if any expected canonical is still missing
+            dict_rep: Dict[str, str] = {}
+            for o, p, canon in all_course_occ:
+                dict_rep[o] = f"'{canon}' course"
+            for o, p, canon in resolved_track_occ:
+                if o not in dict_rep:
+                    dict_rep[o] = f"'{canon}' program"
+            still_unreplaced = any(
+                v.lower() not in clean.lower()
+                for k, v in dict_rep.items()
+                if k.lower() != v.lower()
+            )
+            if still_unreplaced:
+                clean = self._rewrite_query(pending.original_query, dict_rep)
+        else:
+            clean = pending.original_query
 
         box(
             "📝  CLEAN QUERY (sent to agent)",
@@ -1185,13 +1415,20 @@ Resolved question:"""
         # Match any run of 2+ of the same char (case-sensitive)
         return _re.sub(r"(.)\1+", _collapse, term)
 
-    def _extract_entities(self, query: str) -> Tuple[List[str], List[str]]:
+    def _extract_entities(
+        self, query: str
+    ) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
         """
         Extract course mentions and track/program mentions from the query.
 
-        Returns: (list_of_course_terms, list_of_track_terms)
+        Returns: (course_occurrences, track_occurrences)
+            Each is a list of (term, char_position) tuples — one entry per
+            occurrence of the term in the query text.  The same surface text
+            (e.g. "ai") may appear multiple times and will produce multiple
+            independent entries.
 
-        Uses the LLM for robust extraction from casual language.
+        Uses the LLM for term identification, then finds ALL char positions
+        of each extracted term in the query via substring search.
         """
         prompt = f"""Extract course names and program/track names from this student question.
 
@@ -1250,10 +1487,77 @@ Examples:
             courses_lower = {c.lower().strip() for c in courses}
             tracks = [t for t in tracks if t.lower().strip() not in courses_lower]
 
-            return courses, tracks
+            # ── Post-process extracted course terms ───────────────────────────
+            # 1. Strip trailing blocklist words: "ai courses" → "ai"
+            # 2. Split "X in/at/for Y" where Y is a track alias:
+            #    "special topics in ai" → course "special topics" + track "ai"
+            processed_courses: List[str] = []
+            extra_tracks_from_split: List[str] = []
+            for term in courses:
+                # Step 1: strip trailing blocklist words
+                stripped = self._strip_trailing_blocklist(term)
+                if not stripped:
+                    continue
+                # Step 2: split "X in/at/for track_alias"
+                split = self._split_course_track_compound(stripped)
+                if split:
+                    course_part, track_part = split
+                    if course_part:
+                        processed_courses.append(course_part)
+                    if track_part and track_part.lower().strip() not in courses_lower:
+                        extra_tracks_from_split.append(track_part)
+                else:
+                    processed_courses.append(stripped)
+            courses = processed_courses
+            tracks  = tracks + extra_tracks_from_split
+
+            # Find ALL char positions of each unique term in the query.
+            # This is the key change: the same term appearing twice produces
+            # two independent (term, position) entries.
+            course_occurrences = self._find_all_char_occurrences(query, courses)
+            track_occurrences  = self._find_all_char_occurrences(query, tracks)
+
+            return course_occurrences, track_occurrences
         except Exception as exc:
             logger.debug("Entity extraction failed: %s", exc)
             return [], []
+
+    @staticmethod
+    def _find_all_char_occurrences(
+        text: str, terms: List[str]
+    ) -> List[Tuple[str, int]]:
+        """
+        For each term, find ALL character positions where it appears in text
+        as a whole word (case-insensitive, word-boundary aware).
+
+        "ai" will NOT match inside "explain", "said", "fails" etc. — the char
+        immediately before and after the match must not be alphanumeric or '_'.
+
+        Returns a flat list of (term, start_char_pos) sorted by position ascending.
+        Each unique occurrence is returned independently — if "ai" appears at
+        positions 8 and 23, the result contains both entries.
+        """
+        result: List[Tuple[str, int]] = []
+        text_lower = text.lower()
+        for term in terms:
+            t_lower = term.lower()
+            t_len   = len(t_lower)
+            start   = 0
+            while True:
+                pos = text_lower.find(t_lower, start)
+                if pos == -1:
+                    break
+                end = pos + t_len
+                # Word-boundary check: char before and after must not be
+                # alphanumeric (or underscore), otherwise "ai" would match
+                # inside "explain", "said", "training", etc.
+                before_ok = (pos == 0) or not (text_lower[pos - 1].isalnum() or text_lower[pos - 1] == "_")
+                after_ok  = (end >= len(text_lower)) or not (text_lower[end].isalnum() or text_lower[end] == "_")
+                if before_ok and after_ok:
+                    result.append((term, pos))
+                start = pos + t_len  # non-overlapping occurrences
+        result.sort(key=lambda x: x[1])
+        return result
 
     # ── Step 3: Course mapping ────────────────────────────────────────────
 
@@ -1487,15 +1791,21 @@ Examples:
 
         return []
 
-    def _detect_intent_signal(self, term: str, query: str) -> Tuple[str, float]:
+    def _detect_intent_signal(
+        self,
+        term:     str,
+        query:    str,
+        char_pos: Optional[int] = None,
+    ) -> Tuple[str, float]:
         """
         Detect whether `term` is used as a course or track reference in `query`.
 
-        Strategy: find every occurrence of `term` in the word-tokenised query,
-        score the ±6-word window around it for course/track signal words, take
-        the best score across all occurrences.  Falls back to the full query
-        when the term is not found literally (e.g. it was spelled differently
-        before deduplication).
+        When `char_pos` is given, only the ±6-word window around the occurrence
+        at that character position is scored — enabling per-occurrence resolution
+        when the same term appears multiple times with different meanings.
+
+        When `char_pos` is None (default), the best score across ALL occurrences
+        is returned (original behaviour).
 
         Returns:
             ("course", confidence)  |  ("track", confidence)  |  ("unknown", 0.0)
@@ -1505,32 +1815,93 @@ Examples:
         q_words = q_lower.split()
         t_words = t_lower.split()
 
-        # Find word-level positions of the term
-        positions: List[int] = []
-        for i in range(len(q_words) - len(t_words) + 1):
-            if q_words[i: i + len(t_words)] == t_words:
-                positions.append(i)
-
         WINDOW = 6
 
-        # Structural check: term immediately follows a preposition → strong track signal.
-        # Covers "courses in SAD", "courses at year 3 of SAD", "courses from AIM", etc.
-        # This runs before the window scoring so it can short-circuit obvious cases.
+        # Find ALL word-level positions of the term
+        all_word_positions: List[int] = []
+        for i in range(len(q_words) - len(t_words) + 1):
+            if q_words[i: i + len(t_words)] == t_words:
+                all_word_positions.append(i)
+
+        NARROW_WINDOW = 3   # words each side for intent scoring (per-occurrence mode)
+
+        def _score_at_word_pos(word_pos: int, narrow: bool = False) -> Tuple[float, float]:
+            """
+            Score the context around a single word position.
+
+            When `narrow=True` (per-occurrence mode):
+              - Structural checks (preposition / container) examine only the
+                IMMEDIATELY ADJACENT word so they cannot match a different
+                occurrence of the same term nearby.
+              - Intent scoring uses a ±NARROW_WINDOW context.
+
+            When `narrow=False` (global mode):
+              - Structural checks run on the full ±WINDOW context.
+              - Intent scoring uses the full ±WINDOW context.
+            """
+            if narrow:
+                # --- Structural: check only the one word directly before/after ---
+                before = q_words[word_pos - 1] if word_pos > 0 else ""
+                after_idx = word_pos + len(t_words)
+                after = q_words[after_idx] if after_idx < len(q_words) else ""
+
+                if before in {"of", "in", "at", "from", "for"}:
+                    return 0.0, 0.92   # preposition directly before → strong track
+                if after in {"courses", "course", "electives", "elective",
+                             "curriculum", "subjects", "subject", "classes", "class"}:
+                    return 0.0, 0.92   # container word directly after → strong track
+
+                # Intent signal: narrow window only
+                start = max(0, word_pos - NARROW_WINDOW)
+                end   = min(len(q_words), word_pos + len(t_words) + NARROW_WINDOW)
+            else:
+                # --- Structural: regex on the ±WINDOW context ---
+                start = max(0, word_pos - WINDOW)
+                end   = min(len(q_words), word_pos + len(t_words) + WINDOW)
+                ctx   = " ".join(q_words[start:end])
+                prep_re = r'\b(?:of|in|at|from|for)\s+' + re.escape(t_lower) + r'\b'
+                if re.search(prep_re, ctx):
+                    return 0.0, 0.92
+                cont_re = re.escape(t_lower) + r'\s+(?:courses?|electives?|curriculum|subjects?|classes?)'
+                if re.search(cont_re, ctx):
+                    return 0.0, 0.92
+
+            ctx = " ".join(q_words[start:end])
+            c, t = _score_intent_context(ctx)
+            return c, t
+
+        if char_pos is not None and all_word_positions:
+            # ── Position-specific scoring (narrow, occurrence-isolated) ───────
+            # Convert char_pos to a word index:
+            # len(query[:char_pos].split()) = number of complete words before char_pos
+            # = 0-based index of the word that starts at char_pos.
+            target_word_idx = len(query[:char_pos].split())
+            best_word_pos = min(
+                all_word_positions, key=lambda p: abs(p - target_word_idx)
+            )
+            c, t = _score_at_word_pos(best_word_pos, narrow=True)
+            if t > 0 and t >= c:
+                return "track", t
+            if c > 0 and c > t:
+                return "course", c
+            return "unknown", 0.0
+
+        # ── Global scoring (no char_pos): structural checks first, then best ──
         preposition_re = r'\b(?:of|in|at|from|for)\s+' + re.escape(t_lower) + r'\b'
         if re.search(preposition_re, q_lower):
             return "track", 0.92
 
-        if positions:
+        container_re = re.escape(t_lower) + r'\s+(?:courses?|electives?|curriculum|subjects?|classes?)'
+        if re.search(container_re, q_lower):
+            return "track", 0.92
+
+        if all_word_positions:
             best_c, best_t = 0.0, 0.0
-            for pos in positions:
-                start = max(0, pos - WINDOW)
-                end   = min(len(q_words), pos + len(t_words) + WINDOW)
-                ctx   = " ".join(q_words[start:end])
-                c, t  = _score_intent_context(ctx)
+            for wpos in all_word_positions:
+                c, t   = _score_at_word_pos(wpos, narrow=False)
                 best_c = max(best_c, c)
                 best_t = max(best_t, t)
         else:
-            # Term not literally in query — score the whole thing
             best_c, best_t = _score_intent_context(q_lower)
 
         if best_c > best_t and best_c > 0:
@@ -1546,12 +1917,14 @@ Examples:
         course_canonical: str,
         track_canonical:  str,
         student_track:    Optional[str],
+        char_pos:         Optional[int] = None,
     ) -> Tuple[str, Optional[str], Optional[str]]:
         """
         Decide whether `term` refers to a course or a track in `query`.
 
         Resolution layers (applied in order):
-          1. Intent signal from ±6-word proximity context
+          1. Intent signal from the ±6-word context window around `char_pos`
+             (when provided) or the best score across all occurrences (default).
           2. Enrolled-track heuristic (confidence boost when signal exists)
           3. Fallback → ask the student
 
@@ -1563,7 +1936,7 @@ Examples:
         is_exact = term.lower().strip() in EXACT_COLLISION_TERMS
         threshold = EXACT_COLLISION_THRESHOLD if is_exact else INTENT_SIGNAL_THRESHOLD
 
-        intent, confidence = self._detect_intent_signal(term, query)
+        intent, confidence = self._detect_intent_signal(term, query, char_pos=char_pos)
 
         if intent != "unknown":
             # Enrolled-track heuristic: boost confidence when the signal aligns
@@ -1585,17 +1958,27 @@ Examples:
         return (
             "ambiguous",
             None,
-            self._build_track_course_clarification(term, track_canonical),
+            self._build_track_course_clarification(term, track_canonical, query, char_pos),
         )
 
     def _build_track_course_clarification(
         self,
         term:            str,
         track_canonical: str,
+        query:           Optional[str] = None,
+        char_pos:        int           = -1,
     ) -> str:
-        """Build a friendly course-vs-track disambiguation question."""
+        """Build a friendly course-vs-track disambiguation question.
+        When query and char_pos are provided, a ±1-word context snippet is
+        included so the student knows which occurrence is being asked about.
+        """
+        if query and char_pos >= 0:
+            snippet     = self._context_snippet(query, term, char_pos)
+            term_header = f'**"{term}"** (in: "{snippet}")'
+        else:
+            term_header = f'**"{term}"**'
         return (
-            f'**"{term}"** can refer to either a course or a track/program:\n\n'
+            f'{term_header} can refer to either a course or a track/program:\n\n'
             f'  **1.** A **course**\n'
             f'  **2.** The *{track_canonical.title()}* **track/program**\n\n'
             'Which did you mean? (Reply with 1, 2, "course", or "track")'
@@ -1673,10 +2056,13 @@ Examples:
                         f"Multiple course matches — asking student to pick one",
                     ],
                 )
+                # term_position not known yet (student still picking which course)
+                # — propagate the chain history as-is, without adding this term yet.
                 new_pending = PendingAmbiguity(
                     original_query   = pending.original_query,
                     dereferenced     = pending.dereferenced,
                     ambiguous_term   = pending.ambiguous_term,
+                    term_position    = pending.term_position,
                     candidates       = course_result["candidates"],
                     resolved_courses = all_courses,
                     pending_courses  = pending.pending_courses,
@@ -1685,11 +2071,14 @@ Examples:
                     ambiguity_type   = "course_name",
                     student_track    = pending.student_track,
                     pending_track_course_conflicts = pending.pending_track_course_conflicts,
+                    resolved_course_occ       = list(pending.resolved_course_occ),
+                    pending_track_occurrences  = list(pending.pending_track_occurrences),
                 )
                 return PreprocessResult(
                     status        = "ambiguous",
                     clarification = self._build_clarification(
-                        pending.ambiguous_term, course_result["candidates"]
+                        pending.ambiguous_term, course_result["candidates"],
+                        pending.dereferenced, pending.term_position,
                     ),
                     pending       = new_pending,
                 )
@@ -1708,25 +2097,60 @@ Examples:
             )
             all_courses[pending.ambiguous_term] = canonical
 
+        # Build position-keyed occurrence lists so every chained PendingAmbiguity
+        # carries the full resolution history for both courses AND tracks.
+        #
+        # chain_course_occ — occurrences resolved as COURSE (for skip-guard and rewriter)
+        # IMPORTANT: only add the current term when choice == "course".
+        # The same surface text may have been resolved as COURSE at a different position
+        # (e.g. "ai" @8 → course); that entry is already in pending.resolved_course_occ.
+        # Adding it here for a TRACK choice would mis-label this occurrence as a course.
+        chain_course_occ: List[Tuple[str, int, str]] = list(pending.resolved_course_occ)
+        if choice == "course" and pending.term_position >= 0:
+            chain_course_occ.append(
+                (pending.ambiguous_term, pending.term_position,
+                 all_courses[pending.ambiguous_term])
+            )
+
+        # chain_pending_track_occ — occurrences that still need track mapping.
+        # Start from the auto-TRACK list carried by the parent pending, then
+        # add the occurrence the student JUST resolved as TRACK (if any) so
+        # the downstream rewriter can replace it too.
+        chain_pending_track_occ: List[Tuple[str, int, str]] = list(pending.pending_track_occurrences)
+        if choice == "track" and pending.term_position >= 0:
+            deduped_t = self._dedupe_chars(pending.ambiguous_term)
+            chain_pending_track_occ.append(
+                (pending.ambiguous_term, pending.term_position, deduped_t)
+            )
+
         # ── 1. Process remaining track-vs-course conflicts ─────────────────
-        for rem_term, (rem_course, rem_track) in pending.pending_track_course_conflicts.items():
+        for rem_term, rem_pos_c, rem_course, rem_track in pending.pending_track_course_conflicts:
             resolution, _, clarification = self._resolve_track_course_conflict(
-                rem_term, pending.dereferenced, rem_course, rem_track, pending.student_track
+                rem_term, pending.dereferenced, rem_course, rem_track, pending.student_track,
+                char_pos=rem_pos_c if rem_pos_c >= 0 else None,
             )
             if resolution == "course":
                 all_courses[rem_term] = rem_course
+                # Track this occurrence as course-resolved so the rewriter skips it
+                if rem_pos_c >= 0 and not any(o == rem_term and p == rem_pos_c for o, p, _ in chain_course_occ):
+                    chain_course_occ.append((rem_term, rem_pos_c, rem_course))
             elif resolution == "track":
                 all_tracks[rem_term] = rem_track
+                # Add to pending track occurrences for downstream rewriter
+                deduped_rc = self._dedupe_chars(rem_term)
+                if rem_pos_c >= 0 and (rem_term, rem_pos_c) not in {(o, p) for o, p, _ in chain_pending_track_occ}:
+                    chain_pending_track_occ.append((rem_term, rem_pos_c, deduped_rc))
             else:
                 # Still ambiguous → ask about this one
-                remaining_conflicts = {
-                    k: v for k, v in pending.pending_track_course_conflicts.items()
-                    if k != rem_term
-                }
+                remaining_conflicts = [
+                    item for item in pending.pending_track_course_conflicts
+                    if item[0] != rem_term or item[1] != rem_pos_c
+                ]
                 new_pending = PendingAmbiguity(
                     original_query   = pending.original_query,
                     dereferenced     = pending.dereferenced,
                     ambiguous_term   = rem_term,
+                    term_position    = rem_pos_c,
                     candidates       = [],
                     resolved_courses = all_courses,
                     pending_courses  = pending.pending_courses,
@@ -1737,6 +2161,8 @@ Examples:
                     track_canonical  = rem_track,
                     student_track    = pending.student_track,
                     pending_track_course_conflicts = remaining_conflicts,
+                    resolved_course_occ       = list(chain_course_occ),
+                    pending_track_occurrences  = list(chain_pending_track_occ),
                 )
                 return PreprocessResult(
                     status        = "ambiguous",
@@ -1744,19 +2170,20 @@ Examples:
                     pending       = new_pending,
                 )
 
-        # ── 2. Run Step-3-style mapping for remaining course terms ─────────
-        for rem_orig, rem_deduped in pending.pending_courses.items():
+        # ── 2. Run Step-3-style mapping for remaining course occurrences ──────
+        # pending_courses is List[Tuple[str, int, str]] = [(original, char_pos, deduped), ...]
+        for idx, (rem_orig, rem_pos, rem_deduped) in enumerate(pending.pending_courses):
             rem_result = self._map_course(rem_deduped)
             if rem_result["status"] == "resolved":
                 all_courses[rem_orig] = rem_result["canonical"]
+                chain_course_occ.append((rem_orig, rem_pos, rem_result["canonical"]))
             elif rem_result["status"] == "ambiguous":
-                rem_items   = list(pending.pending_courses.items())
-                rem_idx     = list(pending.pending_courses.keys()).index(rem_orig)
-                next_rem    = dict(rem_items[rem_idx + 1:])
+                next_rem = list(pending.pending_courses[idx + 1:])
                 new_pending = PendingAmbiguity(
                     original_query   = pending.original_query,
                     dereferenced     = pending.dereferenced,
                     ambiguous_term   = rem_orig,
+                    term_position    = rem_pos,
                     candidates       = rem_result["candidates"],
                     resolved_courses = all_courses,
                     pending_courses  = next_rem,
@@ -1764,46 +2191,138 @@ Examples:
                     history          = pending.history,
                     ambiguity_type   = "course_name",
                     student_track    = pending.student_track,
+                    resolved_course_occ       = list(chain_course_occ),
+                    pending_track_occurrences  = list(chain_pending_track_occ),
                 )
                 return PreprocessResult(
                     status        = "ambiguous",
-                    clarification = self._build_clarification(rem_orig, rem_result["candidates"]),
+                    clarification = self._build_clarification(
+                        rem_orig, rem_result["candidates"], pending.dereferenced, rem_pos
+                    ),
                     pending       = new_pending,
                 )
             # else "not_found": leave it for the agent
 
-        # ── 3. Re-run track mapping from the dereferenced query ───────────
-        _, raw_tracks = self._extract_entities(pending.dereferenced)
+        # ── 3. Build full course-resolved occurrence list ─────────────────────
+        # chain_course_occ already contains every course-resolved occurrence:
+        #   pending.resolved_course_occ  (chain history from parent rounds)
+        #   + current term if choice=="course"  (added above)
+        #   + courses from pending_track_course_conflicts auto-resolved as course (step 1)
+        #   + courses from pending_courses (step 2)
+        # Using it directly avoids the "in all_courses" check that fired even for
+        # TRACK choices when the same surface text had been resolved as course elsewhere.
+        all_course_occ: List[Tuple[str, int, str]] = chain_course_occ
+        course_resolved_pos = {(o, p) for o, p, _ in all_course_occ}
+
+        # ── Map remaining track occurrences (position-aware) ─────────────────
+        # chain_pending_track_occ is always the superset: it starts from
+        # pending.pending_track_occurrences and appends any term just resolved
+        # as TRACK in this call. Always use it so the newly-resolved occurrence
+        # is included in the positional replacement pass.
+        if chain_pending_track_occ:
+            raw_track_occ = chain_pending_track_occ
+        else:
+            _, raw_tracks_fb = self._extract_entities(pending.dereferenced)
+            raw_track_occ = [(t, p, self._dedupe_chars(t)) for t, p in raw_tracks_fb]
+
+        resolved_track_occ: List[Tuple[str, int, str]] = []
+        # Carry forward auto-resolved tracks from step 1
+        for term, canon in all_tracks.items():
+            for o2, p2, _ in raw_track_occ:
+                if o2 == term and (o2, p2) not in course_resolved_pos:
+                    resolved_track_occ.append((term, p2, canon))
+                    break
+
         track_debug: List[str] = []
-        for t in raw_tracks:
-            if t in all_courses:
-                # Already resolved as a course — do NOT overwrite with a track mapping
-                track_debug.append(f'"{t}"  →  skipped (resolved as course)')
+        # track-fallback collection for _resolve_course_vs_track path
+        track_fallback_ambiguous_cvt: List[Tuple[str, int, str, List[Dict]]] = []
+        for orig, pos, ded in raw_track_occ:
+            if (orig, pos) in course_resolved_pos:
+                track_debug.append(f'"{orig}" @{pos}  →  skipped (resolved as course)')
                 continue
-            deduped  = self._dedupe_chars(t)
-            canonical, method = self._map_track_with_method(deduped)
+            if any(o == orig and p == pos for o, p, _ in resolved_track_occ):
+                continue  # already in list from all_tracks carry-forward above
+            canonical, method = self._map_track_with_method(ded)
             if canonical:
-                all_tracks[t] = canonical
-                track_debug.append(f'"{t}"  →  {canonical}  [{method}]')
+                all_tracks[orig] = canonical
+                resolved_track_occ.append((orig, pos, canonical))
+                track_debug.append(f'"{orig}" @{pos}  →  {canonical}  [{method}]')
             else:
-                track_debug.append(f'"{t}"  →  not found')
-        if raw_tracks:
+                # Track mapping failed — try as a course (LLM misclassification)
+                cr = self._map_course(ded)
+                if cr["status"] == "resolved":
+                    all_courses[orig] = cr["canonical"]
+                    all_course_occ.append((orig, pos, cr["canonical"]))
+                    course_resolved_pos = {(o2, p2) for o2, p2, _ in all_course_occ}
+                    track_debug.append(
+                        f'"{orig}" @{pos}  →  course "{cr["canonical"]}"  [track-fallback]'
+                    )
+                elif cr["status"] == "ambiguous":
+                    track_fallback_ambiguous_cvt.append((orig, pos, ded, cr["candidates"]))
+                    track_debug.append(f'"{orig}" @{pos}  →  AMBIGUOUS as course  [track-fallback]')
+                else:
+                    track_debug.append(f'"{orig}" @{pos}  →  not found')
+
+        if raw_track_occ:
             box("📝  TRACK MAPPING (post-disambiguation)", track_debug)
 
-        # ── 4. Rewrite the query ───────────────────────────────────────────
-        all_replacements: Dict[str, str] = {}
-        for k, v in all_courses.items():
-            all_replacements[k] = f"{v} course"
-        for k, v in all_tracks.items():
-            if k not in all_replacements:
-                all_replacements[k] = f"{v} program"
-        # Deduped fallback for any unresolved terms
-        for orig in list(all_courses.keys()) + list(all_tracks.keys()):
-            ded = self._dedupe_chars(orig)
-            if orig not in all_replacements and orig != ded:
-                all_replacements[orig] = ded
+        # Handle ambiguous track-fallback terms — ask the student, chain remainder
+        if track_fallback_ambiguous_cvt:
+            orig0, pos0, ded0, cands0 = track_fallback_ambiguous_cvt[0]
+            rest_cvt = track_fallback_ambiguous_cvt[1:]
+            remaining_cvt = [(ro, rp, rd) for ro, rp, rd, _ in rest_cvt]
+            new_pending = PendingAmbiguity(
+                original_query   = pending.original_query,
+                dereferenced     = pending.dereferenced,
+                ambiguous_term   = orig0,
+                term_position    = pos0,
+                candidates       = cands0,
+                resolved_courses = all_courses,
+                pending_courses  = remaining_cvt,
+                resolved_tracks  = all_tracks,
+                history          = pending.history,
+                resolved_course_occ      = list(all_course_occ),
+                pending_track_occurrences = [],
+            )
+            return PreprocessResult(
+                status        = "ambiguous",
+                clarification = self._build_clarification(
+                    orig0, cands0, pending.dereferenced, pos0
+                ),
+                pending       = new_pending,
+            )
 
-        clean = self._rewrite_query(pending.dereferenced, all_replacements)
+        # ── 4. Rewrite the query positionally ─────────────────────────────────
+        pos_replacements: List[Tuple[int, int, str]] = []
+        for o, p, canon in all_course_occ:
+            if p >= 0:
+                pos_replacements.append((p, p + len(o), f"'{canon}' course"))
+        for o, p, canon in resolved_track_occ:
+            if p >= 0:
+                pos_replacements.append((p, p + len(o), f"'{canon}' program"))
+        # Deduped fallback for unresolved terms
+        for o, p, ded in raw_track_occ:
+            if (o, p) not in course_resolved_pos and o != ded and p >= 0:
+                if not any(r[0] == p for r in pos_replacements):
+                    pos_replacements.append((p, p + len(o), ded))
+
+        if pos_replacements:
+            clean = self._rewrite_query_positional(pending.dereferenced, pos_replacements)
+            dict_rep: Dict[str, str] = {}
+            for o, p, canon in all_course_occ:
+                dict_rep[o] = f"'{canon}' course"
+            for o, p, canon in resolved_track_occ:
+                if o not in dict_rep:
+                    dict_rep[o] = f"'{canon}' program"
+            still_unreplaced = any(
+                v.lower() not in clean.lower()
+                for k, v in dict_rep.items()
+                if k.lower() != v.lower()
+            )
+            if still_unreplaced:
+                clean = self._rewrite_query(pending.dereferenced, dict_rep)
+        else:
+            clean = pending.dereferenced
 
         box(
             "📝  CLEAN QUERY (sent to agent)",
@@ -1813,6 +2332,32 @@ Examples:
         return PreprocessResult(status="ready", clean_query=clean, resolved_courses=all_courses)
 
     # ── Step 5: Query rewriting ───────────────────────────────────────────
+
+    @staticmethod
+    def _rewrite_query_positional(
+        text:         str,
+        replacements: List[Tuple[int, int, str]],
+    ) -> str:
+        """
+        Apply substring replacements at exact character positions, right-to-left.
+
+        replacements: [(start_pos, end_pos, replacement_text), ...]
+
+        Applying right-to-left (descending start position) ensures that
+        replacements at earlier positions are not shifted by later ones.
+        Overlapping replacements are silently skipped.
+        """
+        result    = text
+        covered: List[Tuple[int, int]] = []  # (start, end) regions already replaced
+
+        for start, end, replacement in sorted(replacements, key=lambda x: x[0], reverse=True):
+            # Skip if this region overlaps one already processed
+            if any(s <= start < e or s < end <= e for s, e in covered):
+                continue
+            result  = result[:start] + replacement + result[end:]
+            covered.append((start, end))
+
+        return result
 
     def _rewrite_query(
         self,
@@ -1890,18 +2435,104 @@ Rewritten question:"""
 
     # ── Disambiguation helpers ────────────────────────────────────────────
 
-    def _build_clarification(self, term: str, candidates: List[Dict]) -> str:
+    @staticmethod
+    def _context_snippet(query: str, term: str, char_pos: int, window: int = 1) -> str:
+        """
+        Return a ±window-word context string around `term` at `char_pos`.
+
+        Example (window=1):
+            query   = "what is special courses at ai and what is ai"
+            term    = "ai", char_pos = 27  →  'at **ai** and'
+            term    = "ai", char_pos = 42  →  'is **ai**'
+        """
+        if char_pos < 0:
+            return f"**{term}**"
+        words     = query.split()
+        word_idx  = len(query[:char_pos].split())          # words before term
+        t_wcount  = len(term.split())
+        before    = words[max(0, word_idx - window): word_idx]
+        after     = words[word_idx + t_wcount: word_idx + t_wcount + window]
+        parts: List[str] = []
+        if before:
+            parts.append(" ".join(before))
+        parts.append(f"**{term}**")
+        if after:
+            parts.append(" ".join(after))
+        return " ".join(parts)
+
+    @staticmethod
+    def _strip_trailing_blocklist(term: str) -> str:
+        """
+        Remove trailing blocklist words from an extracted term.
+
+        Examples:
+            "ai courses"     → "ai"
+            "data course"    → "data"
+            "ml electives"   → "ml"
+            "special topics" → "special topics"  (no blocklist word at end)
+        """
+        words = term.strip().split()
+        while words and words[-1].lower() in ENTITY_BLOCKLIST:
+            words.pop()
+        return " ".join(words)
+
+    @staticmethod
+    def _split_course_track_compound(term: str) -> Optional[Tuple[str, str]]:
+        """
+        If `term` looks like "X in/at/for Y" where Y is a TRACK_ALIASES key,
+        split it into (course_part=X, track_part=Y).
+        Returns None when the term does not match this pattern.
+
+        Examples:
+            "special topics in ai"   → ("special topics", "ai")
+            "electives in aim"        → ("electives", "aim")   ← course_part may still be blocklist
+            "machine learning in sad" → ("machine learning", "sad")
+            "data visualization"     → None  (no preposition + track alias)
+        """
+        term_lower = term.lower()
+        for prep in (" in ", " at ", " for "):
+            idx = term_lower.find(prep)
+            if idx == -1:
+                continue
+            right = term[idx + len(prep):].strip()
+            if right.lower() in TRACK_ALIASES:
+                left = term[:idx].strip()
+                if left:
+                    return left, right
+        return None
+
+    def _build_clarification(
+        self,
+        term:       str,
+        candidates: List[Dict],
+        query:      Optional[str] = None,
+        char_pos:   int           = -1,
+    ) -> str:
         """
         Build a friendly disambiguation question to show the student.
+        When `query` and `char_pos` are provided, a ±1-word context snippet
+        is included so the student knows which occurrence is being asked about.
+        The last option always lets the student keep the original term as-is.
         """
-        lines = [f'I found several courses matching **"{term}"**. Which one did you mean?\n']
+        if query and char_pos >= 0:
+            snippet = self._context_snippet(query, term, char_pos)
+            header  = f'I found several courses matching **"{term}"** (in: "{snippet}"). Which one did you mean?\n'
+        else:
+            header  = f'I found several courses matching **"{term}"**. Which one did you mean?\n'
+        lines = [header]
         for i, c in enumerate(candidates, 1):
             code = f"({c['code']})" if c.get("code") else ""
             lines.append(f"  **{i}.** {c['name'].title()} {code}")
+        # Extra option: keep original term unchanged
+        keep_idx = len(candidates) + 1
+        lines.append(f"  **{keep_idx}.** {term}")
         lines.append(
             "\nPlease reply with the number or name of the course you meant."
         )
         return "\n".join(lines)
+
+    # Sentinel returned when the student chooses to keep their original term.
+    _KEEP_ORIGINAL = "__KEEP_ORIGINAL__"
 
     def _pick_from_reply(self, reply: str, candidates: List[Dict]) -> str:
         """
@@ -1909,10 +2540,12 @@ Rewritten question:"""
 
         Handles:
           - Number: "1", "first", "the first one"
+            * N+1  (last option) → _KEEP_ORIGINAL sentinel
           - Name: "software engineering", "soft eng"
           - Fallback: best fuzzy match against candidate names
         """
         reply_strip = reply.strip().lower()
+        keep_idx = len(candidates) + 1  # index of the "keep original" option
 
         # Number-based selection
         number_words = {
@@ -1924,6 +2557,8 @@ Rewritten question:"""
         }
         for word, idx in number_words.items():
             if word in reply_strip.split() or reply_strip == word:
+                if idx == keep_idx:
+                    return self._KEEP_ORIGINAL
                 if 1 <= idx <= len(candidates):
                     return candidates[idx - 1]["name"]
 

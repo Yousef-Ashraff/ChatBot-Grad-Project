@@ -323,71 +323,84 @@ def _resolve_ambiguity_reply(
 
 def _analyze_and_split(clean_query: str) -> List[str]:
     """
-    Ask the utility LLM to decompose the query into atomic sub-queries.
+    Ask the utility LLM to split the query into one sub-query per user intent.
 
-    Handles all combinatorial cases:
-      - N courses                  → N sub-queries
-      - 1 course × M programs      → M sub-queries
-      - N courses × M programs     → N×M sub-queries
-      - mixed (course + bylaw)     → one per independent topic
-      - already atomic             → [clean_query] unchanged
+    Intent-driven splitting — never permutation/cartesian expansion of non-factual clauses:
+      COMPARISON clause  → always ONE sub-query (atomic, never split by items compared)
+      RECOMMEND  clause  → always ONE sub-query (atomic, never split by options)
+      FACTUAL clause     → N courses → N; 1 course × M programs → M; N×M only for pure factual
+      Independent topics → one per distinct intent
 
-    Returns a list of sub-query strings.  If only one element, no split
-    is performed and the normal single-agent path is taken.
+    Returns a list of sub-query strings.  Single-element list → no split,
+    normal single-agent path is taken.
     """
     from llm_client import llm_call_json
 
     try:
         raw = llm_call_json(
             system=(
-                "You decompose student academic advisor queries into the minimum set "
-                "of independent atomic sub-queries, each requiring exactly one "
-                "focused database lookup."
+                "You split student academic advisor queries into the minimum number of "
+                "independent sub-queries, one per distinct user intent."
             ),
             prompt=(
-                "Decompose the query below into atomic sub-queries.\n\n"
-                "RULES:\n"
-                "  1. N courses, no specific program  → N sub-queries (one per course)\n"
-                "  2. 1 course × M programs           → M sub-queries (one per program)\n"
-                "  3. N courses × M programs          → N×M sub-queries (cartesian product)\n"
-                "  4. Independent questions (course + bylaw, etc.) → one sub-query each\n"
-                "  5. Already atomic (1 course, 1 program, or no entities) → return as-is\n\n"
-                "OUTPUT RULES (STRICT):\n"
-                "  • Copy words EXACTLY from the input — do NOT rephrase, reformat, or change anything.\n"
-                "  • NEVER convert 'and' to '&' or '&' to 'and' in output.\n"
-                "  • NEVER merge two separate items into one.\n\n"
-                "PROGRAM NAME PROTECTION:\n"
-                "The three canonical program names contain '&' and must NEVER be split:\n"
+                "Split the query below into sub-queries, one per user intent.\n\n"
+                "══ STEP 1 — CLASSIFY EACH CLAUSE ══\n"
+                "Read the query and label every clause with one of:\n"
+                "  COMPARISON  — contains: compare, vs, difference between, X or Y (choice)\n"
+                "  RECOMMEND   — contains: which should I choose, what is best for me, recommend\n"
+                "  FACTUAL     — everything else (what is, when can I take, prerequisites, etc.)\n\n"
+                "══ STEP 2 — GENERATE SUB-QUERIES BY INTENT ══\n"
+                "  COMPARISON clause → exactly ONE sub-query (the whole clause, never split by items)\n"
+                "  RECOMMEND  clause → exactly ONE sub-query (the whole clause, never split by options)\n"
+                "  FACTUAL clause:\n"
+                "    • 1 entity                → 1 sub-query\n"
+                "    • N courses, no program   → N sub-queries (one per course)\n"
+                "    • 1 course × M programs   → M sub-queries (one per program)\n"
+                "    • N courses × M programs  → N×M sub-queries (cartesian — ONLY for FACTUAL)\n"
+                "    • Already atomic          → return as-is\n\n"
+                "══ STEP 3 — SMELL TEST (apply before finalizing) ══\n"
+                "  ✗ Did the user actually ask for each generated sub-query? If no → remove it.\n"
+                "  ✗ Is any sub-query a duplicate of another with one variable swapped?\n"
+                "    → the splitter cross-product-expanded a non-FACTUAL clause. Fix it.\n"
+                "  ✗ Do all sub-queries together faithfully reconstruct the original intent\n"
+                "    with no added or lost meaning? If no → revise.\n\n"
+                "══ OUTPUT RULES ══\n"
+                "  • Extract sub-queries verbatim — copy words EXACTLY from the input.\n"
+                "  • Do NOT rephrase, reword, reformat, or add/remove punctuation.\n"
+                "  • NEVER convert 'and' to '&' or '&' to 'and'.\n"
+                "  • NEVER merge two clauses into one sub-query.\n\n"
+                "══ PROGRAM NAME PROTECTION ══\n"
+                "These names contain '&' and must NEVER be split across tokens:\n"
                 "  • artificial intelligence & machine learning\n"
                 "  • software & application development\n"
-                "  • data science\n"
-                "ONLY treat a phrase as a program name when the query is clearly about the program/track itself\n"
-                "(contains words like: track, program, major, curriculum, electives in, courses in).\n"
-                "When the query is about individual COURSES, treat each course name independently.\n\n"
-                "Examples:\n"
+                "  • data science\n\n"
+                "══ EXAMPLES ══\n"
+                '  FACTUAL, 2 courses:\n'
                 '  "what is artificial intelligence and machine learning"\n'
                 '  → ["what is artificial intelligence", "what is machine learning"]\n\n'
-                '  "when can I take field training (1) and field training (2)?"\n'
-                '  → ["when can I take field training (1)?",\n'
-                '     "when can I take field training (2)?"]\n\n'
-                '  "what courses are in artificial intelligence & machine learning track?"\n'
-                '  → ["what courses are in artificial intelligence & machine learning track?"]\n\n'
-                '  "when can I take ML at artificial intelligence & machine learning and software & application development?"\n'
-                '  → ["when can I take ML at artificial intelligence & machine learning?",\n'
-                '     "when can I take ML at software & application development?"]\n\n'
-                '  "when can I take NLP and image processing at artificial intelligence & machine learning and software & application development?"\n'
-                '  → ["when can I take NLP at artificial intelligence & machine learning?",\n'
-                '     "when can I take NLP at software & application development?",\n'
-                '     "when can I take image processing at artificial intelligence & machine learning?",\n'
-                '     "when can I take image processing at software & application development?"]\n\n'
-                '  "compare artificial intelligence & machine learning and software & application development and data science"\n'
-                '  → ["what is artificial intelligence & machine learning",\n'
-                '     "what is software & application development",\n'
-                '     "what is data science"]\n\n'
-                '  "what are ML prerequisites and what is the graduation GPA?"\n'
-                '  → ["what are the prerequisites for ML?",\n'
-                '     "what is the graduation GPA requirement?"]\n\n'
-                '  "what is ML about?"  →  ["what is ML about?"]\n\n'
+                '  FACTUAL, 1 course × 2 programs:\n'
+                '  "when can I take ML at artificial intelligence & machine learning and software & application development"\n'
+                '  → ["when can I take ML at artificial intelligence & machine learning",\n'
+                '     "when can I take ML at software & application development"]\n\n'
+                '  FACTUAL, 2 courses × 2 programs:\n'
+                '  "when can I take NLP and image processing at artificial intelligence & machine learning and software & application development"\n'
+                '  → ["when can I take NLP at artificial intelligence & machine learning",\n'
+                '     "when can I take NLP at software & application development",\n'
+                '     "when can I take image processing at artificial intelligence & machine learning",\n'
+                '     "when can I take image processing at software & application development"]\n\n'
+                '  COMPARISON (atomic):\n'
+                '  "compare artificial intelligence & machine learning and software & application development"\n'
+                '  → ["compare artificial intelligence & machine learning and software & application development"]\n\n'
+                '  COMPARISON + separate FACTUAL:\n'
+                '  "compare NLP and image processing in artificial intelligence & machine learning and what is the GPA"\n'
+                '  → ["compare NLP and image processing in artificial intelligence & machine learning",\n'
+                '     "what is the GPA"]\n\n'
+                '  COMPARISON + separate COMPARISON (two distinct intents):\n'
+                '  "compare course A and course B in program X and program X or program Y"\n'
+                '  → ["compare course A and course B in program X",\n'
+                '     "program X or program Y"]\n\n'
+                '  Already atomic:\n'
+                '  "what is ML about?" → ["what is ML about?"]\n\n'
                 f'Query: "{clean_query}"\n\n'
                 'Return JSON only: {"sub_queries": ["..."]}'
             ),
