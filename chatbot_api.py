@@ -344,61 +344,59 @@ def _analyze_and_split(clean_query: str) -> List[str]:
             ),
             prompt=(
                 "Split the query below into sub-queries, one per user intent.\n\n"
-                "══ STEP 1 — CLASSIFY EACH CLAUSE ══\n"
-                "Read the query and label every clause with one of:\n"
-                "  COMPARISON  — contains: compare, vs, difference between, X or Y (choice)\n"
-                "  RECOMMEND   — contains: which should I choose, what is best for me, recommend\n"
+                "══ STEP 1 — FIND INTENT BOUNDARIES ══\n"
+                "Before splitting, identify every intent-bearing verb or phrase and what it governs:\n"
+                "  COMPARISON  — 'compare', 'vs', 'difference between', 'X or Y (choice)'\n"
+                "  RECOMMEND   — 'which should I choose', 'what is best for me', 'recommend'\n"
                 "  FACTUAL     — everything else (what is, when can I take, prerequisites, etc.)\n\n"
-                "══ STEP 2 — GENERATE SUB-QUERIES BY INTENT ══\n"
-                "  COMPARISON clause → exactly ONE sub-query (the whole clause, never split by items)\n"
-                "  RECOMMEND  clause → exactly ONE sub-query (the whole clause, never split by options)\n"
-                "  FACTUAL clause:\n"
-                "    • 1 entity                → 1 sub-query\n"
-                "    • N courses, no program   → N sub-queries (one per course)\n"
-                "    • 1 course × M programs   → M sub-queries (one per program)\n"
-                "    • N courses × M programs  → N×M sub-queries (cartesian — ONLY for FACTUAL)\n"
-                "    • Already atomic          → return as-is\n\n"
+                "  KEY: every course/program that appears as an argument of a COMPARISON or RECOMMEND\n"
+                "  verb is OWNED BY that clause and must stay inside it. Never extract those\n"
+                "  entities as separate sub-queries.\n\n"
+                "══ STEP 2 — ONE SUB-QUERY PER INTENT ══\n"
+                "  COMPARISON clause → exactly ONE sub-query containing the whole clause.\n"
+                "    – All compared items (courses, programs, tracks, any mix) stay together.\n"
+                "    – Never split 'compare X and Y and Z' into sub-queries for X, Y, Z.\n"
+                "  RECOMMEND  clause → exactly ONE sub-query containing the whole clause.\n"
+                "  FACTUAL clause (only truly independent factual questions):\n"
+                "    • 1 entity                           → 1 sub-query\n"
+                "    • N independent courses, same intent → N sub-queries (one per course)\n"
+                "    • 1 course × M programs, same intent → M sub-queries (one per program)\n"
+                "    • Already atomic                     → return as-is\n\n"
+                "  NEVER apply cartesian expansion to items that are arguments of a COMPARISON\n"
+                "  or RECOMMEND clause, even if those items look like independent entities.\n\n"
                 "══ STEP 3 — SMELL TEST (apply before finalizing) ══\n"
                 "  ✗ Did the user actually ask for each generated sub-query? If no → remove it.\n"
-                "  ✗ Is any sub-query a duplicate of another with one variable swapped?\n"
-                "    → the splitter cross-product-expanded a non-FACTUAL clause. Fix it.\n"
+                "  ✗ Is any sub-query one of the arguments of a comparison/recommend clause\n"
+                "    extracted on its own? → the splitter broke an atomic clause. Merge it back.\n"
                 "  ✗ Do all sub-queries together faithfully reconstruct the original intent\n"
                 "    with no added or lost meaning? If no → revise.\n\n"
                 "══ OUTPUT RULES ══\n"
-                "  • Extract sub-queries verbatim — copy words EXACTLY from the input.\n"
-                "  • Do NOT rephrase, reword, reformat, or add/remove punctuation.\n"
+                "  • Copy sub-query text verbatim from the input — no rephrasing or reformatting.\n"
                 "  • NEVER convert 'and' to '&' or '&' to 'and'.\n"
-                "  • NEVER merge two clauses into one sub-query.\n\n"
+                "  • NEVER merge two distinct intents into one sub-query.\n\n"
                 "══ PROGRAM NAME PROTECTION ══\n"
                 "These names contain '&' and must NEVER be split across tokens:\n"
                 "  • artificial intelligence & machine learning\n"
                 "  • software & application development\n"
                 "  • data science\n\n"
                 "══ EXAMPLES ══\n"
-                '  FACTUAL, 2 courses:\n'
-                '  "what is artificial intelligence and machine learning"\n'
+                '  COMPARISON with mixed entity types (program + courses) — stays atomic:\n'
+                '  "compare artificial intelligence & machine learning program and artificial intelligence course and natural language processing course"\n'
+                '  → ["compare artificial intelligence & machine learning program and artificial intelligence course and natural language processing course"]\n\n'
+                '  COMPARISON between two programs — stays atomic:\n'
+                '  "compare artificial intelligence & machine learning and software & application development"\n'
+                '  → ["compare artificial intelligence & machine learning and software & application development"]\n\n'
+                '  COMPARISON + separate FACTUAL (two distinct intents):\n'
+                '  "compare NLP and image processing in artificial intelligence & machine learning and what is the GPA"\n'
+                '  → ["compare NLP and image processing in artificial intelligence & machine learning",\n'
+                '     "what is the GPA"]\n\n'
+                '  FACTUAL, 2 independent courses:\n'
+                '  "what is artificial intelligence and what is machine learning"\n'
                 '  → ["what is artificial intelligence", "what is machine learning"]\n\n'
                 '  FACTUAL, 1 course × 2 programs:\n'
                 '  "when can I take ML at artificial intelligence & machine learning and software & application development"\n'
                 '  → ["when can I take ML at artificial intelligence & machine learning",\n'
                 '     "when can I take ML at software & application development"]\n\n'
-                '  FACTUAL, 2 courses × 2 programs:\n'
-                '  "when can I take NLP and image processing at artificial intelligence & machine learning and software & application development"\n'
-                '  → ["when can I take NLP at artificial intelligence & machine learning",\n'
-                '     "when can I take NLP at software & application development",\n'
-                '     "when can I take image processing at artificial intelligence & machine learning",\n'
-                '     "when can I take image processing at software & application development"]\n\n'
-                '  COMPARISON (atomic):\n'
-                '  "compare artificial intelligence & machine learning and software & application development"\n'
-                '  → ["compare artificial intelligence & machine learning and software & application development"]\n\n'
-                '  COMPARISON + separate FACTUAL:\n'
-                '  "compare NLP and image processing in artificial intelligence & machine learning and what is the GPA"\n'
-                '  → ["compare NLP and image processing in artificial intelligence & machine learning",\n'
-                '     "what is the GPA"]\n\n'
-                '  COMPARISON + separate COMPARISON (two distinct intents):\n'
-                '  "compare course A and course B in program X and program X or program Y"\n'
-                '  → ["compare course A and course B in program X",\n'
-                '     "program X or program Y"]\n\n'
                 '  Already atomic:\n'
                 '  "what is ML about?" → ["what is ML about?"]\n\n'
                 f'Query: "{clean_query}"\n\n'

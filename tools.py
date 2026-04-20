@@ -883,6 +883,85 @@ def get_all_not_specialized_courses(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Comparison tools ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def compare_programs(program_names: List[str]) -> str:
+    """
+    Gather comprehensive information about multiple programs so the LLM can
+    compare them side-by-side.
+
+    Calls get_program_info for each program and returns all results together.
+    Use this whenever the student wants to compare two or more programs/tracks,
+    e.g.:
+    - "Compare AIM and SAD"
+    - "What's the difference between data science and AI tracks?"
+    - "Which program is better for me, SAD or DAS?"
+    - "Compare all three programs"
+
+    After presenting the comparison, ALWAYS ask the student whether they would
+    like a personalised recommendation based on the information.
+
+    Args:
+        program_names: List of program names to compare.
+                       E.g. ["artificial intelligence & machine learning",
+                              "software & application development"]
+    """
+    from neo4j_track_functions import get_program_info as _fn
+    results = {}
+    for prg in program_names:
+        try:
+            results[prg] = _fn(prg, course_info=True, desc_info=True)
+        except Exception as exc:
+            results[prg] = f"Error fetching info for '{prg}': {exc}"
+    return _to_str(results)
+
+
+@tool
+def compare_courses(course_names: List[str], program_name: Optional[str] = None) -> str:
+    """
+    Gather detailed information about multiple courses so the LLM can compare
+    them side-by-side.
+
+    For each course this tool fetches:
+    - General info (description, credit hours, code, core/elective status)
+    - Prerequisites and dependents (what it unlocks)
+
+    Use this whenever the student wants to compare two or more courses, e.g.:
+    - "Compare machine learning and deep learning"
+    - "What's the difference between OS and computer networks?"
+    - "Which is harder, AI or computer vision?"
+    - "Compare all AI electives"
+
+    After presenting the comparison, ALWAYS ask the student whether they would
+    like a personalised recommendation based on the information.
+
+    Args:
+        course_names: List of course names to compare. Fuzzy matching applied.
+        program_name: (optional) Program context for program-specific codes.
+    """
+    from neo4j_course_functions import (
+        get_course_info as _info_fn,
+        get_course_dependencies as _dep_fn,
+    )
+    results = {}
+    for raw_name in course_names:
+        name = _normalize_course(raw_name)
+        entry: dict = {}
+        try:
+            entry["info"] = _info_fn(name, program_name=program_name)
+        except Exception as exc:
+            entry["info"] = f"Error: {exc}"
+        try:
+            entry["prerequisites_and_dependents"] = _dep_fn(name, program_name)
+        except Exception as exc:
+            entry["prerequisites_and_dependents"] = f"Error: {exc}"
+        results[name] = entry
+    return _to_str(results)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tool list exported to agent.py
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -912,4 +991,7 @@ ALL_TOOLS = [
     get_all_types_courses,
     get_all_core_courses,
     get_all_not_specialized_courses,
+    # Comparison tools
+    compare_programs,
+    compare_courses,
 ]

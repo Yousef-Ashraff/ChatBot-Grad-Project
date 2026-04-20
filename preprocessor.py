@@ -889,9 +889,23 @@ class QueryPreprocessor:
         step4b_debug: List[str] = []
         step4b_ambiguous: List[Tuple[str, int, str, List[Dict]]] = []
 
+        # Build resolved-track spans for overlap detection below
+        resolved_track_spans = [
+            (pos, pos + len(orig))
+            for orig, pos, _d in track_occurrences
+            if orig in resolved_tracks
+        ]
+
         for original, pos, deduped in track_occurrences:
             if original in resolved_tracks:
                 continue   # already resolved as track — skip
+            # Skip if another track occurrence with overlapping span already mapped
+            span_end = pos + len(original)
+            if any(
+                pos < rend and rstart < span_end
+                for rstart, rend in resolved_track_spans
+            ):
+                continue  # overlapping term already resolved as a track — skip fallback
             course_result = self._map_course(deduped)
             if course_result["status"] == "resolved":
                 canonical = course_result["canonical"]
@@ -1847,9 +1861,10 @@ Examples:
 
                 if before in {"of", "in", "at", "from", "for"}:
                     return 0.0, 0.92   # preposition directly before → strong track
-                if after in {"courses", "course", "electives", "elective",
-                             "curriculum", "subjects", "subject", "classes", "class"}:
-                    return 0.0, 0.92   # container word directly after → strong track
+                if after in {"courses", "electives", "curriculum", "subjects", "classes"}:
+                    return 0.0, 0.92   # plural/collective container word directly after → strong track
+                if after in {"course", "elective", "subject", "class"}:
+                    return 0.92, 0.0   # singular "X course" pattern → "the AI course" → strong course
 
                 # Intent signal: narrow window only
                 start = max(0, word_pos - NARROW_WINDOW)
@@ -1862,9 +1877,12 @@ Examples:
                 prep_re = r'\b(?:of|in|at|from|for)\s+' + re.escape(t_lower) + r'\b'
                 if re.search(prep_re, ctx):
                     return 0.0, 0.92
-                cont_re = re.escape(t_lower) + r'\s+(?:courses?|electives?|curriculum|subjects?|classes?)'
+                cont_re = re.escape(t_lower) + r'\s+(?:courses|electives?|curriculum|subjects|classes)'
                 if re.search(cont_re, ctx):
                     return 0.0, 0.92
+                sing_re = re.escape(t_lower) + r'\s+(?:course|subject|class)\b'
+                if re.search(sing_re, ctx):
+                    return 0.92, 0.0
 
             ctx = " ".join(q_words[start:end])
             c, t = _score_intent_context(ctx)

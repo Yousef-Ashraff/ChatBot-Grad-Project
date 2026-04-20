@@ -179,7 +179,12 @@ _ANSWER_SYSTEM = (
     "- If the query has multiple parts, address each one completely and separately.\n"
     "- Include all relevant fields for every item — never summarize or truncate a list.\n"
     "- Do not refer the student to an advisor or external source as a substitute for "
-    "  information you already have access to.\n"
+    "  information you already have access to.\n\n"
+    "COMPARISON FOLLOW-UP RULE:\n"
+    "Whenever the context was gathered using compare_programs or compare_courses, "
+    "end your response with a friendly follow-up question asking the student whether "
+    "they would like a personalised recommendation based on the comparison — for example: "
+    "'Would you like me to make a personalised recommendation for you based on this comparison?'\n"
 )
 
 
@@ -460,47 +465,102 @@ def _make_judge_node():
 
         context = "\n\n---\n\n".join(accum_ctx) if accum_ctx else "(no data collected yet)"
 
+        # Structured chain-of-thought judge: the model must enumerate and type
+        # every required entity before it can set satisfied=true/false.
+        # This prevents the LLM from confusing a COURSE named "X" with a
+        # PROGRAM named "X" (e.g. "artificial intelligence" course ≠
+        # "artificial intelligence & machine learning" program).
         prompt = (
             f'Student query: "{original_query}"\n\n'
             f'Data collected from the BNU database:\n{context}\n\n'
-            f'Can an academic advisor fully answer the student query using this data?\n'
+            f'Determine whether the collected data is sufficient to fully answer '
+            f'the student query.\n'
             f'\n'
-            f'IMPORTANT RULES:\n'
-            f'1. satisfied = true if the data contains enough information for a '
-            f'   concrete, helpful answer — even if general (not student-specific).\n'
-            f'   Examples:\n'
-            f'   - "when can I take X?" + data shows year/semester → SATISFIED\n'
-            f'   - "prereqs of X?" + data shows prerequisites list → SATISFIED\n'
-            f'   - "what does X close?" + data shows dependents list → SATISFIED\n'
-            f'   - "am I eligible?" + eligibility result present → SATISFIED\n'
-            f'2. satisfied = false ONLY if the key data is completely absent or wrong.\n'
-            f'3. Tool errors and missing student_id do NOT make satisfied = false '
-            f'   if other results already answer the query.\n'
-            f'4. MULTI-ENTITY RULE: If the query mentions N courses or N programs, '
-            f'   satisfied = true ONLY when data for ALL N entities is present. '
-            f'   Count each entity in the query and verify each one appears in the '
-            f'   collected data. If even one is missing, set satisfied = false and '
-            f'   name the missing entity in "missing".\n'
+            f'--- ENTITY CLASSIFICATION ---\n'
+            f'Before judging, identify every entity the query asks about and its type:\n'
+            f'  type="course"  → a specific course (has description/credits/prerequisites)\n'
+            f'  type="program" → an academic track/program/major (has curriculum/credit structure)\n'
+            f'  type="other"   → anything else (GPA policy, graduation rules, bylaws, etc.)\n'
             f'\n'
-            f'Respond with ONLY valid JSON, nothing else:\n'
-            f'{{"satisfied": true}}  OR  '
-            f'{{"satisfied": false, "missing": "one short sentence on what is still needed"}}'
+            f'CRITICAL: courses and programs are COMPLETELY DIFFERENT entities.\n'
+            f'  - course "artificial intelligence" ≠ program "artificial intelligence & machine learning"\n'
+            f'  - A course mentioning which program it BELONGS TO is NOT program data.\n'
+            f'  - Program data must contain ALL of: total credit requirements, credit distribution\n'
+            f'    by category (humanities/math/computing/specialized), year-by-year curriculum\n'
+            f'    listing, AND elective slot information.\n'
+            f'  - If the context only shows course descriptions/prereqs (even for many courses),\n'
+            f'    mark any program entity as present_in_context=FALSE.\n'
+            f'\n'
+            f'--- PRESENCE CHECK ---\n'
+            f'For each entity you listed, mark present_in_context=true ONLY if the '
+            f'context contains data specifically for that entity and type.\n'
+            f'For program entities: present_in_context=true requires seeing credit_distribution,\n'
+            f'total credits, and multi-year curriculum data — not just course membership.\n'
+            f'\n'
+            f'--- SATISFACTION RULES ---\n'
+            f'1. satisfied=true  ONLY when every entity has present_in_context=true.\n'
+            f'2. satisfied=false if ANY entity is absent — name the missing one.\n'
+            f'3. For comparison queries, ALL compared items must be present.\n'
+            f'4. Tool errors or missing student_id alone do NOT make satisfied=false '
+            f'   if the other results already answer the query.\n'
+            f'5. General answers (not student-specific) are fine — if data exists to '
+            f'   give a helpful answer, that is enough.\n'
+            f'\n'
+            f'Respond with ONLY this exact JSON structure — no other text:\n'
+            f'{{\n'
+            f'  "entities": [\n'
+            f'    {{"name": "entity name", "type": "course|program|other", '
+            f'"present_in_context": true}},\n'
+            f'    ...\n'
+            f'  ],\n'
+            f'  "satisfied": true,\n'
+            f'  "missing": ""\n'
+            f'}}'
         )
 
         satisfied = False
         missing   = ""
         raw       = ""
         try:
-            raw = llm_call_json(prompt, temperature=0, max_tokens=500)
+            raw = llm_call_json(prompt, temperature=0, max_tokens=800)
             # Strip markdown fences if present
             raw = re.sub(r"```json|```", "", raw).strip()
-            # Extract first {...} blob in case model added surrounding text
-            m = re.search(r"\{.*?\}", raw, re.DOTALL)
+            # Extract the outermost {...} blob (handles extra surrounding text)
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
             if m:
                 raw = m.group(0)
-            data      = json.loads(raw)
+            data = json.loads(raw)
+
+            # Primary read: top-level satisfied field
             satisfied = bool(data.get("satisfied", False))
             missing   = data.get("missing", "")
+
+            # Safety cross-check: if any entity is marked present_in_context=false,
+            # override a (hallucinated) satisfied=true.
+            entities = data.get("entities", [])
+            if entities:
+                absent = [
+                    e.get("name", "unknown")
+                    for e in entities
+                    if not e.get("present_in_context", True)
+                ]
+                if absent and satisfied:
+                    satisfied = False
+                    missing   = missing or f"missing data for: {', '.join(absent)}"
+                    logger.warning(
+                        "[Judge] overriding satisfied=true — absent entities: %s", absent
+                    )
+            else:
+                # Model returned no entity list — fall back to strict False
+                # unless the model explicitly said satisfied=true with a reason
+                # (trust the model only when it provides entities)
+                if satisfied and not missing:
+                    # no entities parsed but model said true — keep it only if
+                    # context is non-empty (something was actually collected)
+                    if not accum_ctx:
+                        satisfied = False
+                        missing   = "no data collected yet"
+
         except Exception as exc:
             logger.warning("[Judge] parse failed — raw=%r  err=%s", raw[:200], exc)
             satisfied = False
