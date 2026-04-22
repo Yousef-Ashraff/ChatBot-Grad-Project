@@ -374,13 +374,21 @@ def _analyze_and_split(clean_query: str) -> List[str]:
                 "    • 1 entity                           → 1 sub-query\n"
                 "    • N independent courses, same intent → N sub-queries (one per course)\n"
                 "    • 1 course × M programs, same intent → M sub-queries (one per program)\n"
-                "    • Already atomic                     → return as-is\n\n"
+                "    • Already atomic                     → return as-is\n"
+                "    • Multiple attributes of the SAME entity (student profile, one course,\n"
+                "      one program) — e.g. 'my completed courses and their grades',\n"
+                "      'ML credits and prerequisites' — → exactly ONE sub-query.\n"
+                "      A possessive pronoun ('their', 'its') referencing an entity in the\n"
+                "      same query is a strong signal that both parts form one compound\n"
+                "      question about the same thing.\n\n"
                 "  NEVER apply cartesian expansion to items that are arguments of a COMPARISON\n"
                 "  or RECOMMEND clause, even if those items look like independent entities.\n\n"
                 "══ STEP 3 — SMELL TEST (apply before finalizing) ══\n"
                 "  ✗ Did the user actually ask for each generated sub-query? If no → remove it.\n"
                 "  ✗ Is any sub-query one of the arguments of a comparison/recommend clause\n"
                 "    extracted on its own? → the splitter broke an atomic clause. Merge it back.\n"
+                "  ✗ Are all sub-queries about attributes of the same entity (same course,\n"
+                "    same student profile, same program)? → collapse into one sub-query.\n"
                 "  ✗ Do all sub-queries together faithfully reconstruct the original intent\n"
                 "    with no added or lost meaning? If no → revise.\n\n"
                 "══ OUTPUT RULES ══\n"
@@ -415,6 +423,12 @@ def _analyze_and_split(clean_query: str) -> List[str]:
                 '  "what is \'natural language processing\' course and i love it"\n'
                 '  → Step 0: "it" → "\'natural language processing\' course"\n'
                 '  → ["what is \'natural language processing\' course and i love \'natural language processing\' course"]\n\n'
+                '  FACTUAL, multiple attributes of the same entity — stays atomic:\n'
+                '  "what are my completed courses and their grades"\n'
+                '  → ["what are my completed courses and their grades"]\n\n'
+                '  FACTUAL, multiple attributes of one course — stays atomic:\n'
+                '  "how many credits is ML and what are its prerequisites"\n'
+                '  → ["how many credits is ML and what are its prerequisites"]\n\n'
                 '  Already atomic:\n'
                 '  "what is ML about?" → ["what is ML about?"]\n\n'
                 f'Query: "{clean_query}"\n\n'

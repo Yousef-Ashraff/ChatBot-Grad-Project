@@ -70,9 +70,9 @@ def get_elective_slots(track, year, semester):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_prerequisites(course_name, program_name):
-    """Alias for get_course_dependencies from neo4j_course_functions."""
+    """Alias for get_course_dependencies — prerequisites only."""
     from neo4j_course_functions import get_course_dependencies
-    return get_course_dependencies(course_name, program_name)
+    return get_course_dependencies(course_name, program_name, dependents=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

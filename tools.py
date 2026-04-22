@@ -111,13 +111,10 @@ def get_student_info() -> str:
     """
     Retrieve the student's complete academic profile from the database.
     Returns: full name, program/track, university year, GPA, total earned
-    credits, and the complete list of completed courses.
+    credits, completed courses with degrees, per-semester GPA history,
+    and LinkedIn profile URL and summary.
 
     Use this when the student asks about:
-    - Their GPA or academic standing
-    - How many credits they have earned
-    - Which courses they have already completed
-    - Their current program or track
     - Any question about their personal academic status
     """
     sid = _get_student_id()
@@ -139,19 +136,12 @@ def get_course_info(course_name: str, program_name: Optional[str] = None) -> str
     Returns: full course name, description, credit hours, course code, and course type
     (core / elective).
 
-    Use this when the student wants to know what a course is about,
-    how many credits it gives, its course code, or whether it is core or elective.
-    Examples: "What is Machine Learning about?", "How many credits is SE?",
-              "What is the code for Machine Learning in the AIM program?"
-
+    Use this when wants to know what a course is about
     Args:
         course_name: Course name, abbreviation, or partial name. Fuzzy
                      matching is applied automatically (e.g. "ml", "soft eng").
         program_name: (optional) Full program name to get program-specific info
-                      such as the correct course code. Required for courses whose
-                      code differs per program (e.g. Machine Learning, Deep Learning).
-                      Examples: "artificial intelligence and machine learning",
-                                "software and application development", "data science".
+                      
     """
     try:
         from neo4j_course_functions import get_course_info as _fn
@@ -168,36 +158,42 @@ def get_course_info(course_name: str, program_name: Optional[str] = None) -> str
 def get_course_dependencies(
     course_name: str,
     program_name: Optional[str] = None,
+    prereq: bool = True,
+    dependents: bool = True,
 ) -> str:
     """
-    Get BOTH the prerequisites for a course AND the courses that depend on it.
+    Get prerequisite and/or dependent information for a course.
 
-    Returns TWO sections:
-    - "prerequisites": courses the student must complete BEFORE enrolling in
-      this course (what the student needs first).
-    - "dependents": courses that REQUIRE this course as a prerequisite — i.e.,
-      what this course UNLOCKS, CLOSES, or ENABLES for the student.
+    prereq=True     → what must be done BEFORE X can be taken (X's prerequisites).
+    dependents=True → what becomes available AFTER X is completed (courses X unlocks).
 
-    Use this for ANY of these question types:
-    - "What do I need before taking X?" (prerequisites section)
-    - "What are the prerequisites for X?" (prerequisites section)
-    - "What does X close / unlock / enable?" (dependents section)
-    - "What courses require X?" (dependents section)
-    - "What comes after completing X?" (dependents section)
-    - "What closes if I complete X?" (dependents section)
-    - "What courses does X lead to?" (dependents section)
-    - "What is X a prerequisite for?" (dependents section)
+    Choosing flags — ask ONE question:
+        "Is the student asking about what comes BEFORE X, or what comes AFTER X?"
+
+        BEFORE X → prereq=True,  dependents=False
+        AFTER X  → prereq=False, dependents=True
+        Both / uncertain → both=True (default — always safe when unsure)
+
+    To resolve BEFORE vs AFTER, reconstruct what the correct answer would look like:
+        Answer = courses the student must finish TO REACH X          → BEFORE → prereq
+        Answer = courses the student can take HAVING COMPLETED X     → AFTER  → dependents
+
+    No surface keyword reliably indicates direction. Always reason from meaning:
+    what would a complete and correct answer to this query actually contain?
 
     Args:
-        course_name:  Course name or abbreviation. Fuzzy matching is applied.
-        program_name: Student's program/track (optional). Improves accuracy.
-                      E.g. "artificial intelligence & machine learning",
-                      "software & application development", "data science".
+        course_name:  Course name
+        program_name: Student's program/track (optional).
+        prereq:       If True (default), include prerequisites in the result.
+        dependents:   If True (default), include dependent/closes courses in the result.
     """
     try:
         from neo4j_course_functions import get_course_dependencies
         return _to_str(
-            get_course_dependencies(_normalize_course(course_name), program_name)
+            get_course_dependencies(
+                _normalize_course(course_name), program_name,
+                prereq=prereq, dependents=dependents,
+            )
         )
     except Exception as exc:
         return f"Error fetching prerequisites: {exc}"
@@ -222,7 +218,7 @@ def get_course_timing(
     - "What year do students take Data Structures?"
 
     Args:
-        course_name:  Course name or abbreviation. Fuzzy matching is applied.
+        course_name:  Course name.
         program_name: Student's program/track (optional).
     """
     try:
@@ -261,7 +257,7 @@ def check_course_eligibility(
     - "Do I have the prerequisites for Deep Learning?"
 
     Args:
-        course_name: Course name or abbreviation. Fuzzy matching is applied.
+        course_name: Course name.
     """
     sid = _get_student_id()
     try:
@@ -353,9 +349,7 @@ def get_all_electives(program_name: str) -> str:
     - "What are my elective choices?"
 
     Args:
-        program_name: The student's program/track. E.g. "artificial
-                      intelligence & machine learning", "software &
-                      application development", "data science".
+        program_name: The student's program/track.
     """
     try:
         from neo4j_course_functions import get_all_electives_by_program, run_cypher_query
@@ -458,9 +452,7 @@ def get_program_total_credits(program_name: str) -> str:
     - "What are the total credits needed for data science?"
 
     Args:
-        program_name: The program/track name. E.g. "artificial intelligence
-                      & machine learning", "software & application
-                      development", "data science".
+        program_name: The program/track name.
     """
     try:
         from neo4j_track_functions import get_program_total_credits as _fn
@@ -615,9 +607,7 @@ def get_specialized_core_courses(
     - "List the core courses specific to the data science track"
 
     Args:
-        prg:       Program name. E.g. "artificial intelligence & machine learning",
-                   "software & application development", "data science" (or aliases
-                   like "AIM", "SAD", "DS").
+        prg:       Program name.
         year_flag: Set True to include the year level for each course.
         sem_flag:  Set True to include the semester for each course.
     """
@@ -681,7 +671,7 @@ def get_all_specialized_courses(
     - "What specialised courses are in year 3 of SAD?" (return all, LLM filters by year)
 
     Args:
-        prg:       Program name or alias.
+        prg:       Program name.
         year_flag: Include year for core courses; elective slot years for electives.
         sem_flag:  Include semester for core courses; elective slot semesters for electives.
     """
@@ -768,7 +758,7 @@ def get_basic_computing_sciences_courses(
     - "List basic computing sciences courses for data science"
 
     Args:
-        prg:       Program name or alias (optional).
+        prg:       Program name (optional).
         year_flag: Set True to include the year level for each course.
         sem_flag:  Set True to include the semester for each course.
     """
@@ -802,7 +792,7 @@ def get_all_types_courses(
     - "What do students study in the SAD track?"
 
     Args:
-        prg:       Program name or alias.
+        prg:       Program name.
         year_flag: Include year level for each course.
         sem_flag:  Include semester for each course.
     """
@@ -836,7 +826,7 @@ def get_all_core_courses(
     - "Show me only mandatory courses for SAD"
 
     Args:
-        prg:       Program name or alias.
+        prg:       Program name.
         year_flag: Include year level for each course.
         sem_flag:  Include semester for each course.
     """
@@ -871,7 +861,7 @@ def get_all_not_specialized_courses(
     - "What courses would I take regardless of which track I choose?"
 
     Args:
-        prg:       Program name or alias (optional).
+        prg:       Program name (optional).
         year_flag: Include year level for each course.
         sem_flag:  Include semester for each course.
     """
@@ -888,56 +878,7 @@ def get_all_not_specialized_courses(
 
 @tool
 def store_preference(preferences: Dict[str, float]) -> str:
-    """
-    Persist the student's academic interests and strengths inferred from the
-    conversation into their preference profile.
-
-    Call this whenever the student reveals a genuine interest, skill, background,
-    certification, or dislike — even if they don't say "I like X" explicitly.
-
-    TRIGGER EXAMPLES (these should all cause a call):
-      "I love calculus"              → {"math": 0.25}
-      "I'm really good at stats"     → {"probability_statistics": 0.20}
-      "I got my CCNA certification"  → {"networking_systems": 0.30, "software_engineering": 0.10}
-      "I find coding easy"           → {"programming": 0.20}
-      "I'm into data analysis"       → {"data_analysis": 0.25, "data_management": 0.15}
-      "I hate theory subjects"       → {"theory": -0.15}
-      "I love AI and math"           → {"ai_ml": 0.25, "math": 0.20}
-      "I studied NLP at my previous college" → {"ai_ml": 0.20, "language_text": 0.20}
-      "I built a web app before"     → {"software_engineering": 0.20, "programming": 0.15}
-      "Probability is my weak point" → {"probability_statistics": -0.10}
-
-    VALID CATEGORY KEYS — use ONLY these 12 strings as dict keys:
-      math                  calculus, linear algebra, discrete math, numerical methods
-      probability_statistics  probability, statistics, stochastic processes
-      programming           coding, algorithms, data structures, competitive programming
-      software_engineering  design patterns, web/mobile dev, system design, SDLC
-      ai_ml                 machine learning, deep learning, AI in general
-      data_management       databases, SQL, data warehousing, data engineering
-      data_analysis         analytics, BI, visualization, insight extraction
-      theory                automata, complexity, formal methods, logic
-      networking_systems    networks, OS, security, CCNA, sysadmin, infrastructure
-      visual_computing      image processing, computer graphics, geometry
-      language_text         NLP, linguistics, text processing, translation
-      optimization          operations research, numerical optimization
-
-    DELTA STRENGTH GUIDE:
-      +0.10  tried it / studied it once
-      +0.15  likes it / comfortable with it
-      +0.20  good at it / studies it regularly
-      +0.25  loves it / passionate about it
-      +0.30  certified in it / works in it professionally
-      -0.10  dislikes it / finds it difficult
-      -0.15  hates it / actively avoids it
-
-    One student statement can map to MULTIPLE categories — pass all of them in
-    a single call. Do NOT call this for casual course mentions — only for
-    genuine signals about the student's interest, skill level, or background.
-
-    Args:
-        preferences: Dict mapping category keys to delta scores.
-                     E.g. {"math": 0.25, "ai_ml": 0.20}
-    """
+    """ test """
     sid = _get_student_id()
     try:
         from preference_service import update_ai_preference, VALID_CATEGORIES
@@ -974,8 +915,6 @@ def compare_programs(program_names: List[str]) -> str:
 
     Args:
         program_names: List of program names to compare.
-                       E.g. ["artificial intelligence & machine learning",
-                              "software & application development"]
     """
     from neo4j_track_functions import get_program_info as _fn
     results = {}
@@ -1007,7 +946,7 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
     like a personalised recommendation based on the information.
 
     Args:
-        course_names: List of course names to compare. Fuzzy matching applied.
+        course_names: List of course names to compare .
         program_name: (optional) Program context for program-specific codes.
     """
     from neo4j_course_functions import (

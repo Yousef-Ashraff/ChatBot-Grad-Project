@@ -241,7 +241,7 @@ def check_course_eligibility(student_id: str, course_name: str) -> dict:
 
     # ── Fetch prerequisites from the knowledge graph ──────────────────────────
     from neo4j_course_functions import get_course_dependencies
-    dep_info      = get_course_dependencies(course_name, program_name)
+    dep_info      = get_course_dependencies(course_name, program_name, dependents=False)
     prerequisites = dep_info.get("prerequisites", [])
 
     # ── No prerequisites → immediately eligible ───────────────────────────────

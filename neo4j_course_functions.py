@@ -280,45 +280,22 @@ def get_courses_by_multiple_terms(terms, program_name=None):
     return combined_results
 
 
-def get_course_dependencies(course_name, program_name=None):
+def get_course_dependencies(course_name, program_name=None, prereq=True, dependents=True):
     """
-    Get complete dependency information for a course from the knowledge graph.
-    
-    This function returns BOTH:
-    1. Prerequisites - courses needed BEFORE taking this course
-    2. Dependents (closes) - courses that become available AFTER completing this course
-    
+    Get dependency information for a course from the knowledge graph.
+
     Uses track property if available, otherwise falls back to intersection of programs.
 
     Args:
-        course_name: Name of the course (case-insensitive, will be converted to lowercase)
-        program_name: Optional program name (string) or list of program names to filter
+        course_name:  Name of the course (case-insensitive).
+        program_name: Optional program name (string) or list of program names to filter.
+        prereq:       If True (default), include prerequisites in the result.
+        dependents:   If True (default), include dependent/closes courses in the result.
 
     Returns:
-        Dictionary with:
-            - prerequisites: List of prerequisite information with track details
-            - dependents: List of courses that become available after completing this course
-            
-    Example:
-        >>> get_course_dependencies("machine learning")
-        {
-            "prerequisites": [
-                {
-                    "name": "data structures",
-                    "code": "CS201",
-                    "credit_hours": 3,
-                    "tracks": ["AI", "DS"]
-                }
-            ],
-            "dependents": [
-                {
-                    "name": "deep learning",
-                    "code": "CS401",
-                    "credit_hours": 3,
-                    "tracks": ["AI"]
-                }
-            ]
-        }
+        Dictionary with any combination of:
+            - "prerequisites": courses needed BEFORE taking this course (when prereq=True)
+            - "dependents":    courses unlocked AFTER completing this course (when dependents=True)
     """
 
     # Convert to lowercase to match the KG format
@@ -326,31 +303,37 @@ def get_course_dependencies(course_name, program_name=None):
 
     # Special cases with credit hour requirements
     if course_name == 'graduation project (1)':
-        return {
-            "prerequisites": [{'Required_Credit_Hours': '100',
+        result = {}
+        if prereq:
+            result["prerequisites"] = [{'Required_Credit_Hours': '100',
                 'tracks': ['software & application development',
                    'artificial intelligence & machine learning',
-                   'data science']}],
-            "dependents": get_course_closes(course_name)
-        }
+                   'data science']}]
+        if dependents:
+            result["dependents"] = get_course_closes(course_name)
+        return result
 
     elif course_name == 'field training (1)':
-        return {
-            "prerequisites": [{'Required_Credit_Hours': '60',
+        result = {}
+        if prereq:
+            result["prerequisites"] = [{'Required_Credit_Hours': '60',
                 'tracks': ['software & application development',
                    'artificial intelligence & machine learning',
-                   'data science']}],
-            "dependents": []
-        }
+                   'data science']}]
+        if dependents:
+            result["dependents"] = []
+        return result
 
     elif course_name == 'field training (2)':
-        return {
-            "prerequisites": [{'Required_Credit_Hours': '90',
+        result = {}
+        if prereq:
+            result["prerequisites"] = [{'Required_Credit_Hours': '90',
                 'tracks': ['software & application development',
                    'artificial intelligence & machine learning',
-                   'data science']}],
-            "dependents": []
-        }
+                   'data science']}]
+        if dependents:
+            result["dependents"] = []
+        return result
 
     if program_name:
         # Handle both string and list inputs
@@ -393,36 +376,38 @@ def get_course_dependencies(course_name, program_name=None):
         """
         params = {"course_name": course_name, "program_names": program_names}
 
-        # Execute query on Neo4j
-        result = run_cypher_query(query, params)
+        result_dict = {}
 
-        # Build prerequisites list
-        prerequisites = []
-        for record in result:
-            prereq_data = {
-                "name": record["prerequisite_name"],
-                "code": record["prerequisite_code"],
-                "credit_hours": record["credit_hours"],
-                "tracks": []
-            }
+        if prereq:
+            # Execute prerequisites query on Neo4j
+            result = run_cypher_query(query, params)
 
-            for detail in record["program_details"]:
-                if detail and detail.get("program"):
-                    prereq_data["tracks"].append({
-                        "program": detail["program"],
-                        "course_type": "elective" if detail["course_type"] == "yes" else "mandatory"
-                    })
+            # Build prerequisites list
+            prerequisites = []
+            for record in result:
+                prereq_data = {
+                    "name": record["prerequisite_name"],
+                    "code": record["prerequisite_code"],
+                    "credit_hours": record["credit_hours"],
+                    "tracks": []
+                }
 
-            if prereq_data["tracks"]:
-                prerequisites.append(prereq_data)
+                for detail in record["program_details"]:
+                    if detail and detail.get("program"):
+                        prereq_data["tracks"].append({
+                            "program": detail["program"],
+                            "course_type": "elective" if detail["course_type"] == "yes" else "mandatory"
+                        })
 
-        # Get courses that this course closes/opens up (dependents)
-        dependents = get_course_closes(course_name, program_name)
-        
-        return {
-            "prerequisites": prerequisites,
-            "dependents": dependents
-        }
+                if prereq_data["tracks"]:
+                    prerequisites.append(prereq_data)
+
+            result_dict["prerequisites"] = prerequisites
+
+        if dependents:
+            result_dict["dependents"] = get_course_closes(course_name, program_name)
+
+        return result_dict
     else:
         # Get all prerequisites — respecting r.track on HAS_PREREQUISITE and the
         # intersection of programs that both the main course and the prereq belong to.
@@ -489,36 +474,38 @@ def get_course_dependencies(course_name, program_name=None):
         """
         params = {"course_name": course_name}
 
-        # Execute query on Neo4j
-        preq_result = run_cypher_query(query, params)
+        result_dict = {}
 
-        # Get courses that this course closes/opens up (dependents)
-        dependent_result = get_course_closes(course_name, program_name)
+        if prereq:
+            # Execute prerequisites query on Neo4j
+            preq_result = run_cypher_query(query, params)
 
-        # Build prerequisites list — same dict-track format as the program-specific path.
-        # _resolve_code() unwraps the Case-3 code structure:
-        #   [{program: null, code: "X"}] → "X"  (node-level code, plain string)
-        #   [{program: "aim", code: ...}, ...] → list of per-program dicts
-        prerequisites = []
-        for record in preq_result:
-            prereq_data = {
-                "name":         record["prerequisite_name"],
-                "code":         _resolve_code(record["prerequisite_code"]),
-                "credit_hours": record["credit_hours"],
-                "tracks":       [],
-            }
-            for detail in record["program_details"]:
-                if detail and detail.get("program"):
-                    prereq_data["tracks"].append({
-                        "program":     detail["program"],
-                        "course_type": detail["course_type"],
-                    })
-            prerequisites.append(prereq_data)
+            # Build prerequisites list — same dict-track format as the program-specific path.
+            # _resolve_code() unwraps the Case-3 code structure:
+            #   [{program: null, code: "X"}] → "X"  (node-level code, plain string)
+            #   [{program: "aim", code: ...}, ...] → list of per-program dicts
+            prerequisites = []
+            for record in preq_result:
+                prereq_data = {
+                    "name":         record["prerequisite_name"],
+                    "code":         _resolve_code(record["prerequisite_code"]),
+                    "credit_hours": record["credit_hours"],
+                    "tracks":       [],
+                }
+                for detail in record["program_details"]:
+                    if detail and detail.get("program"):
+                        prereq_data["tracks"].append({
+                            "program":     detail["program"],
+                            "course_type": detail["course_type"],
+                        })
+                prerequisites.append(prereq_data)
 
-        return {
-            "prerequisites": prerequisites,
-            "dependents": dependent_result,
-        }
+            result_dict["prerequisites"] = prerequisites
+
+        if dependents:
+            result_dict["dependents"] = get_course_closes(course_name, program_name)
+
+        return result_dict
 
 
 def get_course_closes(course_name, program_name=None):
@@ -880,8 +867,8 @@ def check_course_eligibility(course_name, prerequisites=None, completed_courses=
     
     # Get prerequisites for the course if not provided
     if not prerequisites:
-        prerequisites = get_course_dependencies(course_name, program_name)['prerequisites']
-    
+        prerequisites = get_course_dependencies(course_name, program_name, dependents=False)['prerequisites']
+
     if not prerequisites:
         return {
             "eligible": True,
@@ -1167,8 +1154,8 @@ def interactive_eligibility_check(course_name, program_name=None, student_id=os.
             print(f"⚠ Could not retrieve existing academic details: {e}\n")
     
     # Get prerequisites first
-    prerequisites = get_course_dependencies(course_name, program_name)['prerequisites']
-    
+    prerequisites = get_course_dependencies(course_name, program_name, dependents=False)['prerequisites']
+
     if not prerequisites:
         print(f"✅ No prerequisites required for {course_name}!")
         return {

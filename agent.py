@@ -138,12 +138,26 @@ _AGENT_SYSTEM = (
     "angle' — it artificially restricts results and counts as a wasted round.\n"
     "6. For course planning requests, call start_course_planning — it is a "
     "   complete interactive session, no other tools are needed alongside it.\n"
-    "7. COURSE COMPLETION STATEMENT — if the student says they completed, passed, "
-    "finished, or earned a course (e.g. 'I got ML', 'I passed machine learning', "
-    "'I completed OS', 'I have DB'), call get_course_dependencies with that course "
-    "name — its 'dependents' section shows which courses it unlocks. Do NOT call "
-    "store_preference for course completion statements — 'I got X course' means "
-    "they finished it, not that they have a preference for it.\n"
+    "7. COURSE COMPLETION STATEMENT — ONLY applies when the student's message contains "
+    "explicit first-person language stating they finished a course: 'I got X', 'I passed X', "
+    "'I completed X', 'I finished X', 'I have X done'. A QUESTION about a course ('what "
+    "close X?', 'what does X unlock?', 'what courses need X?') is NEVER a course completion "
+    "statement, even if it mentions a course name. When the pattern matches: call "
+    "get_course_dependencies with prereq=False, dependents=True (show what completing X "
+    "enables). Do NOT call store_preference for course completion statements.\n"
+    "7b. CHOOSING FLAGS for get_course_dependencies — ask ONE question:\n"
+    "  'Is the student asking about what comes BEFORE X, or what comes AFTER X?'\n"
+    "  BEFORE X (courses the student must complete to reach/access X) → prereq=True, dependents=False\n"
+    "  AFTER X (courses that become available once X is completed)    → prereq=False, dependents=True\n"
+    "  Both directions or uncertain                                   → both=True (default — safest)\n"
+    "\n"
+    "  To determine BEFORE vs AFTER: reconstruct the expected answer.\n"
+    "    Expected answer = courses you must finish TO REACH X → BEFORE → prereq.\n"
+    "    Expected answer = courses you can take HAVING COMPLETED X → AFTER → dependents.\n"
+    "\n"
+    "  When direction is genuinely uncertain, always use both=True rather than guessing.\n"
+    "  No surface keyword (close, open, unlock, need, require) reliably signals direction.\n"
+    "  Always resolve from meaning: what would a correct answer to this query look like?\n"
     "8. PREFERENCE DETECTION — call store_preference whenever the student expresses "
     "interest, love, skill, weakness, background, or emotion about any subject "
     "(e.g. 'I love NLP', 'I'm good at math', 'I hate theory', 'coding is easy for me'). "
@@ -168,13 +182,17 @@ _ANSWER_SYSTEM = (
     "Do NOT cite article numbers, source names, or tool names. "
     "If the context is insufficient, say so and suggest the student contact "
     "the registrar's office.\n"
-    "COURSE COMPLETION ACKNOWLEDGMENT: If the student said they completed, passed, or "
-    "earned a course (e.g. 'I got ML', 'I passed OS'), start with a warm, brief "
-    "congratulation, then list the courses that require it as a prerequisite — but "
-    "make clear that those courses may have OTHER prerequisites too, so passing this "
-    "course alone does not guarantee eligibility. Suggest they use the eligibility "
-    "checker if they want to know exactly which courses they can take now. "
-    "Never respond with the course's own description — they already know the course.\n"
+    "COURSE COMPLETION ACKNOWLEDGMENT: ONLY trigger this when the student's message "
+    "explicitly states in first person that they completed, passed, finished, or earned "
+    "a course — the message must contain language like 'I got X', 'I passed X', "
+    "'I completed X', 'I finished X', 'I have X'. Do NOT trigger this for questions "
+    "that merely ask about prerequisites or what a course unlocks — a question is not "
+    "a completion statement, even if the tool returned a `dependents` list. "
+    "When triggered: start with a warm, brief congratulation, then list the courses "
+    "that require it as a prerequisite — but make clear that those courses may have "
+    "OTHER prerequisites too, so passing this course alone does not guarantee eligibility. "
+    "Suggest they use the eligibility checker if they want to know exactly which courses "
+    "they can take now. Never respond with the course's own description.\n"
     "STUDENT PREFERENCES AND INTERESTS: If the student expressed interest, love, "
     "enthusiasm, or a personal connection to a subject (e.g. 'I love NLP', 'I enjoy math'), "
     "acknowledge it warmly at the start of your response. Briefly mention why that subject "
@@ -543,17 +561,18 @@ def _make_judge_node():
             f'\n'
             f'--- TOOL RESULT FIELD SEMANTICS ---\n'
             f'Use these mappings when deciding if context satisfies the query intent:\n'
-            f'• "what courses can I take AFTER X" / "what does X unlock" / "what does X close" /\n'
-            f'  "what does X open" / "what does X enable" / "I completed X, what can I take now":\n'
-            f'  → satisfied when context contains a get_course_dependencies result for course X\n'
-            f'    that has a `dependents` list  (even an empty list IS a valid answer — it means\n'
-            f'    X does not unlock any further course).\n'
-            f'  → The `dependents` field = courses whose prerequisite IS X = courses you can\n'
-            f'    take AFTER completing X.  This DIRECTLY answers "what can I take after X".\n'
-            f'  → Do NOT mark this as missing just because the word "dependents" differs from\n'
-            f'    the query wording "after" / "unlock" / "close" — they are the same concept.\n'
-            f'• "prerequisites for X" / "what do I need before X" / "what does X require":\n'
-            f'  → satisfied by a `prerequisites` list in get_course_dependencies for course X.\n'
+            f'• get_course_dependencies has two fields:\n'
+            f'  `prerequisites` = what must be done BEFORE X (X\'s prerequisites).\n'
+            f'    Satisfies any query about what the student must complete to reach/access X.\n'
+            f'  `dependents` = what becomes available AFTER X is completed (courses X unlocks).\n'
+            f'    Satisfies any query about what completing X makes accessible.\n'
+            f'  To judge which field is expected: reconstruct what the correct answer contains.\n'
+            f'    "Courses you must finish to reach X" → BEFORE → expect `prerequisites`.\n'
+            f'    "Courses you can take once you have X" → AFTER → expect `dependents`.\n'
+            f'  An empty list IS a valid answer. ONLY `prerequisites` is sufficient for a\n'
+            f'  BEFORE-X query; ONLY `dependents` is sufficient for an AFTER-X query —\n'
+            f'  do not mark as missing because the other field is absent.\n'
+            f'  Surface keywords never reliably indicate BEFORE vs AFTER — reason from meaning.\n'
             f'• Course description / info / credits:\n'
             f'  → satisfied by a get_course_info result for course X.\n'
             f'• Timing / semester / year offered:\n'
