@@ -38,7 +38,7 @@ project/
 ├── api_server.py              # FastAPI HTTP server (port 8000)
 ├── chatbot_api.py             # Main orchestration layer + session management
 ├── agent.py                   # LangGraph judging-loop agent
-├── tools.py                   # 12 LangChain tool definitions
+├── tools.py                   # 27 LangChain tool definitions
 ├── preprocessor.py            # Query preprocessing pipeline (5 steps)
 ├── course_name_mapper.py      # Fuzzy course name → Neo4j canonical name
 ├── neo4j_course_functions.py  # Core Neo4j/KG query functions + _resolve_code()
@@ -51,6 +51,7 @@ project/
 ├── student_functions.py       # Student profile query helper
 ├── llm_client.py              # Groq LLM client with 5-key fallback
 ├── debug_box.py               # Unicode box printer for debug output
+├── preference_service.py      # Student preference CRUD (ai_preference column in Supabase)
 ├── google_sheets_logger.py    # Optional conversation logging to Sheets
 └── .env                       # All credentials and config
 ```
@@ -78,13 +79,14 @@ project/
 [agent.py]               ← LangGraph ReAct agent with Judging Loop
    │
    ▼
-[tools.py]               ← 12 LangChain tools
+[tools.py]               ← 27 LangChain tools
    │
    ├─► [neo4j_course_functions.py]  ← Knowledge Graph (Neo4j Aura)
    ├─► [eligibility.py]            ← Prerequisite + credit-hour checks (Supabase)
    ├─► [rag_service.py]            ← RAG pipeline (Pinecone + HuggingFace + Groq)
    ├─► [student_functions.py]      ← Student profile queries (Supabase)
-   └─► [planning_service.py]       ← Interactive multi-turn course planner
+   ├─► [planning_service.py]       ← Interactive multi-turn course planner
+   └─► [preference_service.py]     ← Student preference storage (Supabase)
 ```
 
 ### Request Flow (End-to-End)
@@ -105,7 +107,7 @@ chatbot_api.chat(student_id, message)
     │   [Normal path: _preprocess_and_run()]
     │      │
     │      ▼
-    │   preprocessor.process(message, history)   ← 5-step pipeline
+    │   preprocessor.process(message, history, student_track)   ← 5-step pipeline
     │      │
     │      ▼
     │   Returns PreprocessResult:
@@ -162,6 +164,7 @@ START → agent → dedup → tools → collect → judge
 **`AgentState` TypedDict fields:**
 - `messages` — full LangChain message history (add_messages reducer)
 - `accumulated_context` — all tool result strings (append-only, never discarded)
+- `silent_context` — results from "silent" tools like `store_preference` (append-only); shown to the judge but not included in the main context block passed to the answer LLM
 - `called_tools` — dedup signatures `"tool_name|sorted_args_json"` (append-only)
 - `previous_reformulations` — prior query reformulations tried
 - `tool_calls_this_round` — counter of tool rounds done (int, replace)
@@ -175,8 +178,8 @@ START → agent → dedup → tools → collect → judge
 - **agent** — selects next tool. Uses `GROQ_MODEL_AGENT`. Retries on `tool_use_failed` (Groq 400).
 - **dedup** — injects fake `[SKIPPED]` ToolMessage for duplicate calls.
 - **tools** — `ToolNode(ALL_TOOLS)`, executes tool calls.
-- **collect** — appends ToolMessage content to `accumulated_context`, increments round counter.
-- **judge** — LLM evaluates if context fully answers `original_query`. If `start_course_planning` was called → always `satisfied=true`.
+- **collect** — appends ToolMessage content to `accumulated_context` (or `silent_context` for tools in `_SILENT_TOOLS = {"store_preference"}`), increments round counter.
+- **judge** — LLM evaluates if context fully answers `original_query`. If `start_course_planning` was called → always `satisfied=true`. Handles PURE PREFERENCE STATEMENT rule: if query is only a sentiment/interest statement and `store_preference` ran → `satisfied=true` immediately.
 - **answer** — generates final answer from `accumulated_context`. If planning tool was called → relays planning output directly.
 - **reformulate** — generates new `current_query` with a different angle (7 fixed angles in order). Resets `tool_calls_this_round` to 0.
 - **clarify** — polite last-resort clarification request after all reformulations exhausted.
@@ -205,28 +208,47 @@ Runs before every agent invocation. Five steps:
 
 **PreprocessResult** fields: `status`, `clean_query`, `clarification`, `pending`, `resolved_courses: Dict[str,str]` (original→canonical for every course mapped in this run)
 
+**`process(message, history, student_track=None)`** — `student_track` is the student's canonical program name (fetched from Supabase by `chatbot_api._preprocess_and_run()` before calling the preprocessor). Used as a secondary hint for resolving track-vs-course conflicts.
+
 **Chained ambiguity flow:** When multiple courses are ambiguous, the preprocessor asks about them one at a time. After each disambiguation reply, `resolve_ambiguity()` processes remaining `pending_courses`; if another is ambiguous it returns `status="ambiguous"` again. `_resolve_ambiguity_reply()` in `chatbot_api.py` detects this and stores the new pending instead of running the agent.
 
-## Tools (`tools.py`) — 12 Tools
+## Tools (`tools.py`) — 27 Tools
 
 Student ID injected via module-level `_ACTIVE_STUDENT_ID` (set by `set_active_student_id()` before each graph run). All tools return plain strings. Course name fuzzy matching applied automatically via `_normalize_course()`.
 
 The inline electives Cypher query inside `get_all_electives` uses `COALESCE(c.code, r.code) AS course_code` and `ORDER BY COALESCE(c.code, r.code)` (Case 1 — program is always provided).
 
+**Silent tools** (`_SILENT_TOOLS = {"store_preference"}`): their results go to `silent_context` instead of `accumulated_context`, so they are visible to the judge but not included in the LLM answer prompt.
+
 | Tool | When to use |
 |---|---|
 | `get_student_info` | "What's my GPA?", "What have I completed?" |
 | `get_course_info` | "What is ML about?", "How many credits is SE?" |
-| `get_course_prerequisites` | "What does X close?", "What are prereqs for X?", "What does X unlock?" |
+| `get_course_dependencies` | "What does X close?", "What are prereqs for X?", "What does X unlock?", "I passed X, what can I take now?" |
 | `get_course_timing` | "When is ML taught?", "Which semester is OS?" |
 | `check_course_eligibility` | "Can I take ML?", "Am I eligible for OS?" |
 | `get_courses_by_term` | "What's in year 2 semester 1?" |
 | `get_courses_by_multiple_terms` | "What do I study in years 2 and 3?" |
 | `get_all_electives` | "What electives are in the AI track?" |
-| `get_elective_slots` | "When can I take electives?", "How many elective slots?" |
+| `get_elective_slots_time_and_occ` | "When can I take electives?", "How many elective slots?" |
 | `filter_courses` | "Show all 3-credit courses in AIM", "What core courses in SAD?" |
+| `get_program_total_credits` | "How many credits to graduate?", "Total credit requirement for AIM?" |
 | `answer_academic_question` | "What's the minimum GPA?", "Graduation requirements?" — RAG over bylaws |
 | `start_course_planning` | "Make a plan for me", "What should I take next semester?" |
+| `get_program_info` | "Tell me about the AIM program", "What is the SAD track?" |
+| `get_credit_hour_distribution` | "How are the 136 credits broken down?", "How many humanities credits?" |
+| `get_specialized_core_courses` | "What mandatory specialized courses does AIM have?" |
+| `get_specialized_elective_courses` | "What electives does the AI track offer?" |
+| `get_all_specialized_courses` | "What courses are unique to data science?", "What differs between AIM and SAD?" |
+| `get_general_courses` | "What GEN/humanities courses are there?" |
+| `get_math_and_basic_science_courses` | "What math/BAS courses do I study?" |
+| `get_basic_computing_sciences_courses` | "What BCS courses does AIM have?" |
+| `get_all_types_courses` | "Show me the full curriculum for AIM" |
+| `get_all_core_courses` | "What mandatory courses are in data science?" |
+| `get_all_not_specialized_courses` | "What courses are shared between all programs?" |
+| `compare_programs` | "Compare AIM and SAD", "What's the difference between DAS and AIM?" |
+| `compare_courses` | "Compare ML and DL", "What's the difference between OS and networks?" |
+| `store_preference` *(silent)* | Automatically called when student expresses interest/skill/dislike ("I love NLP", "I'm good at math", "I hate theory") |
 
 ## Data Sources
 
@@ -293,6 +315,20 @@ The `code` property is split across two locations depending on the course:
 
 **Chat history window:** last 3 user + last 3 assistant messages (6 total)
 
+### Supabase — `student_preferences` table
+
+| Column | Type | Notes |
+|---|---|---|
+| `student_id` | text PK | |
+| `ai_preference` | jsonb | AI-inferred interest scores `{category: float 0–1}` |
+| `user_preference` | jsonb | Reserved for explicit user-set preferences |
+| `degree_preference` | jsonb | Reserved for degree-level preference data |
+| `updated_at` | timestamptz | Auto-updated |
+
+**Valid `ai_preference` categories (12):** `math`, `probability_statistics`, `programming`, `software_engineering`, `ai_ml`, `data_management`, `data_analysis`, `theory`, `networking_systems`, `visual_computing`, `language_text`, `optimization`
+
+Scores are clamped to [0.0, 1.0]. Updated via `update_ai_preference(student_id, deltas)` which upserts (creates row on first call).
+
 ### Pinecone (RAG)
 
 - Index: `bnu-bylaws`, top_k=4, min_score=0.30
@@ -332,12 +368,12 @@ The `code` property is split across two locations depending on the course:
 Before every agent run, `_analyze_and_split(clean_query)` is called to detect whether the query asks about multiple independent topics.
 
 **`_analyze_and_split(clean_query) → List[str]`**
-- Calls the utility LLM with a structured prompt covering all combinatorial cases:
-  - N courses → N sub-queries
-  - 1 course × M programs → M sub-queries
-  - N courses × M programs → N×M sub-queries (cartesian product)
-  - Independent mixed questions (course + bylaw) → one each
-  - Already atomic → `[clean_query]` unchanged
+- Calls the utility LLM with a 4-step structured prompt (resolve intra-query pronouns → find intent boundaries → assign one sub-query per intent → smell test).
+- **Intent types:**
+  - `COMPARISON` clause (`compare`, `vs`, `difference between`) → always ONE atomic sub-query, never split by items compared
+  - `RECOMMEND` clause (`which should I choose`, `recommend`) → always ONE atomic sub-query
+  - `FACTUAL` clause: N independent courses → N sub-queries; 1 course × M programs → M sub-queries; N×M only for pure factual; already atomic → unchanged
+- Comparison/recommend arguments are **never** extracted as separate sub-queries even if they look like independent entities.
 - Returns a list of sub-query strings. Single-item list → no split.
 
 **`_split_and_run(student_id, clean_query, sub_queries, history, verbose)`**
@@ -488,12 +524,30 @@ Unicode box-drawing output. Global verbose flag via `set_verbose(True)`.
 
 Boxes printed by: preprocessor (steps 0–5) and agent nodes (Agent, Dedup, Collect, Judge, Reformulate, Answer, Clarify). `force=True` for critical events (always print).
 
+## Preference Service (`preference_service.py`)
+
+Manages the `ai_preference` column in the `student_preferences` Supabase table.
+
+**`VALID_CATEGORIES`** — the 12 allowed keys for the `ai_preference` dict (see Tools section above).
+
+**`get_preferences(student_id) → Dict`** — returns all three preference dicts (`ai_preference`, `user_preference`, `degree_preference`). Parses JSON strings if Supabase returns them as strings.
+
+**`update_ai_preference(student_id, deltas: Dict[str, float]) → Dict[str, float]`**
+- Filters out any key not in `VALID_CATEGORIES`.
+- Reads existing `ai_preference` scores from Supabase.
+- Merges: `updated[cat] = clamp(current.get(cat, 0.0) + delta, 0.0, 1.0)`.
+- Upserts the full updated dict (creates row on first call, updates on subsequent calls).
+- Returns the updated dict.
+
+**How it's called:** The `store_preference` LangChain tool calls `update_ai_preference` with LLM-inferred delta scores whenever the student expresses genuine interest, skill, background, or dislike about a subject category.
+
 ## Key Global State Patterns (not thread-safe across concurrent students)
 
 - `tools._ACTIVE_STUDENT_ID` — set before each `agent.run()` call
 - `chatbot_api._planning_sessions` — active planning sessions by student_id
 - `chatbot_api._ambiguity_sessions` — pending course disambiguation by student_id
 - `eligibility._supabase` — lazy singleton Supabase client
+- `preference_service._client` — lazy singleton Supabase client
 - `course_name_mapper` — module-level singleton, cached Neo4j course list
 
 ## Environment Variables (`.env`)
@@ -553,4 +607,8 @@ DEBUG_LEVEL=
 11. **Planning in split queries** — when `start_course_planning` fires as a sub-query of a split, its output is surfaced directly (not summarised) so the interactive session continues correctly. Any co-located non-planning answer is prepended.
 12. **Chat history is a sliding window** — only last 3 user + 3 assistant messages stored in Supabase and passed to agent.
 13. **Authoritative credit count from DB** — `total_hours_earned` read directly from Supabase, never recomputed from `courses_degrees`.
-14. **Course code split across node vs. relationship** — six courses (`machine learning`, `natural language processing`, `image processing`, `deep learning`, `computer vision`, `data mining`) have program-specific codes that differ per program. Their `code` property was removed from the Course node and migrated to the `BELONGS_TO` relationship (`r.code`). All Cypher queries follow a 3-case rule: (1/2) program context available → `COALESCE(c.code, r.code)` returning a plain string; (3) no program context → `CASE WHEN c.code IS NOT NULL` returning a `[{program, code}]` list, unwrapped by `_resolve_code()`. The `_query_courses_by_code_prefix()` filter in `neo4j_track_functions.py` uses `(c.code STARTS WITH $prefix OR r.code STARTS WITH $prefix)` so these courses are still found by prefix. The fuzzy code matchers (`course_name_mapper.py`, `preprocessor.py`) use `OPTIONAL MATCH + collect(r.code)[0]` to get any one code for matching, which is sufficient for string-identity matching.
+14. **Silent context for side-effects** — `store_preference` results go to `silent_context` (not `accumulated_context`) so the judge can see the side-effect was performed, but the preference update text is not included in the answer prompt. This keeps preference storage invisible to the student-facing response.
+15. **Preference inference from conversation** — the agent system prompt includes rules for detecting preference signals ("I love X", "I'm good at Y", "I hate Z") and routing them to `store_preference` before (or instead of) any factual tool calls. Pure preference statements (no factual question) are fully satisfied after `store_preference` alone — the judge marks them satisfied immediately.
+16. **Agent rules for preference vs. course completion** — the agent distinguishes "I got ML" (course completion → call `get_course_dependencies`) from "I love NLP" (preference → call `store_preference`). A `COURSE COMPLETION STATEMENT` triggers dependency lookup; a `PREFERENCE DETECTION` trigger only applies when the student expresses genuine interest/skill, not course completion.
+17. **Comparison tools kept atomic** — `compare_programs` and `compare_courses` gather full data for all items in a single call. The query splitter treats any comparison/recommend clause as a single atomic sub-query; it never breaks out individual compared items as separate sub-queries.
+18. **Course code split across node vs. relationship** — six courses (`machine learning`, `natural language processing`, `image processing`, `deep learning`, `computer vision`, `data mining`) have program-specific codes that differ per program. Their `code` property was removed from the Course node and migrated to the `BELONGS_TO` relationship (`r.code`). All Cypher queries follow a 3-case rule: (1/2) program context available → `COALESCE(c.code, r.code)` returning a plain string; (3) no program context → `CASE WHEN c.code IS NOT NULL` returning a `[{program, code}]` list, unwrapped by `_resolve_code()`. The `_query_courses_by_code_prefix()` filter in `neo4j_track_functions.py` uses `(c.code STARTS WITH $prefix OR r.code STARTS WITH $prefix)` so these courses are still found by prefix. The fuzzy code matchers (`course_name_mapper.py`, `preprocessor.py`) use `OPTIONAL MATCH + collect(r.code)[0]` to get any one code for matching, which is sufficient for string-identity matching.

@@ -88,6 +88,7 @@ class AgentState(TypedDict):
     """
     messages:                  Annotated[list[BaseMessage], add_messages]
     accumulated_context:       Annotated[List[str], operator.add]
+    silent_context:            Annotated[List[str], operator.add]
     # "tool_name|canonicalized_args" — used to skip exact duplicate calls
     called_tools:              Annotated[List[str], operator.add]
     # Every distinct reformulation attempted so far (including original)
@@ -131,8 +132,30 @@ _AGENT_SYSTEM = (
     "4. If context has already been collected, pick a DIFFERENT tool.\n"
     "5. Use the exact course/program name from the query (the full single-quoted string) "
     "— do NOT substitute, split, or paraphrase.\n"
+    "5b. Do NOT add a program_name parameter unless the query explicitly names a program. "
+    "If the query asks about a course without specifying a program, call the tool "
+    "without program_name. Adding an uninstructed program filter is not 'trying a different "
+    "angle' — it artificially restricts results and counts as a wasted round.\n"
     "6. For course planning requests, call start_course_planning — it is a "
     "   complete interactive session, no other tools are needed alongside it.\n"
+    "7. COURSE COMPLETION STATEMENT — if the student says they completed, passed, "
+    "finished, or earned a course (e.g. 'I got ML', 'I passed machine learning', "
+    "'I completed OS', 'I have DB'), call get_course_dependencies with that course "
+    "name — its 'dependents' section shows which courses it unlocks. Do NOT call "
+    "store_preference for course completion statements — 'I got X course' means "
+    "they finished it, not that they have a preference for it.\n"
+    "8. PREFERENCE DETECTION — call store_preference whenever the student expresses "
+    "interest, love, skill, weakness, background, or emotion about any subject "
+    "(e.g. 'I love NLP', 'I'm good at math', 'I hate theory', 'coding is easy for me'). "
+    "Exclude course completion statements (rule 7).\n"
+    "   8a. PURE PREFERENCE (no factual question): if the message is ONLY a sentiment "
+    "statement with no factual question embedded, call store_preference and DO NOT call "
+    "any other tool. The judge will mark the query satisfied after store_preference alone. "
+    "Do not fetch course info, prerequisites, or any other data.\n"
+    "   8b. PREFERENCE + FACTUAL QUESTION: if the message expresses a preference AND asks "
+    "a factual question (e.g. 'I love NLP, what are its prerequisites?'), call "
+    "store_preference FIRST. After it completes you will be called again — then call the "
+    "appropriate factual tool to answer the question.\n"
 )
 
 _ANSWER_SYSTEM = (
@@ -144,7 +167,21 @@ _ANSWER_SYSTEM = (
     "Use **bold** for key terms, bullet points for lists. "
     "Do NOT cite article numbers, source names, or tool names. "
     "If the context is insufficient, say so and suggest the student contact "
-    "the registrar's office. "
+    "the registrar's office.\n"
+    "COURSE COMPLETION ACKNOWLEDGMENT: If the student said they completed, passed, or "
+    "earned a course (e.g. 'I got ML', 'I passed OS'), start with a warm, brief "
+    "congratulation, then list the courses that require it as a prerequisite — but "
+    "make clear that those courses may have OTHER prerequisites too, so passing this "
+    "course alone does not guarantee eligibility. Suggest they use the eligibility "
+    "checker if they want to know exactly which courses they can take now. "
+    "Never respond with the course's own description — they already know the course.\n"
+    "STUDENT PREFERENCES AND INTERESTS: If the student expressed interest, love, "
+    "enthusiasm, or a personal connection to a subject (e.g. 'I love NLP', 'I enjoy math'), "
+    "acknowledge it warmly at the start of your response. Briefly mention why that subject "
+    "is valuable and how it connects to their studies or career — then continue with the "
+    "factual answer. If the message is ONLY a preference statement with no factual question, "
+    "respond warmly, affirm their interest, and highlight the benefits and career relevance "
+    "of that subject. Do NOT mention databases, preference profiles, or system internals.\n"
     "IMPORTANT: When listing courses, always include 'Elective Slot' entries "
     "exactly like any other course — do NOT skip or omit them. An elective slot "
     "is a scheduled course position (not a specific elective course itself) and "
@@ -363,31 +400,51 @@ def _collect_node(state: AgentState) -> dict:
 
     # Walk backwards to find ToolMessages and the AIMessage of this round
     new_context: List[str] = []
+    new_silent:  List[str] = []
     new_tool_sigs: List[str] = []
     triggering_ai: Optional[AIMessage] = None
 
+    import json as _j
+
+    _SILENT_TOOLS = {"store_preference"}
+
+    # Find the triggering AIMessage and build tool_call_id → args map
+    tc_args_map: dict = {}
     for m in reversed(messages):
-        if isinstance(m, ToolMessage):
-            tool_content = getattr(m, "content", "") or ""
-            tool_name    = getattr(m, "name",    "tool")
-            new_context.insert(0, f"[{tool_name}]:\n{tool_content}")
-        elif isinstance(m, AIMessage):
+        if isinstance(m, AIMessage):
             triggering_ai = m
+            if m.tool_calls:
+                for tc in m.tool_calls:
+                    tc_id  = tc.get("id", "")
+                    args   = tc.get("args", {})
+                    tc_args_map[tc_id] = args
+                    name     = tc.get("name", "?")
+                    args_str = _j.dumps(args, sort_keys=True, ensure_ascii=False)
+                    new_tool_sigs.append(f"{name}|{args_str}")
             break
 
-    # Build canonical signatures for each tool call in this round
-    if triggering_ai and triggering_ai.tool_calls:
-        import hashlib, json as _j
-        for tc in triggering_ai.tool_calls:
-            name = tc.get("name", "?")
-            args = tc.get("args", {})
-            # Sort keys so {"a":1,"b":2} == {"b":2,"a":1}
-            args_str = _j.dumps(args, sort_keys=True, ensure_ascii=False)
-            sig = f"{name}|{args_str}"
-            new_tool_sigs.append(sig)
+    # Collect ToolMessages from the current round (after the triggering AIMessage)
+    for m in reversed(messages):
+        if isinstance(m, ToolMessage):
+            tool_name    = getattr(m, "name", "tool")
+            tool_content = getattr(m, "content", "") or ""
+            tool_call_id = getattr(m, "tool_call_id", "")
+            args         = tc_args_map.get(tool_call_id, {})
+            if args:
+                args_label = ", ".join(f"{k}={v}" for k, v in args.items() if v is not None)
+                header = f"[{tool_name}({args_label})]"
+            else:
+                header = f"[{tool_name}]"
+            if tool_name in _SILENT_TOOLS:
+                new_silent.insert(0, f"{header}:\n{tool_content}")
+            else:
+                new_context.insert(0, f"{header}:\n{tool_content}")
+        elif isinstance(m, AIMessage):
+            break
 
     return {
         "accumulated_context":   new_context,           # operator.add appends
+        "silent_context":        new_silent,            # operator.add appends
         "called_tools":          new_tool_sigs,         # operator.add appends
         "tool_calls_this_round": tool_calls_this_round + 1,
     }
@@ -406,6 +463,7 @@ def _make_judge_node():
     def judge_node(state: AgentState) -> dict:
         original_query = state.get("original_query", "")
         accum_ctx      = state.get("accumulated_context", [])
+        silent_ctx     = state.get("silent_context", [])
         tools_used     = state.get("tool_calls_this_round", 0)
         called_tools   = state.get("called_tools", [])
 
@@ -453,17 +511,24 @@ def _make_judge_node():
                 or "Could not start course planning" in full_planning_ctx
             )
             logger.warning("[Judge] planning_failed=%s", planning_failed)
-            # Always short-circuit when planning was called — whether it
-            # succeeded or failed, the planning output IS the answer.
-            # Falling through would waste tool rounds on an unrelated LLM judge.
             return {
                 "satisfied":             True,
                 "judge_missing":         "",
                 "judge_tools_this_round": tools_used,
             }
 
+        main_ctx = "\n\n---\n\n".join(accum_ctx) if accum_ctx else "(no data collected yet)"
+        if silent_ctx:
+            side_block = "\n".join(silent_ctx)
+            context = f"{main_ctx}\n\n--- [Side-effects] ---\n{side_block}"
+        else:
+            context = main_ctx
 
-        context = "\n\n---\n\n".join(accum_ctx) if accum_ctx else "(no data collected yet)"
+        if _is_verbose():
+            _box(
+                "🔍  JUDGE INPUT  —  context sent to judge LLM",
+                context.splitlines(),
+            )
 
         # Structured chain-of-thought judge: the model must enumerate and type
         # every required entity before it can set satisfied=true/false.
@@ -476,26 +541,54 @@ def _make_judge_node():
             f'Determine whether the collected data is sufficient to fully answer '
             f'the student query.\n'
             f'\n'
+            f'--- TOOL RESULT FIELD SEMANTICS ---\n'
+            f'Use these mappings when deciding if context satisfies the query intent:\n'
+            f'• "what courses can I take AFTER X" / "what does X unlock" / "what does X close" /\n'
+            f'  "what does X open" / "what does X enable" / "I completed X, what can I take now":\n'
+            f'  → satisfied when context contains a get_course_dependencies result for course X\n'
+            f'    that has a `dependents` list  (even an empty list IS a valid answer — it means\n'
+            f'    X does not unlock any further course).\n'
+            f'  → The `dependents` field = courses whose prerequisite IS X = courses you can\n'
+            f'    take AFTER completing X.  This DIRECTLY answers "what can I take after X".\n'
+            f'  → Do NOT mark this as missing just because the word "dependents" differs from\n'
+            f'    the query wording "after" / "unlock" / "close" — they are the same concept.\n'
+            f'• "prerequisites for X" / "what do I need before X" / "what does X require":\n'
+            f'  → satisfied by a `prerequisites` list in get_course_dependencies for course X.\n'
+            f'• Course description / info / credits:\n'
+            f'  → satisfied by a get_course_info result for course X.\n'
+            f'• Timing / semester / year offered:\n'
+            f'  → satisfied by a get_course_timing result for course X.\n'
+            f'• Eligibility ("can I take X"):\n'
+            f'  → satisfied by a check_course_eligibility result for course X,\n'
+            f'    regardless of whether the verdict is eligible or not eligible.\n'
+            f'\n'
             f'--- ENTITY CLASSIFICATION ---\n'
-            f'Before judging, identify every entity the query asks about and its type:\n'
-            f'  type="course"  → a specific course (has description/credits/prerequisites)\n'
-            f'  type="program" → an academic track/program/major (has curriculum/credit structure)\n'
+            f'List ONLY the entities the query DIRECTLY asks to describe, compare, or analyze.\n'
+            f'  type="course"  → a specific course being asked about (its info, prereqs, timing, eligibility, dependents, etc.)\n'
+            f'  type="program" → an academic track/program that is itself being asked about\n'
             f'  type="other"   → anything else (GPA policy, graduation rules, bylaws, etc.)\n'
             f'\n'
-            f'CRITICAL: courses and programs are COMPLETELY DIFFERENT entities.\n'
-            f'  - course "artificial intelligence" ≠ program "artificial intelligence & machine learning"\n'
+            f'SUBJECT vs FILTER — this is the most important rule:\n'
+            f'  A program name used ONLY as a scope/filter is NOT an entity.\n'
+            f'  • "tell me about course X in the AIM program"     → entity: course X ONLY.\n'
+            f'    AIM is a filter — do NOT list it as an entity.\n'
+            f'  • "prerequisites for course X in program Y"       → entity: course X ONLY.\n'
+            f'  • "compare the AIM program with course X"         → entities: AIM (program) + course X.\n'
+            f'    AIM is being compared — list it as an entity.\n'
+            f'  • "what is the AIM program about?"                → entity: AIM (program).\n'
+            f'  • "what courses are in the AIM program?"          → entity: AIM (program).\n'
+            f'\n'
+            f'CRITICAL: course data ≠ program data.\n'
+            f'  - "artificial intelligence" (course) ≠ "artificial intelligence & machine learning" (program)\n'
             f'  - A course mentioning which program it BELONGS TO is NOT program data.\n'
-            f'  - Program data must contain ALL of: total credit requirements, credit distribution\n'
-            f'    by category (humanities/math/computing/specialized), year-by-year curriculum\n'
-            f'    listing, AND elective slot information.\n'
-            f'  - If the context only shows course descriptions/prereqs (even for many courses),\n'
-            f'    mark any program entity as present_in_context=FALSE.\n'
+            f'  - Program data requires: total credits, credit distribution by category,\n'
+            f'    AND multi-year curriculum listing. Course descriptions alone never satisfy a program entity.\n'
             f'\n'
             f'--- PRESENCE CHECK ---\n'
-            f'For each entity you listed, mark present_in_context=true ONLY if the '
-            f'context contains data specifically for that entity and type.\n'
-            f'For program entities: present_in_context=true requires seeing credit_distribution,\n'
-            f'total credits, and multi-year curriculum data — not just course membership.\n'
+            f'For each entity you listed, mark present_in_context=true if the context contains\n'
+            f'data that semantically answers the query intent for that entity — use the TOOL\n'
+            f'RESULT FIELD SEMANTICS section above to map query wording to the correct field.\n'
+            f'Do NOT require literal word matches between the query and the field names.\n'
             f'\n'
             f'--- SATISFACTION RULES ---\n'
             f'1. satisfied=true  ONLY when every entity has present_in_context=true.\n'
@@ -505,6 +598,19 @@ def _make_judge_node():
             f'   if the other results already answer the query.\n'
             f'5. General answers (not student-specific) are fine — if data exists to '
             f'   give a helpful answer, that is enough.\n'
+            f'6. PURE PREFERENCE STATEMENT RULE — HIGHEST PRIORITY:\n'
+            f'   If the query is solely expressing a personal feeling, interest, or attitude\n'
+            f'   (e.g. "I love X", "I enjoy Y", "I hate Z", "X is easy for me", "I am good at Y")\n'
+            f'   with NO embedded factual question (no "what is", "can I take", "when is",\n'
+            f'   "prerequisites", "eligibility", etc.), then:\n'
+            f'   → List ZERO entities (nothing factual to look up).\n'
+            f'   → satisfied=true as soon as store_preference appears in the side-effects context.\n'
+            f'   → Do NOT require any factual course/program data. The preference was stored — done.\n'
+            f'   DISTINCTION: "I love X" = pure preference (satisfied after store_preference).\n'
+            f'                "I love X, what are its prerequisites?" = preference + factual question\n'
+            f'                (satisfied only after store_preference AND the factual answer).\n'
+            f'                "I passed/completed/got X" = course completion, NOT a preference\n'
+            f'                (needs get_course_dependencies result — see TOOL RESULT SEMANTICS).\n'
             f'\n'
             f'Respond with ONLY this exact JSON structure — no other text:\n'
             f'{{\n'
@@ -556,8 +662,8 @@ def _make_judge_node():
                 # (trust the model only when it provides entities)
                 if satisfied and not missing:
                     # no entities parsed but model said true — keep it only if
-                    # context is non-empty (something was actually collected)
-                    if not accum_ctx:
+                    # something was actually collected (factual or silent)
+                    if not accum_ctx and not silent_ctx:
                         satisfied = False
                         missing   = "no data collected yet"
 
@@ -904,10 +1010,14 @@ def _print_step(
     # ── COLLECT ───────────────────────────────────────────────────────────
     elif node_name == "collect":
         new_ctx    = node_output.get("accumulated_context", [])
+        new_silent = node_output.get("silent_context", [])
         tools_used = node_output.get("tool_calls_this_round", 0)
+        lines = [f"{len(new_ctx)} new item(s) added to accumulated context."]
+        if new_silent:
+            lines.append(f"{len(new_silent)} side-effect result(s) stored in silent context.")
         _box(
             f"📦  CONTEXT COLLECTED  (round {tools_used} / {MAX_TOOL_CALLS_PER_ROUND})",
-            [f"{len(new_ctx)} new item(s) added to accumulated context."],
+            lines,
         )
 
     # ── JUDGE ─────────────────────────────────────────────────────────────
@@ -1207,6 +1317,7 @@ class BNUAdvisorAgent:
         initial_state: AgentState = {
             "messages":                  messages,
             "accumulated_context":       [],
+            "silent_context":            [],
             "called_tools":              [],
             "previous_reformulations":   [],
             "tool_calls_this_round":     0,
@@ -1216,7 +1327,6 @@ class BNUAdvisorAgent:
             "satisfied":                 False,
             "judge_missing":             "",
             "judge_tools_this_round":    0,
-
         }
 
         # RunnableConfig — student_id reaches tools via configurable
@@ -1285,6 +1395,7 @@ class BNUAdvisorAgent:
         initial_state: AgentState = {
             "messages":                messages,
             "accumulated_context":     [],
+            "silent_context":          [],
             "called_tools":            [],
             "previous_reformulations": [],
             "tool_calls_this_round":   0,

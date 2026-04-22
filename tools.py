@@ -165,7 +165,7 @@ def get_course_info(course_name: str, program_name: Optional[str] = None) -> str
 # ─────────────────────────────────────────────────────────────────────────────
 
 @tool
-def get_course_prerequisites(
+def get_course_dependencies(
     course_name: str,
     program_name: Optional[str] = None,
 ) -> str:
@@ -883,6 +883,75 @@ def get_all_not_specialized_courses(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Preference storage ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def store_preference(preferences: Dict[str, float]) -> str:
+    """
+    Persist the student's academic interests and strengths inferred from the
+    conversation into their preference profile.
+
+    Call this whenever the student reveals a genuine interest, skill, background,
+    certification, or dislike — even if they don't say "I like X" explicitly.
+
+    TRIGGER EXAMPLES (these should all cause a call):
+      "I love calculus"              → {"math": 0.25}
+      "I'm really good at stats"     → {"probability_statistics": 0.20}
+      "I got my CCNA certification"  → {"networking_systems": 0.30, "software_engineering": 0.10}
+      "I find coding easy"           → {"programming": 0.20}
+      "I'm into data analysis"       → {"data_analysis": 0.25, "data_management": 0.15}
+      "I hate theory subjects"       → {"theory": -0.15}
+      "I love AI and math"           → {"ai_ml": 0.25, "math": 0.20}
+      "I studied NLP at my previous college" → {"ai_ml": 0.20, "language_text": 0.20}
+      "I built a web app before"     → {"software_engineering": 0.20, "programming": 0.15}
+      "Probability is my weak point" → {"probability_statistics": -0.10}
+
+    VALID CATEGORY KEYS — use ONLY these 12 strings as dict keys:
+      math                  calculus, linear algebra, discrete math, numerical methods
+      probability_statistics  probability, statistics, stochastic processes
+      programming           coding, algorithms, data structures, competitive programming
+      software_engineering  design patterns, web/mobile dev, system design, SDLC
+      ai_ml                 machine learning, deep learning, AI in general
+      data_management       databases, SQL, data warehousing, data engineering
+      data_analysis         analytics, BI, visualization, insight extraction
+      theory                automata, complexity, formal methods, logic
+      networking_systems    networks, OS, security, CCNA, sysadmin, infrastructure
+      visual_computing      image processing, computer graphics, geometry
+      language_text         NLP, linguistics, text processing, translation
+      optimization          operations research, numerical optimization
+
+    DELTA STRENGTH GUIDE:
+      +0.10  tried it / studied it once
+      +0.15  likes it / comfortable with it
+      +0.20  good at it / studies it regularly
+      +0.25  loves it / passionate about it
+      +0.30  certified in it / works in it professionally
+      -0.10  dislikes it / finds it difficult
+      -0.15  hates it / actively avoids it
+
+    One student statement can map to MULTIPLE categories — pass all of them in
+    a single call. Do NOT call this for casual course mentions — only for
+    genuine signals about the student's interest, skill level, or background.
+
+    Args:
+        preferences: Dict mapping category keys to delta scores.
+                     E.g. {"math": 0.25, "ai_ml": 0.20}
+    """
+    sid = _get_student_id()
+    try:
+        from preference_service import update_ai_preference, VALID_CATEGORIES
+        ignored = [k for k in preferences if k not in VALID_CATEGORIES]
+        updated = update_ai_preference(sid, preferences)
+        msg = f"Preference profile updated: {updated}"
+        if ignored:
+            msg += f" (ignored unknown categories: {ignored})"
+        return msg
+    except Exception as exc:
+        return f"Error storing preference: {exc}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ── Comparison tools ─────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -968,7 +1037,7 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
 ALL_TOOLS = [
     get_student_info,
     get_course_info,
-    get_course_prerequisites,
+    get_course_dependencies,
     get_course_timing,
     check_course_eligibility,
     get_courses_by_term,
@@ -994,4 +1063,6 @@ ALL_TOOLS = [
     # Comparison tools
     compare_programs,
     compare_courses,
+    # Preference storage
+    store_preference,
 ]

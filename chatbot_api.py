@@ -344,8 +344,21 @@ def _analyze_and_split(clean_query: str) -> List[str]:
             ),
             prompt=(
                 "Split the query below into sub-queries, one per user intent.\n\n"
+                "══ STEP 0 — RESOLVE INTRA-QUERY REFERENCES ══\n"
+                "Before splitting, resolve any pronouns or vague references that point to an entity\n"
+                "already named within the SAME query. Replace the pronoun with the referent.\n"
+                "The referent can be anything: a course, program, track, elective, academic rule,\n"
+                "concept, or any other entity. Use the surrounding context to decide.\n"
+                "  Pronouns to check: it, this, that, them, those, one, ones, there, here, …\n"
+                "  Examples:\n"
+                "    'what is NLP and I love it'       → 'what is NLP and I love NLP'\n"
+                "    'tell me about ML, is it hard?'   → 'tell me about ML, is ML hard?'\n"
+                "    'what are the electives and when can I take them?' → already clear, no change\n"
+                "    'compare AIM and SAD, which is better for me?'    → already clear, no change\n"
+                "  If a pronoun is ambiguous or has no referent in the query, leave it as-is.\n"
+                "  Work on the RESOLVED query in all subsequent steps.\n\n"
                 "══ STEP 1 — FIND INTENT BOUNDARIES ══\n"
-                "Before splitting, identify every intent-bearing verb or phrase and what it governs:\n"
+                "Identify every intent-bearing verb or phrase and what it governs:\n"
                 "  COMPARISON  — 'compare', 'vs', 'difference between', 'X or Y (choice)'\n"
                 "  RECOMMEND   — 'which should I choose', 'what is best for me', 'recommend'\n"
                 "  FACTUAL     — everything else (what is, when can I take, prerequisites, etc.)\n\n"
@@ -371,7 +384,8 @@ def _analyze_and_split(clean_query: str) -> List[str]:
                 "  ✗ Do all sub-queries together faithfully reconstruct the original intent\n"
                 "    with no added or lost meaning? If no → revise.\n\n"
                 "══ OUTPUT RULES ══\n"
-                "  • Copy sub-query text verbatim from the input — no rephrasing or reformatting.\n"
+                "  • Write sub-queries using the RESOLVED query text from Step 0 (pronouns replaced).\n"
+                "  • Otherwise copy verbatim — no extra rephrasing or reformatting.\n"
                 "  • NEVER convert 'and' to '&' or '&' to 'and'.\n"
                 "  • NEVER merge two distinct intents into one sub-query.\n\n"
                 "══ PROGRAM NAME PROTECTION ══\n"
@@ -397,6 +411,10 @@ def _analyze_and_split(clean_query: str) -> List[str]:
                 '  "when can I take ML at artificial intelligence & machine learning and software & application development"\n'
                 '  → ["when can I take ML at artificial intelligence & machine learning",\n'
                 '     "when can I take ML at software & application development"]\n\n'
+                '  Pronoun resolved, stays atomic:\n'
+                '  "what is \'natural language processing\' course and i love it"\n'
+                '  → Step 0: "it" → "\'natural language processing\' course"\n'
+                '  → ["what is \'natural language processing\' course and i love \'natural language processing\' course"]\n\n'
                 '  Already atomic:\n'
                 '  "what is ML about?" → ["what is ML about?"]\n\n'
                 f'Query: "{clean_query}"\n\n'
@@ -490,13 +508,9 @@ def _split_and_run(
             # planning prompt so the student gets both pieces of info.
             if verbose:
                 _box("✅  ANSWER NODE  →  generating final response", [], force=True)
+            from agent import _ANSWER_SYSTEM
             other_answer = llm_call_text(
-                system=(
-                    "You are the BNU Academic Advisor. "
-                    "Write a clear, helpful answer using ONLY the provided database context. "
-                    "Use **bold** for key terms, bullet points for lists. "
-                    "Do NOT cite source or tool names."
-                ),
+                system=_ANSWER_SYSTEM,
                 user=(
                     f"Student question: {clean_query}\n\n"
                     f"Information from the BNU database:\n"
@@ -512,19 +526,10 @@ def _split_and_run(
         _box("✅  ANSWER NODE  →  generating final response", [], force=True)
 
     # One final synthesis from all collected context
+    from agent import _ANSWER_SYSTEM
     combined = "\n\n---\n\n".join(all_contexts)
     return llm_call_text(
-        system=(
-            "You are the BNU Academic Advisor. "
-            "Write a clear, helpful answer to the student's question using ONLY the "
-            "provided database context. "
-            "Match answer length to the question: short for simple queries, detailed "
-            "for complex ones. "
-            "Use **bold** for key terms, bullet points for lists. "
-            "Do NOT cite article numbers, source names, or tool names. "
-            "If the context is insufficient, say so and suggest the student contact "
-            "the registrar's office."
-        ),
+        system=_ANSWER_SYSTEM,
         user=(
             f"Student question: {clean_query}\n\n"
             f"Information from the BNU database:\n{combined}\n\n"

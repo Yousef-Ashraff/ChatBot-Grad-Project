@@ -974,6 +974,10 @@ class QueryPreprocessor:
             if original in resolved_tracks:
                 canon = resolved_tracks[original]
                 annotated_replacements.append((pos, pos + len(original), f"'{canon}' program"))
+            elif original in resolved_courses:
+                # Resolved as a course via track-fallback (Step 4b)
+                canon = resolved_courses[original]
+                annotated_replacements.append((pos, pos + len(original), f"'{canon}' course"))
             elif original != deduped:
                 annotated_replacements.append((pos, pos + len(original), deduped))
 
