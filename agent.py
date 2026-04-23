@@ -188,11 +188,24 @@ _ANSWER_SYSTEM = (
     "'I completed X', 'I finished X', 'I have X'. Do NOT trigger this for questions "
     "that merely ask about prerequisites or what a course unlocks — a question is not "
     "a completion statement, even if the tool returned a `dependents` list. "
-    "When triggered: start with a warm, brief congratulation, then list the courses "
-    "that require it as a prerequisite — but make clear that those courses may have "
-    "OTHER prerequisites too, so passing this course alone does not guarantee eligibility. "
-    "Suggest they use the eligibility checker if they want to know exactly which courses "
-    "they can take now. Never respond with the course's own description.\n"
+    "When triggered: start with a warm, brief congratulation, then follow these steps:\n"
+    "  STEP 1 — Build COMPLETED_SET: all course names the student explicitly stated "
+    "finishing in this message (e.g. 'I finished X, Y, Z' → COMPLETED_SET = {X, Y, Z}).\n"
+    "  STEP 2 — Classify every dependent course from the tool's 'dependents' list:\n"
+    "    • ALREADY DONE — the dependent's name is itself in COMPLETED_SET.\n"
+    "    • FULLY UNLOCKED — every course in that dependent's 'dep_prereq' list is in "
+    "COMPLETED_SET (or dep_prereq is empty), AND the dependent is not already done.\n"
+    "    • GETTING CLOSER — at least one course in dep_prereq is NOT in COMPLETED_SET "
+    "and the dependent is not already done.\n"
+    "  STEP 3 — Render up to THREE sections (omit any section that is empty):\n"
+    "    Section 1 '✅ Already completed:' — ALREADY DONE courses, each marked ✅ with "
+    "'(you mentioned finishing this)'.\n"
+    "    Section 2 '🎯 Fully unlocked — you meet all prerequisites:' — FULLY UNLOCKED "
+    "courses with their code and type. End this section with: *Use the eligibility "
+    "checker to confirm enrollment — credit-hour requirements may also apply.*\n"
+    "    Section 3 '⏳ Getting closer — more prerequisites needed:' — GETTING CLOSER "
+    "courses. Under each course list the dep_prereq items NOT in COMPLETED_SET as "
+    "'Still needs: <course name>'. Never respond with the course's own description.\n"
     "STUDENT PREFERENCES AND INTERESTS: If the student expressed interest, love, "
     "enthusiasm, or a personal connection to a subject (e.g. 'I love NLP', 'I enjoy math'), "
     "acknowledge it warmly at the start of your response. Briefly mention why that subject "
@@ -590,32 +603,39 @@ def _make_judge_node():
             f'  → satisfied by a check_course_eligibility result for course X,\n'
             f'    regardless of whether the verdict is eligible or not eligible.\n'
             f'\n'
-            f'--- ENTITY CLASSIFICATION ---\n'
-            f'List ONLY the entities the query DIRECTLY asks to describe, compare, or analyze.\n'
-            f'  type="course"  → a specific course being asked about (its info, prereqs, timing, eligibility, dependents, etc.)\n'
-            f'  type="program" → an academic track/program that is itself being asked about\n'
+            f'--- STEP 1: DERIVE ENTITIES FROM THE QUERY — ignore the collected data entirely ---\n'
+            f'Read the student query above and answer: "What is this student explicitly asking\n'
+            f'to learn about?" List ONLY those things. Do NOT look at the tool results or\n'
+            f'tool call parameters yet — they cannot add new entities.\n'
+            f'\n'
+            f'Entity types:\n'
+            f'  type="course"  → a specific course the query is asking about\n'
+            f'  type="program" → an academic track/program the query is asking about\n'
             f'  type="other"   → anything else (GPA policy, graduation rules, bylaws, etc.)\n'
             f'\n'
-            f'SUBJECT vs FILTER — this is the most important rule:\n'
-            f'  A program name used ONLY as a scope/filter is NOT an entity.\n'
-            f'  • "tell me about course X in the AIM program"     → entity: course X ONLY.\n'
-            f'    AIM is a filter — do NOT list it as an entity.\n'
-            f'  • "prerequisites for course X in program Y"       → entity: course X ONLY.\n'
-            f'  • "compare the AIM program with course X"         → entities: AIM (program) + course X.\n'
-            f'    AIM is being compared — list it as an entity.\n'
-            f'  • "what is the AIM program about?"                → entity: AIM (program).\n'
-            f'  • "what courses are in the AIM program?"          → entity: AIM (program).\n'
+            f'SUBJECT vs FILTER:\n'
+            f'  Ask: "Is this name the SUBJECT of the question, or just a scope/filter?"\n'
+            f'  Subject  → student wants data ABOUT it          → list as entity\n'
+            f'  Filter   → narrows WHERE to look, not WHAT to learn → do NOT list as entity\n'
+            f'\n'
+            f'  Filters are never entities:\n'
+            f'  • A program name that scopes a course query ("in the AIM program", "for AIM")\n'
+            f'    is a filter — NOT an entity. The courses are the subject.\n'
+            f'  • "What is the AIM program?" / "Describe AIM"  → AIM IS the subject → entity.\n'
+            f'  • "Compare AIM and SAD"                        → AIM, SAD are subjects → entities.\n'
+            f'  • "Compare course A and B in AIM"              → A, B are subjects; AIM is a filter.\n'
             f'\n'
             f'CRITICAL: course data ≠ program data.\n'
-            f'  - "artificial intelligence" (course) ≠ "artificial intelligence & machine learning" (program)\n'
-            f'  - A course mentioning which program it BELONGS TO is NOT program data.\n'
-            f'  - Program data requires: total credits, credit distribution by category,\n'
-            f'    AND multi-year curriculum listing. Course descriptions alone never satisfy a program entity.\n'
+            f'  "artificial intelligence" (course) ≠ "artificial intelligence & machine learning" (program).\n'
+            f'  A course result that mentions which program it belongs to is NOT program data.\n'
+            f'  Program data requires: total credits, credit distribution, multi-year curriculum.\n'
             f'\n'
-            f'--- PRESENCE CHECK ---\n'
-            f'For each entity you listed, mark present_in_context=true if the context contains\n'
-            f'data that semantically answers the query intent for that entity — use the TOOL\n'
-            f'RESULT FIELD SEMANTICS section above to map query wording to the correct field.\n'
+            f'Your entity list is now FIXED. Do NOT add anything from the tool results or\n'
+            f'tool call parameters in the steps below.\n'
+            f'\n'
+            f'--- STEP 2: CHECK PRESENCE — for each entity from Step 1 only ---\n'
+            f'Mark present_in_context=true if the collected data semantically answers the query\n'
+            f'intent for that entity. Use the TOOL RESULT FIELD SEMANTICS above.\n'
             f'Do NOT require literal word matches between the query and the field names.\n'
             f'\n'
             f'--- SATISFACTION RULES ---\n'

@@ -405,7 +405,11 @@ def get_course_dependencies(course_name, program_name=None, prereq=True, depende
             result_dict["prerequisites"] = prerequisites
 
         if dependents:
-            result_dict["dependents"] = get_course_closes(course_name, program_name)
+            closes = get_course_closes(course_name, program_name)
+            for dep in closes:
+                dep_prereqs = get_course_dependencies(dep["name"], program_name, prereq=True, dependents=False).get("prerequisites", [])
+                dep["dep_prereq"] = dep_prereqs
+            result_dict["dependents"] = closes
 
         return result_dict
     else:
@@ -503,7 +507,11 @@ def get_course_dependencies(course_name, program_name=None, prereq=True, depende
             result_dict["prerequisites"] = prerequisites
 
         if dependents:
-            result_dict["dependents"] = get_course_closes(course_name, program_name)
+            closes = get_course_closes(course_name, program_name)
+            for dep in closes:
+                dep_prereqs = get_course_dependencies(dep["name"], program_name, prereq=True, dependents=False).get("prerequisites", [])
+                dep["dep_prereq"] = dep_prereqs
+            result_dict["dependents"] = closes
 
         return result_dict
 
