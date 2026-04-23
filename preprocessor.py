@@ -108,15 +108,15 @@ COURSE_ALIASES: Dict[str, str] = {
     "cn":              "computer networks",
     "net":             "computer networks",
     "oop":             "object oriented programming",
-    "dsa":             "data structures & algorithms",
+    "dsa":             "'data structures', 'design & analysis of algorithms'",
     "algo":            "algorithms",
     "alg":             "algorithms",
-    "ds&a":            "data structures & algorithms",
+    "ds&a":            "data structures and algorithms",
 
     # Core / foundations
-    "prob":            "probability & statistical methods",
-    "stats":           "probability & statistical methods",
-    "stat":            "probability & statistical methods",
+    "prob":            "probability",
+    "stats":           "statistical methods",
+    "stat":            "statistical methods",
     "calc":            "calculus",
     "la":              "linear algebra",
     "linalg":          "linear algebra",
@@ -305,6 +305,10 @@ ENTITY_BLOCKLIST: set = {
     "information", "details", "list", "overview", "description",
     "time", "timing", "schedule", "date", "when", "what", "how",
     "all", "any", "some", "these", "those", "this", "that",
+    # Course category code prefixes — used as structural qualifiers in the curriculum,
+    # NOT as individual course names or track names.
+    # (e.g. "show BCS, BAS, and GEN courses" — BCS/BAS/GEN are category labels)
+    "bcs", "bas", "gen", "specialized",
 }
 
 
@@ -679,8 +683,8 @@ class QueryPreprocessor:
         # (original, pos, deduped, canonical) for already-resolved ones
         step25_resolved_occ: List[Tuple[str, int, str, str]] = []
         step25_course_resolutions: Dict[str, str] = {}   # orig → canonical
-        # unresolved_courses: (orig, pos, deduped, candidates)
-        unresolved_courses: List[Tuple[str, int, str, List[Dict]]] = []
+        # unresolved_courses: (orig, pos, deduped, candidates, track_can_or_None)
+        unresolved_courses: List[Tuple[str, int, str, List[Dict], Optional[str]]] = []
 
         for (orig, pos, ded) in to_move_to_course:
             track_can, _ = self._map_track_with_method(ded)
@@ -694,7 +698,7 @@ class QueryPreprocessor:
                     f'"{orig}" @{pos}  →  auto-resolved course "{canon}"  [COURSE-AUTO]'
                 )
             elif len(candidates) > 1:
-                unresolved_courses.append((orig, pos, ded, candidates))
+                unresolved_courses.append((orig, pos, ded, candidates, track_can))
                 conflict_debug.append(
                     f'"{orig}" @{pos}  →  {len(candidates)} possible courses  [COURSE-AMBIGUOUS]'
                 )
@@ -707,30 +711,57 @@ class QueryPreprocessor:
 
         # ── Handle multi-course ambiguity from Part B ─────────────────────────
         if unresolved_courses:
-            orig0, pos0, ded0, cands0 = unresolved_courses[0]
+            orig0, pos0, ded0, cands0, track0 = unresolved_courses[0]
             rest_courses = unresolved_courses[1:]
             remaining_occ = list(course_occurrences) + [
-                (ro, rp, rd) for ro, rp, rd, _ in rest_courses
+                (ro, rp, rd) for ro, rp, rd, _, _t in rest_courses
             ]
             step25_course_occ = [(o, p, c) for o, p, d, c in step25_resolved_occ]
-            pending = PendingAmbiguity(
-                original_query   = query,
-                dereferenced     = resolved,
-                ambiguous_term   = orig0,
-                term_position    = pos0,
-                candidates       = cands0,
-                resolved_courses = step25_course_resolutions,
-                pending_courses  = remaining_occ,
-                resolved_tracks  = {},
-                history          = history,
-                resolved_course_occ      = step25_course_occ,
-                pending_track_occurrences = list(track_occurrences),
-            )
-            return PreprocessResult(
-                status        = "ambiguous",
-                clarification = self._build_clarification(orig0, cands0, resolved, pos0),
-                pending       = pending,
-            )
+
+            if track0:
+                # Term matches multiple courses AND a track → show 3-option menu
+                pending = PendingAmbiguity(
+                    original_query   = query,
+                    dereferenced     = resolved,
+                    ambiguous_term   = orig0,
+                    term_position    = pos0,
+                    candidates       = cands0,
+                    resolved_courses = step25_course_resolutions,
+                    pending_courses  = remaining_occ,
+                    resolved_tracks  = {},
+                    history          = history,
+                    ambiguity_type   = "course_ambiguous_with_track",
+                    track_canonical  = track0,
+                    resolved_course_occ      = step25_course_occ,
+                    pending_track_occurrences = list(track_occurrences),
+                )
+                return PreprocessResult(
+                    status        = "ambiguous",
+                    clarification = self._build_course_ambiguous_with_track_clarification(
+                        orig0, track0, resolved, pos0
+                    ),
+                    pending       = pending,
+                )
+            else:
+                # No track option — course-only disambiguation
+                pending = PendingAmbiguity(
+                    original_query   = query,
+                    dereferenced     = resolved,
+                    ambiguous_term   = orig0,
+                    term_position    = pos0,
+                    candidates       = cands0,
+                    resolved_courses = step25_course_resolutions,
+                    pending_courses  = remaining_occ,
+                    resolved_tracks  = {},
+                    history          = history,
+                    resolved_course_occ      = step25_course_occ,
+                    pending_track_occurrences = list(track_occurrences),
+                )
+                return PreprocessResult(
+                    status        = "ambiguous",
+                    clarification = self._build_clarification(orig0, cands0, resolved, pos0),
+                    pending       = pending,
+                )
 
         # ── Return ambiguity for first unresolvable track-vs-course conflict ──
         if unresolved:
@@ -1030,11 +1061,14 @@ class QueryPreprocessor:
         Called when the student answers a disambiguation question.
 
         Dispatches to the appropriate handler based on ambiguity_type:
-          "course_name"    — student picks from multiple close-matching courses
-          "course_vs_track" — student picks whether the term is a course or track
+          "course_name"                — student picks from multiple close-matching courses
+          "course_vs_track"            — student picks whether the term is a course or track
+          "course_ambiguous_with_track"— term matches multiple courses AND a track (3 options)
         """
         if pending.ambiguity_type == "course_vs_track":
             return self._resolve_course_vs_track(pending, student_reply)
+        if pending.ambiguity_type == "course_ambiguous_with_track":
+            return self._resolve_course_ambiguous_with_track(pending, student_reply)
 
         # ── "course_name" handler (original behaviour) ────────────────────
         # 1. Parse the student's reply to pick the chosen course.
@@ -1465,6 +1499,13 @@ Rules:
     sad, software, sw, app dev → software & application development
     das, ds, data science, data → data science
   If the question contains any of these, put them in tracks[], NOT courses[].
+- IMPORTANT — course category code prefixes are NOT entities. Do NOT extract:
+    BCS (Basic Computing Sciences category)
+    BAS (Basic Sciences / Math category)
+    GEN (General Education category)
+    "specialized" (curriculum category label)
+  These are structural qualifiers about groups of courses, not course names or track names.
+- Full course codes like "BCS311" ARE valid and should be extracted as courses.
 - Use the EXACT wording from the question.
 - Use [] if nothing found for a category.
 
@@ -1472,13 +1513,17 @@ Examples:
   "what electives at das?" → {{"courses": [], "tracks": ["das"]}}
   "what electives at ai?" → {{"courses": [], "tracks": ["ai"]}}
   "can i take ml in sad?" → {{"courses": ["ml"], "tracks": ["sad"]}}
-  "prereqs for BCS311?" → {{"courses": ["BCS311"], "tracks": []}}"""
+  "prereqs for BCS311?" → {{"courses": ["BCS311"], "tracks": []}}
+  "show AIM curriculum by BCS, BAS, GEN" → {{"courses": [], "tracks": ["AIM"]}}"""
 
         try:
             raw = llm_call_json(prompt, temperature=0, max_tokens=200)
-            # Strip markdown fences if the model wraps with ```json
-            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            data = json.loads(raw)
+            # Extract the first {...} block — handles leading/trailing text and
+            # markdown fences that lstrip/rstrip can't reliably remove.
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not m:
+                raise ValueError(f"No JSON object found in LLM response: {raw!r}")
+            data = json.loads(m.group(0))
             courses = [str(c).strip() for c in data.get("courses", []) if c]
             tracks  = [str(t).strip() for t in data.get("tracks",  []) if t]
 
@@ -1980,17 +2025,18 @@ Examples:
         return (
             "ambiguous",
             None,
-            self._build_track_course_clarification(term, track_canonical, query, char_pos),
+            self._build_track_course_clarification(term, course_canonical, track_canonical, query, char_pos),
         )
 
     def _build_track_course_clarification(
         self,
-        term:            str,
-        track_canonical: str,
-        query:           Optional[str] = None,
-        char_pos:        int           = -1,
+        term:             str,
+        course_canonical: str,
+        track_canonical:  str,
+        query:            Optional[str] = None,
+        char_pos:         int           = -1,
     ) -> str:
-        """Build a friendly course-vs-track disambiguation question.
+        """Build a friendly course-vs-track disambiguation question (3 options).
         When query and char_pos are provided, a ±1-word context snippet is
         included so the student knows which occurrence is being asked about.
         """
@@ -2000,17 +2046,39 @@ Examples:
         else:
             term_header = f'**"{term}"**'
         return (
-            f'{term_header} can refer to either a course or a track/program:\n\n'
-            f'  **1.** A **course**\n'
-            f'  **2.** The *{track_canonical.title()}* **track/program**\n\n'
-            'Which did you mean? (Reply with 1, 2, "course", or "track")'
+            f'{term_header} can refer to:\n\n'
+            f'  **1.** The course: *{course_canonical.title()}*\n'
+            f'  **2.** The *{track_canonical.title()}* **track/program**\n'
+            f'  **3.** Keep **"{term}"** as is\n\n'
+            'Reply with 1, 2, or 3.'
+        )
+
+    def _build_course_ambiguous_with_track_clarification(
+        self,
+        term:             str,
+        track_canonical:  str,
+        query:            Optional[str] = None,
+        char_pos:         int           = -1,
+    ) -> str:
+        """Build clarification for a term that matches multiple courses AND a track."""
+        if query and char_pos >= 0:
+            snippet     = self._context_snippet(query, term, char_pos)
+            term_header = f'**"{term}"** (in: "{snippet}")'
+        else:
+            term_header = f'**"{term}"**'
+        return (
+            f'{term_header} can refer to:\n\n'
+            f'  **1.** A course (there are multiple options — I\'ll show you the list)\n'
+            f'  **2.** The *{track_canonical.title()}* **track/program**\n'
+            f'  **3.** Keep **"{term}"** as is\n\n'
+            'Reply with 1, 2, or 3.'
         )
 
     @staticmethod
     def _pick_course_vs_track_from_reply(reply: str) -> str:
         """
         Parse the student's answer to a course-vs-track question.
-        Returns "course" or "track".  Defaults to "course" when unclear.
+        Returns "course", "track", or "keep".  Defaults to "course" when unclear.
         """
         r     = reply.strip().lower()
         words = set(r.split())
@@ -2020,17 +2088,99 @@ Examples:
             return "course"
         if words & {"2", "two", "second"}:
             return "track"
+        if words & {"3", "three", "third"}:
+            return "keep"
 
         # Keyword vote
         course_votes = sum(1 for w in ["course", "class", "subject"] if w in words)
         track_votes  = sum(1 for w in ["track", "program", "major"]  if w in words)
+        keep_votes   = sum(1 for w in ["keep", "original", "as is", "itself"] if w in r)
 
+        if keep_votes and keep_votes >= course_votes and keep_votes >= track_votes:
+            return "keep"
         if course_votes > track_votes:
             return "course"
         if track_votes > course_votes:
             return "track"
 
         return "course"  # default
+
+    def _resolve_course_ambiguous_with_track(
+        self,
+        pending:       PendingAmbiguity,
+        student_reply: str,
+    ) -> PreprocessResult:
+        """
+        Handle the student's answer when a term matched multiple courses AND a track.
+
+        Options shown were:
+          1. A course (will show list)
+          2. The {track} track/program
+          3. Keep "{term}" as is
+
+        If student picks "course" → chain into course_name disambiguation.
+        If student picks "track" or "keep" → delegate to _resolve_course_vs_track
+          with a synthetic reply ("2" or "3") to reuse all its tail logic.
+        """
+        choice = self._pick_course_vs_track_from_reply(student_reply)
+
+        if choice == "course":
+            # Student wants to pick a specific course — show the full list.
+            box(
+                "📝  COURSE AMBIGUOUS WITH TRACK RESOLVED",
+                [
+                    f'Term           : "{pending.ambiguous_term}"',
+                    f"Student chose  : COURSE (showing list)",
+                    f"Candidates     : {len(pending.candidates)}",
+                ],
+            )
+            new_pending = PendingAmbiguity(
+                original_query   = pending.original_query,
+                dereferenced     = pending.dereferenced,
+                ambiguous_term   = pending.ambiguous_term,
+                term_position    = pending.term_position,
+                candidates       = pending.candidates,
+                resolved_courses = dict(pending.resolved_courses),
+                pending_courses  = list(pending.pending_courses),
+                resolved_tracks  = dict(pending.resolved_tracks),
+                history          = pending.history,
+                ambiguity_type   = "course_name",
+                student_track    = pending.student_track,
+                pending_track_course_conflicts = list(pending.pending_track_course_conflicts),
+                resolved_course_occ       = list(pending.resolved_course_occ),
+                pending_track_occurrences  = list(pending.pending_track_occurrences),
+            )
+            return PreprocessResult(
+                status        = "ambiguous",
+                clarification = self._build_clarification(
+                    pending.ambiguous_term, pending.candidates,
+                    pending.dereferenced, pending.term_position,
+                ),
+                pending       = new_pending,
+            )
+
+        # "track" or "keep" — reuse _resolve_course_vs_track tail logic by
+        # converting to a course_vs_track pending and passing the encoded choice.
+        synthetic_pending = PendingAmbiguity(
+            original_query   = pending.original_query,
+            dereferenced     = pending.dereferenced,
+            ambiguous_term   = pending.ambiguous_term,
+            term_position    = pending.term_position,
+            candidates       = [],
+            resolved_courses = dict(pending.resolved_courses),
+            pending_courses  = list(pending.pending_courses),
+            resolved_tracks  = dict(pending.resolved_tracks),
+            history          = pending.history,
+            ambiguity_type   = "course_vs_track",
+            course_canonical = pending.candidates[0]["name"] if pending.candidates else None,
+            track_canonical  = pending.track_canonical,
+            student_track    = pending.student_track,
+            pending_track_course_conflicts = list(pending.pending_track_course_conflicts),
+            resolved_course_occ       = list(pending.resolved_course_occ),
+            pending_track_occurrences  = list(pending.pending_track_occurrences),
+        )
+        synthetic_reply = "2" if choice == "track" else "3"
+        return self._resolve_course_vs_track(synthetic_pending, synthetic_reply)
 
     def _resolve_course_vs_track(
         self,
@@ -2061,8 +2211,18 @@ Examples:
                     f'Resolved to    : "{pending.track_canonical}"',
                 ],
             )
+        elif choice == "keep":
+            # Student wants to keep the original term unchanged in the query.
+            box(
+                "📝  COURSE vs TRACK RESOLVED",
+                [
+                    f'Term           : "{pending.ambiguous_term}"',
+                    f"Student chose  : KEEP AS IS",
+                ],
+            )
+            # Don't add to all_courses or all_tracks — term stays verbatim.
         else:
-            # Student picked "course" — run full course mapping to check
+            # choice == "course" — run full course mapping to check
             # whether the term is ambiguous between MULTIPLE courses.
             deduped_term  = self._dedupe_chars(pending.ambiguous_term)
             course_result = self._map_course(deduped_term)
@@ -2561,7 +2721,7 @@ Rewritten question:"""
         Parse the student's disambiguation reply and return the chosen name.
 
         Handles:
-          - Number: "1", "first", "the first one"
+          - Number: "1", "11", "first", "the first one"
             * N+1  (last option) → _KEEP_ORIGINAL sentinel
           - Name: "software engineering", "soft eng"
           - Fallback: best fuzzy match against candidate names
@@ -2569,7 +2729,16 @@ Rewritten question:"""
         reply_strip = reply.strip().lower()
         keep_idx = len(candidates) + 1  # index of the "keep original" option
 
-        # Number-based selection
+        # Direct integer parsing — handles any number including 11, 12, …
+        m = re.fullmatch(r'\d+', reply_strip.strip())
+        if m:
+            idx = int(m.group())
+            if idx == keep_idx:
+                return self._KEEP_ORIGINAL
+            if 1 <= idx <= len(candidates):
+                return candidates[idx - 1]["name"]
+
+        # Word-number fallback (handles "one", "first", etc. and small digits in phrases)
         number_words = {
             "1": 1, "one": 1, "first": 1,
             "2": 2, "two": 2, "second": 2,

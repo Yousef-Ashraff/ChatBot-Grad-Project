@@ -109,13 +109,15 @@ def _to_str(result) -> str:
 @tool
 def get_student_info() -> str:
     """
-    Retrieve the student's complete academic profile from the database.
-    Returns: full name, program/track, university year, GPA, total earned
-    credits, completed courses with degrees, per-semester GPA history,
-    and LinkedIn profile URL and summary.
+    The sole source for the current student's personal academic record.
 
-    Use this when the student asks about:
-    - Any question about their personal academic status
+    Covers everything that belongs to this student specifically: identity,
+    program, year, GPA, total earned credits, completed courses with grades,
+    and semester-by-semester GPA history.
+
+    Does not answer questions about courses, curriculum, or policies — those
+    live in Neo4j and the bylaws. Accepts no parameters; student ID is
+    injected automatically.
     """
     sid = _get_student_id()
     try:
@@ -132,16 +134,16 @@ def get_student_info() -> str:
 @tool
 def get_course_info(course_name: str, program_name: Optional[str] = None) -> str:
     """
-    Get general information about a specific course.
-    Returns: full course name, description, credit hours, course code, and course type
-    (core / elective).
+    The source for static facts about a single course: what it is, its credit
+    value, its code, and its role in the curriculum (core or elective).
 
-    Use this when wants to know what a course is about
-    Args:
-        course_name: Course name, abbreviation, or partial name. Fuzzy
-                     matching is applied automatically (e.g. "ml", "soft eng").
-        program_name: (optional) Full program name to get program-specific info
-                      
+    Belongs to queries about the nature of a course itself — content,
+    description, weight, classification.
+
+    Does not cover when it is offered (get_course_timing), what leads to or
+    from it (get_course_dependencies), or whether the student can take it
+    (check_course_eligibility). program_name is optional; only affects code
+    resolution for the six courses whose codes differ per program.
     """
     try:
         from neo4j_course_functions import get_course_info as _fn
@@ -209,17 +211,16 @@ def get_course_timing(
     program_name: Optional[str] = None,
 ) -> str:
     """
-    Find out which academic year level and semester a course is offered in.
-    Returns: year level (1–4) and semester (1 or 2) in the curriculum.
+    The only source for where in the academic timeline a course is scheduled:
+    its year level (1–4) and semester (1 or 2).
 
-    Use this for questions like:
-    - "When is Machine Learning taught?"
-    - "Which semester is Operating Systems?"
-    - "What year do students take Data Structures?"
+    Belongs to "when is this course offered?" — positioning within the
+    curriculum calendar.
 
-    Args:
-        course_name:  Course name.
-        program_name: Student's program/track (optional).
+    Does not list all courses in a given term (get_courses_by_term). Does not
+    say whether the student can enroll now (check_course_eligibility). Accepts
+    course names; program_name optional but improves accuracy when a
+    course's position differs across programs.
     """
     try:
         from neo4j_course_functions import get_course_timing as _fn
@@ -237,27 +238,17 @@ def check_course_eligibility(
     course_name: str,
 ) -> str:
     """
-    Check whether the current student is eligible to enroll in a specific
-    course right now.
+    The only tool that answers whether the current student is allowed to
+    enroll in a specific course right now, given their actual academic record.
 
-    Checks:
-    - Whether the course belongs to the student's program
-    - Whether all prerequisite courses have been completed
-    - Whether any credit-hour requirements are met
+    Belongs to all enrollment-gate questions: prerequisite gaps, credit-hour
+    thresholds, program membership.
 
-    Returns a clear eligible / not-eligible result with:
-    - The eligibility verdict (true/false)
-    - List of any missing prerequisite courses
-    - Credit-hour requirement status if applicable
-
-    Use this for questions like:
-    - "Can I take Machine Learning this semester?"
-    - "Am I eligible for Operating Systems?"
-    - "Can I register for Advanced AI?"
-    - "Do I have the prerequisites for Deep Learning?"
-
-    Args:
-        course_name: Course name.
+    Evaluates one course at a time. Does not list all courses the student is
+    eligible for. Does not suggest what to take next (start_course_planning).
+    The missing prerequisites in the result are only what the student currently
+    lacks, not the full prerequisite list (use get_course_dependencies for
+    that). course_name accepts input; student data is read automatically.
     """
     sid = _get_student_id()
     try:
@@ -283,18 +274,16 @@ def get_courses_by_term(
     program_name: Optional[str] = None,
 ) -> str:
     """
-    Get all courses scheduled in a specific academic term.
-    Returns: list of courses in that year/semester with names, codes, credits.
+    Returns every course scheduled in a single academic term (one year +
+    semester pair) as it appears in the curriculum.
 
-    Use this for questions like:
-    - "What courses are in year 2 semester 1?"
-    - "Show me the third-year second-semester curriculum"
-    - "What do first-year students study?"
+    Belongs to "what's in year X semester Y?" — the static curriculum snapshot
+    for one time slot.
 
-    Args:
-        level:        Academic year: 1, 2, 3, or 4.
-        semester:     1 (first/Fall) or 2 (second/Spring).
-        program_name: Student's program/track (optional).
+    For queries spanning multiple terms, use get_courses_by_multiple_terms to
+    avoid separate round trips. Does not reflect the student's progress or
+    eligibility. level is 1–4; semester is 1 or 2; program_name optional
+    (omitting it returns all programs' courses for that term).
     """
     try:
         from neo4j_course_functions import get_courses_by_term as _fn
@@ -313,18 +302,14 @@ def get_courses_by_multiple_terms(
     program_name: Optional[str] = None,
 ) -> str:
     """
-    Get courses for several academic terms in a single call.
+    Retrieves curriculum data for several academic terms in one call — the
+    batch form of get_courses_by_term.
 
-    Use this INSTEAD of calling get_courses_by_term multiple times when the
-    student asks about courses spanning more than one semester.
+    Belongs to queries spanning more than one semester. Use this instead of
+    calling get_courses_by_term multiple times.
 
-    Example: "What do I study in years 2 and 3?" → call with:
-    terms = [{"level": 2, "semester": 1}, {"level": 2, "semester": 2},
-             {"level": 3, "semester": 1}, {"level": 3, "semester": 2}]
-
-    Args:
-        terms:        List of {"level": int, "semester": int} objects.
-        program_name: Student's program/track (optional).
+    terms is a list of {"level": int, "semester": int} objects; a full year
+    requires two entries (semester 1 and 2). program_name optional.
     """
     try:
         from neo4j_course_functions import get_courses_by_multiple_terms as _fn
@@ -340,16 +325,14 @@ def get_courses_by_multiple_terms(
 @tool
 def get_all_electives(program_name: str) -> str:
     """
-    List all available elective courses for a given program.
-    Returns: full list of elective options with names, codes, and credit hours.
+    The complete elective course catalogue for a given program — every course
+    available to fill elective slots.
 
-    Use this when the student asks:
-    - "What electives are available in my program?"
-    - "Show me elective options for the AI track"
-    - "What are my elective choices?"
+    Belongs to "what elective courses can I choose from?" — the content menu
+    of optional courses.
 
-    Args:
-        program_name: The student's program/track.
+    Does not answer when elective slots occur or how many exist
+    (get_elective_slots_time_and_occ). program_name is required.
     """
     try:
         from neo4j_course_functions import get_all_electives_by_program, run_cypher_query
@@ -376,16 +359,14 @@ def get_all_electives(program_name: str) -> str:
 @tool
 def get_elective_slots_time_and_occ(program_name: str) -> str:
     """
-    Get the elective slot schedule for a program: which year/semester
-    students can take electives and how many slots are available at each time.
+    Returns the schedule of elective slots in a program: which year/semester
+    they fall in and how many slots are available at each point.
 
-    Use this for questions like:
-    - "When can I take electives?"
-    - "How many elective slots do I have?"
-    - "In which semesters are elective courses offered?"
+    Belongs to questions about the timing and count of elective opportunities,
+    not their content.
 
-    Args:
-        program_name: The student's program/track.
+    Does not list the courses that fill those slots (get_all_electives or
+    get_specialized_elective_courses). program_name required.
     """
     try:
         from neo4j_course_functions import get_elective_slots_time_and_occ as _fn
@@ -407,18 +388,21 @@ def filter_courses(
     course_list: Optional[List[str]] = None,
 ) -> str:
     """
-    Search and filter courses using multiple criteria simultaneously.
-    Use this for complex or exploratory course search queries, such as:
-    - "Show me all 3-credit courses in my program"
-    - "What core courses are in the AI program?"
-    - "List all electives with 2 credit hours"
+    A flexible multi-criteria search engine over the course graph — finds
+    courses matching a combination of attributes.
 
-    Args:
-        program_name:  Student's program/track (optional).
-        filters:       Dict of criteria, e.g. {"credit_hours": 3} (optional).
-        course_types:  Types to include, e.g. ["elective"] or ["core"] (opt.).
-        return_fields: Fields to include in the result (optional).
-        course_list:   Specific course names to filter from (optional).
+    Belongs to exploratory or attribute-filtered searches where the target is
+    a set of courses matching conditions, not a known category.
+
+    Use category-specific tools (get_all_specialized_courses, get_general_courses,
+    etc.) when you want a well-defined category wholesale. Use get_course_info
+    for a single known course. All parameters are optional; apply only the
+    filters relevant to the query.
+
+    filters: dict of attribute conditions, e.g. {"credit_hours": 3}.
+    course_types: ["core"], ["elective"], or both.
+    course_list: restricts filtering to a specific set of course names.
+    return_fields: limits which fields appear in the output.
     """
     try:
         from neo4j_course_functions import filter_courses as _fn
@@ -442,17 +426,13 @@ def filter_courses(
 @tool
 def get_program_total_credits(program_name: str) -> str:
     """
-    Return the total number of credit hours required to graduate from a
-    specific program (track).
+    Returns the single total graduation credit-hour requirement for a program.
 
-    Use this when the student asks:
-    - "How many credits do I need to graduate?"
-    - "What is the total credit requirement for the AI track?"
-    - "How many credit hours are required in my program?"
-    - "What are the total credits needed for data science?"
+    Belongs to "how many credits do I need to graduate?" — one scalar answer
+    per program.
 
-    Args:
-        program_name: The program/track name.
+    Does not break the total into categories (get_credit_hour_distribution).
+    Does not compare with the student's earned credits. program_name required.
     """
     try:
         from neo4j_track_functions import get_program_total_credits as _fn
@@ -468,20 +448,18 @@ def get_program_total_credits(program_name: str) -> str:
 @tool
 def answer_academic_question(question: str) -> str:
     """
-    Search the BNU bylaws and academic regulations knowledge base.
-    Covers: graduation requirements, grading/GPA policies, academic probation,
-    attendance rules, credit transfer, registration/withdrawal, disciplinary
-    policies, academic warnings, leave of absence, and all official BNU rules.
+    The RAG interface to BNU's official bylaws and academic regulations — the
+    authoritative source for all institutional policy questions.
 
-    Use this for ANY question about BNU policies or academic regulations:
-    - "What is the minimum GPA to avoid probation?"
-    - "How many absences are allowed per course?"
-    - "What are the graduation requirements?"
-    - "Can I withdraw from a course after the add/drop period?"
-    - "What happens if I fail a course twice?"
+    Belongs to questions about university rules: GPA thresholds, graduation
+    conditions, probation, attendance limits, credit transfer, course
+    withdrawal, course repetition, academic warnings, leave of absence,
+    disciplinary procedures — anything that lives in official documents.
 
-    Args:
-        question: The specific policy or regulation question to look up.
+    Does not know course details, program structures, or student records —
+    those are Neo4j/Supabase tools. Answers are bounded by what the bylaws
+    cover; if a topic is absent from the regulations, the tool will say so.
+    question should be a full, natural-language policy question.
     """
     try:
         from rag_service import handle_general_query
@@ -497,19 +475,18 @@ def answer_academic_question(question: str) -> str:
 @tool
 def start_course_planning() -> str:
     """
-    Start a personalised multi-turn course planning session for the student.
-    Builds a tailored study plan based on completed courses, GPA, earned
-    credits, and remaining graduation requirements.
+    The entry point for a personalised, multi-turn interactive course planning
+    session that builds a study plan tailored to the student's record and goals.
 
-    Use this when the student asks:
-    - "Help me plan my courses"
-    - "What should I take next semester?"
-    - "Make a study plan for me"
-    - "What courses do I still need to graduate?"
-    - "Give me a recommended course schedule"
+    Belongs to requests for a planned path: semester recommendations,
+    identifying remaining graduation requirements, personalised scheduling.
 
-    After calling this tool, the student enters a multi-turn planning session
-    and should answer the planner's follow-up prompts.
+    Calling this tool ends the current tool-selection loop — the student then
+    enters a dedicated planner conversation. Do not call any other tool in the
+    same round as this one. Not for one-off prerequisite checks
+    (get_course_dependencies) or single-course eligibility
+    (check_course_eligibility). No parameters; uses the student record
+    automatically.
     """
     # NOTE: chatbot_api.py patches this function at startup to also capture
     # the PlanningState for multi-turn continuation.
@@ -535,26 +512,20 @@ def get_program_info(
     desc_info: bool = True,
 ) -> str:
     """
-    Get comprehensive information about a specific academic program/track.
+    The comprehensive data package for one academic program: description,
+    credit category breakdown, full years-3/4 curriculum, elective slot
+    schedule, and elective catalogue.
 
-    Returns any combination of:
-    - Program description (from Neo4j)
-    - Credit hour distribution (always included — shared across all programs)
-    - Full curriculum for years 3 and 4 (core + elective courses)
-    - Hardcoded year-1/2 courses that differ between tracks
-    - Elective slot schedule (which year/semester electives are offered)
-    - Full elective course catalogue
+    Belongs to "tell me about program X" — the full structural profile of a
+    single track.
 
-    Use this for questions like:
-    - "What is the AI / SAD / Data Science program?"
-    - "Tell me about the artificial intelligence track"
-    - "Compare the AI and SAD programs" (call once per program)
+    For comparing programs, use compare_programs (which calls this per program
+    atomically — do not call manually per-program for a comparison). For
+    the credit breakdown alone, get_credit_hour_distribution is lighter.
 
-    Args:
-        prg:         Program name 'full names'.
-        course_info: Set False to skip curriculum/elective data (e.g. when
-                     only the description is needed).
-        desc_info:   Set False to skip the program description.
+    prg is the full program name. course_info=False skips curriculum/elective
+    data when only the description is needed. desc_info=False skips the
+    description.
     """
     try:
         from neo4j_track_functions import get_program_info as _fn
@@ -566,16 +537,15 @@ def get_program_info(
 @tool
 def get_credit_hour_distribution() -> str:
     """
-    Return the faculty-wide credit hour distribution shared by ALL programs.
+    The faculty-wide credit breakdown by category (GEN, BAS, BCS, specialized,
+    field training, graduation projects) — identical across all three programs.
 
-    This breakdown is identical across all three tracks (AIM, SAD, Data Science)
-    and should be called ONCE — not once per program.
+    Belongs to questions about how the 136 total credits are allocated across
+    categories.
 
-    Use this for questions like:
-    - "How are credit hours distributed?"
-    - "How many humanities credits are required?"
-    - "What is the breakdown of the 136 credit hours?"
-    - "How many credits are for field training / graduation project?"
+    Program-independent: call once, never per-program. For the single
+    graduation total, use get_program_total_credits. For the actual courses
+    within a category, use the category tools. No parameters.
     """
     try:
         from neo4j_track_functions import get_credit_hour_distribution as _fn
@@ -595,21 +565,17 @@ def get_specialized_core_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return the specialized **core** (non-elective) courses for a program.
+    The mandatory, non-elective courses unique to a specific program —
+    identified by the program's code prefix (AIM/SAD/DAS) and marked
+    non-elective. Part of the 51-credit specialized category.
 
-    These are courses whose code starts with the program's prefix
-    (AIM / SAD / DAS) and are mandatory (not elective).
-    They correspond to the "applied / specialized courses" (51 cr) category.
+    Belongs to questions about the obligatory specialized work that defines
+    a track.
 
-    Use this when the student asks:
-    - "What specialized courses are NOT elective in the SAD program?"
-    - "What mandatory specialized courses does AIM have?"
-    - "List the core courses specific to the data science track"
-
-    Args:
-        prg:       Program name.
-        year_flag: Set True to include the year level for each course.
-        sem_flag:  Set True to include the semester for each course.
+    "Specialized" means program-prefixed, not merely advanced or upper-level.
+    Does not include GEN, BAS, or BCS courses. For electives alongside these,
+    use get_all_specialized_courses. prg required; year_flag/sem_flag add
+    per-course scheduling data.
     """
     try:
         from neo4j_track_functions import get_specialized_core_courses as _fn
@@ -625,23 +591,16 @@ def get_specialized_elective_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return the specialized **elective** courses available in a program.
+    The elective courses unique to a specific program — program-prefixed
+    (AIM/SAD/DAS) and marked elective.
 
-    These are courses whose code starts with the program's prefix
-    (AIM / SAD / DAS) and are elective (students choose some of them).
-    When year_flag or sem_flag is True the elective *slot schedule* is
-    returned (the semesters when students may fill elective slots), since
-    individual elective courses have no fixed placement in the curriculum.
+    Belongs to "what optional program-specific courses does this track offer?"
 
-    Use this when the student asks:
-    - "What electives does the AI track offer?"
-    - "What program-specific electives are in data science?"
-    - "Show me elective options for SAD"
-
-    Args:
-        prg:       Program name or alias.
-        year_flag: Set True to include the elective slot year schedule.
-        sem_flag:  Set True to include the elective slot semester schedule.
+    Mandatory counterpart is get_specialized_core_courses; both together are
+    get_all_specialized_courses. When year_flag or sem_flag is True, returns
+    the elective slot schedule rather than per-course positioning, because
+    elective courses have no fixed year/semester placement in the curriculum.
+    prg required.
     """
     try:
         from neo4j_track_functions import get_specialized_elective_courses as _fn
@@ -657,23 +616,17 @@ def get_all_specialized_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return ALL specialized courses (core + elective) for a program.
+    All program-specific courses — mandatory and elective — for a track,
+    covering the full 51-credit specialized category.
 
-    These are courses unique to that track, identified by the program code
-    prefix (AIM / SAD / DAS).  Combines both mandatory and elective courses.
-    The applied/specialized category totals 51 credits.
+    Belongs to "what makes this program distinct?" or "what courses are unique
+    to this track?" — the complete set of courses that separates one program
+    from the others.
 
-    Use this when the student asks:
-    - "What courses are special to the data science program?"
-    - "What courses are in the data science program but not in others?"
-    - "What specialised courses does SAD offer?"
-    - "What courses differ between AIM and SAD?" (call once per program)
-    - "What specialised courses are in year 3 of SAD?" (return all, LLM filters by year)
-
-    Args:
-        prg:       Program name.
-        year_flag: Include year for core courses; elective slot years for electives.
-        sem_flag:  Include semester for core courses; elective slot semesters for electives.
+    Use the split tools (get_specialized_core_courses, get_specialized_elective_courses)
+    only when one subset is specifically needed. Does not include shared
+    courses (GEN/BAS/BCS). prg required; year_flag/sem_flag add scheduling
+    (elective courses return slot schedule, not per-course timing).
     """
     try:
         from neo4j_track_functions import get_all_specialized_courses as _fn
@@ -688,19 +641,15 @@ def get_general_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return the humanities / general education courses (code prefix: GEN).
+    The humanities and general education courses (GEN prefix, 12 credits) —
+    identical across all three programs.
 
-    These courses are **identical across all three programs** and total 12 credits.
+    Belongs to questions specifically about GEN courses.
 
-    Use this when the student asks:
-    - "What general courses are there?"
-    - "What humanities courses do I take?"
-    - "What GEN courses are in the curriculum?"
-    - "What general courses are in the data science program?" (same for all)
-
-    Args:
-        year_flag: Set True to include the year level for each course.
-        sem_flag:  Set True to include the semester for each course.
+    Program-independent: the result is the same regardless of track; do not
+    call per-program. For the full shared curriculum (GEN + BAS + BCS), use
+    get_all_not_specialized_courses. No prg parameter; year_flag/sem_flag add
+    scheduling.
     """
     try:
         from neo4j_track_functions import get_general_courses as _fn
@@ -715,19 +664,14 @@ def get_math_and_basic_science_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return the mathematics and basic sciences courses (code prefix: BAS).
+    The mathematics and basic sciences courses (BAS prefix, 24 credits) —
+    identical across all three programs.
 
-    These courses are **identical across all three programs** and total 24 credits.
+    Belongs to questions specifically about BAS courses.
 
-    Use this when the student asks:
-    - "What math courses are there?"
-    - "What mathematics and basic science courses do I study?"
-    - "Show me BAS courses"
-    - "What math courses are in the data science program?" (same for all)
-
-    Args:
-        year_flag: Set True to include the year level for each course.
-        sem_flag:  Set True to include the semester for each course.
+    Program-independent: do not call per-program. For the full shared
+    curriculum, use get_all_not_specialized_courses. No prg parameter;
+    year_flag/sem_flag add scheduling.
     """
     try:
         from neo4j_track_functions import get_MathAndBasicScience_courses as _fn
@@ -743,24 +687,16 @@ def get_basic_computing_sciences_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return the basic computing sciences courses (code prefix: BCS).
+    The core computing foundation courses (BCS prefix, 36 credits) — mostly
+    identical across programs, with one exception: Data Science substitutes
+    "Fundamentals of Data Science" for "Technical Report Writing" (found in
+    AIM and SAD).
 
-    Mostly identical across programs (36 credits), with one difference:
-    - Data Science has **"Fundamentals of Data Science"** (not in AIM/SAD).
-    - AIM and SAD have **"Technical Report Writing"** (not in Data Science).
+    Belongs to questions specifically about BCS courses.
 
-    Provide *prg* to get the exact BCS list for that program.
-    Omit *prg* to get all BCS courses (with a note about the difference).
-
-    Use this when the student asks:
-    - "What computing science courses are there?"
-    - "What BCS courses does the AI track have?"
-    - "List basic computing sciences courses for data science"
-
-    Args:
-        prg:       Program name (optional).
-        year_flag: Set True to include the year level for each course.
-        sem_flag:  Set True to include the semester for each course.
+    Pass prg when the query is program-specific, especially for Data Science,
+    to get the exact correct list. Omitting prg returns all BCS courses with a
+    note about the difference. year_flag/sem_flag add scheduling.
     """
     try:
         from neo4j_track_functions import get_BasicComputingSciences_courses as _fn
@@ -776,25 +712,15 @@ def get_all_types_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return every course in the curriculum for a program, grouped by category.
+    The complete curriculum for a program, organized into all four course
+    categories: specialized, GEN, BAS, and BCS.
 
-    Covers all four course categories:
-      • Applied / specialized (51 cr)  — core + elective, program-specific
-      • Humanities / general  (12 cr)  — GEN prefix, same for all programs
-      • Math & basic sciences (24 cr)  — BAS prefix, same for all programs
-      • Basic computing sci.  (36 cr)  — BCS prefix, mostly shared
-    (Field training 6 cr and graduation projects 7 cr bring the full degree
-    to 136 credits; those are noted but not listed as courses.)
+    Belongs to full-curriculum queries — "what does this program contain?"
+    with no filtering on type or category.
 
-    Use this when the student asks:
-    - "What courses are in the data science program?"
-    - "Show me the full curriculum for AIM"
-    - "What do students study in the SAD track?"
-
-    Args:
-        prg:       Program name.
-        year_flag: Include year level for each course.
-        sem_flag:  Include semester for each course.
+    For only mandatory courses, use get_all_core_courses. For only the shared
+    (non-specialized) portion, use get_all_not_specialized_courses. prg
+    required; year_flag/sem_flag add scheduling.
     """
     try:
         from neo4j_track_functions import get_all_types_courses as _fn
@@ -810,25 +736,16 @@ def get_all_core_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return all **core (non-elective)** courses for a program, grouped by category.
+    All mandatory (non-elective) courses for a program, spanning all four
+    categories: specialized core, GEN, BAS, and BCS.
 
-    Covers:
-      • Specialized core (51 cr)  — mandatory program-specific courses
-      • Humanities / general (12 cr)
-      • Math & basic sciences (24 cr)
-      • Basic computing sciences (36 cr)
-    (Field training 6 cr and graduation projects 7 cr noted but not listed.)
-    Total degree: 136 credits.
+    Belongs to "what courses must I take?" — the complete non-optional
+    curriculum.
 
-    Use this when the student asks:
-    - "What are the core courses in data science?"
-    - "What courses are NOT elective in the AIM program?"
-    - "Show me only mandatory courses for SAD"
-
-    Args:
-        prg:       Program name.
-        year_flag: Include year level for each course.
-        sem_flag:  Include semester for each course.
+    Excludes electives. For the full curriculum including electives, use
+    get_all_types_courses. For only the specialized mandatory subset, use
+    get_specialized_core_courses. prg required; year_flag/sem_flag add
+    scheduling.
     """
     try:
         from neo4j_track_functions import get_all_core_courses as _fn
@@ -844,26 +761,16 @@ def get_all_not_specialized_courses(
     sem_flag: bool = False,
 ) -> str:
     """
-    Return the courses that are **shared across all programs** (non-specialized).
+    The courses shared across all programs — GEN + BAS + BCS (72 credits) —
+    the common foundation independent of track choice.
 
-    Covers:
-      • Humanities / general  (12 cr)  — GEN prefix
-      • Math & basic sciences (24 cr)  — BAS prefix
-      • Basic computing sci.  (36 cr)  — BCS prefix (mostly shared)
-    Total: 72 cr in courses + 13 cr field training/grad projects = 85 cr non-specialized.
+    Belongs to "what would I take regardless of which program I pick?" or
+    "what courses are common to all tracks?"
 
-    Provide *prg* to get the BCS list specific to that program (handles the
-    DS vs AIM/SAD one-course difference).
-
-    Use this when the student asks:
-    - "What courses are NOT special to the data science program?"
-    - "What courses are shared between all programs?"
-    - "What courses would I take regardless of which track I choose?"
-
-    Args:
-        prg:       Program name (optional).
-        year_flag: Include year level for each course.
-        sem_flag:  Include semester for each course.
+    Excludes specialized (program-prefixed) courses. For the full program
+    curriculum including specialized, use get_all_types_courses. Pass prg
+    when the query is for Data Science specifically, to get the correct BCS
+    variant. year_flag/sem_flag add scheduling.
     """
     try:
         from neo4j_track_functions import get_all_not_specialized_courses as _fn
@@ -878,7 +785,44 @@ def get_all_not_specialized_courses(
 
 @tool
 def store_preference(preferences: Dict[str, float]) -> str:
-    """ test """
+    """
+    The write interface for the student's persistent preference profile —
+    records inferred academic interests, strengths, and dislikes derived from
+    what the student says about themselves.
+
+    Belongs to any moment the student reveals a genuine personal signal:
+    enthusiasm, skill, background, certification, or aversion toward any
+    academic subject — even when expressed implicitly or indirectly.
+
+    Does not apply to course completion or neutral factual discussion. Do not
+    call for casual course mentions; only genuine signals about the student as
+    a learner. Cannot be queried — it only writes.
+
+    preferences is a dict of {category_key: delta_float}. Deltas are additive
+    on top of existing scores, clamped to [0.0, 1.0]. Positive = interest or
+    strength; negative = dislike or weakness. One call may cover multiple
+    categories. Only these 12 keys are valid (others are silently ignored):
+
+      math                  — calculus, linear algebra, discrete math, numerical methods
+      probability_statistics — probability, statistics, stochastic processes
+      programming           — coding, algorithms, data structures, competitive programming
+      software_engineering  — design patterns, web/mobile dev, system design, SDLC
+      ai_ml                 — machine learning, deep learning, AI broadly
+      data_management       — databases, SQL, data warehousing, data engineering
+      data_analysis         — analytics, BI, visualization, insight extraction
+      theory                — automata, complexity, formal methods, logic
+      networking_systems    — networks, OS, security, infrastructure, CCNA
+      visual_computing      — image processing, computer graphics, geometry
+      language_text         — NLP, linguistics, text processing, translation
+      optimization          — operations research, numerical optimization
+
+    Delta magnitude guide:
+      ±0.10  encountered it / studied briefly
+      ±0.15  comfortable or uncomfortable with it
+      ±0.20  good at it / studies regularly / noticeable dislike
+      ±0.25  passionate about it / strong aversion
+      ±0.30  professional certification or work experience
+    """
     sid = _get_student_id()
     try:
         from preference_service import update_ai_preference, VALID_CATEGORIES
@@ -899,22 +843,17 @@ def store_preference(preferences: Dict[str, float]) -> str:
 @tool
 def compare_programs(program_names: List[str]) -> str:
     """
-    Gather comprehensive information about multiple programs so the LLM can
-    compare them side-by-side.
+    Aggregates full program data for two or more programs in one call,
+    enabling side-by-side comparison.
 
-    Calls get_program_info for each program and returns all results together.
-    Use this whenever the student wants to compare two or more programs/tracks,
-    e.g.:
-    - "Compare AIM and SAD"
-    - "What's the difference between data science and AI tracks?"
-    - "Which program is better for me, SAD or DAS?"
-    - "Compare all three programs"
+    Belongs to any request to compare, contrast, or decide between academic
+    tracks.
 
-    After presenting the comparison, ALWAYS ask the student whether they would
-    like a personalised recommendation based on the information.
-
-    Args:
-        program_names: List of program names to compare.
+    Do not use for a single-program query (get_program_info). Never
+    decompose a comparison into separate per-program calls — this tool does
+    it atomically and must be used as a unit. Does not synthesize the
+    comparison; the answer LLM generates that from the collected data.
+    program_names is a list of full program name strings.
     """
     from neo4j_track_functions import get_program_info as _fn
     results = {}
@@ -929,25 +868,19 @@ def compare_programs(program_names: List[str]) -> str:
 @tool
 def compare_courses(course_names: List[str], program_name: Optional[str] = None) -> str:
     """
-    Gather detailed information about multiple courses so the LLM can compare
-    them side-by-side.
+    Aggregates full course data (description, credits, code, classification,
+    prerequisites, and dependents) for two or more courses in one call,
+    enabling side-by-side comparison.
 
-    For each course this tool fetches:
-    - General info (description, credit hours, code, core/elective status)
-    - Prerequisites and dependents (what it unlocks)
+    Belongs to any request to compare, contrast, evaluate, or choose between
+    courses.
 
-    Use this whenever the student wants to compare two or more courses, e.g.:
-    - "Compare machine learning and deep learning"
-    - "What's the difference between OS and computer networks?"
-    - "Which is harder, AI or computer vision?"
-    - "Compare all AI electives"
-
-    After presenting the comparison, ALWAYS ask the student whether they would
-    like a personalised recommendation based on the information.
-
-    Args:
-        course_names: List of course names to compare .
-        program_name: (optional) Program context for program-specific codes.
+    Do not use for a single-course query (get_course_info +
+    get_course_dependencies). Never decompose a comparison into individual
+    per-course calls — this tool does it atomically. Does not synthesize the
+    comparison; the answer LLM generates that from the collected data.
+    course_names is a list of course name strings. program_name optional;
+    improves code accuracy for the six courses with program-specific codes.
     """
     from neo4j_course_functions import (
         get_course_info as _info_fn,
