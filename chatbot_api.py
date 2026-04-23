@@ -328,6 +328,8 @@ def _analyze_and_split(clean_query: str) -> List[str]:
     Intent-driven splitting — never permutation/cartesian expansion of non-factual clauses:
       COMPARISON clause  → always ONE sub-query (atomic, never split by items compared)
       RECOMMEND  clause  → always ONE sub-query (atomic, never split by options)
+      CAUSAL clause      → always ONE sub-query (premise "I finished/passed X" + consequence
+                           "what does that unlock?" are one intent, never split)
       FACTUAL clause     → N courses → N; 1 course × M programs → M; N×M only for pure factual
       Independent topics → one per distinct intent
 
@@ -340,8 +342,10 @@ def _analyze_and_split(clean_query: str) -> List[str]:
         raw = llm_call_json(
             system=(
                 "You split student academic advisor queries into the minimum number of "
-                "independent sub-queries, one per distinct user intent."
+                "independent sub-queries, one per distinct user intent. "
+                "Output ONLY valid JSON — no markdown, no explanations, no prose."
             ),
+            max_tokens=1500,
             prompt=(
                 "Split the query below into sub-queries, one per user intent.\n\n"
                 "══ STEP 0 — RESOLVE INTRA-QUERY REFERENCES ══\n"
@@ -361,15 +365,26 @@ def _analyze_and_split(clean_query: str) -> List[str]:
                 "Identify every intent-bearing verb or phrase and what it governs:\n"
                 "  COMPARISON  — 'compare', 'vs', 'difference between', 'X or Y (choice)'\n"
                 "  RECOMMEND   — 'which should I choose', 'what is best for me', 'recommend'\n"
+                "  CAUSAL      — a PREMISE clause ('I finished/passed/completed/got/took X [and Y…]',\n"
+                "                'I have X done', 'now that I passed X') paired with a CONSEQUENCE\n"
+                "                question ('what does that unlock?', 'what can I take now?',\n"
+                "                'what am I eligible for?', 'what does it close?', 'what comes next?',\n"
+                "                'what does finishing X do?', 'what opens up?').\n"
+                "                The premise supplies context FOR the question — they are one intent.\n"
                 "  FACTUAL     — everything else (what is, when can I take, prerequisites, etc.)\n\n"
-                "  KEY: every course/program that appears as an argument of a COMPARISON or RECOMMEND\n"
-                "  verb is OWNED BY that clause and must stay inside it. Never extract those\n"
-                "  entities as separate sub-queries.\n\n"
+                "  KEY: every course/program that appears as an argument of a COMPARISON, RECOMMEND,\n"
+                "  or CAUSAL clause is OWNED BY that clause and must stay inside it. Never extract\n"
+                "  those entities as separate sub-queries.\n\n"
                 "══ STEP 2 — ONE SUB-QUERY PER INTENT ══\n"
                 "  COMPARISON clause → exactly ONE sub-query containing the whole clause.\n"
                 "    – All compared items (courses, programs, tracks, any mix) stay together.\n"
                 "    – Never split 'compare X and Y and Z' into sub-queries for X, Y, Z.\n"
                 "  RECOMMEND  clause → exactly ONE sub-query containing the whole clause.\n"
+                "  CAUSAL clause → exactly ONE sub-query containing BOTH the premise and the question.\n"
+                "    – Never split the completion/premise half from its consequence question.\n"
+                "    – 'I finished X and Y, what does that unlock?' → one sub-query, not two.\n"
+                "    – Even if multiple courses appear in the premise, keep all of them together\n"
+                "      with the consequence question in one sub-query.\n"
                 "  FACTUAL clause (only truly independent factual questions):\n"
                 "    • 1 entity                           → 1 sub-query\n"
                 "    • N independent courses, same intent → N sub-queries (one per course)\n"
@@ -395,7 +410,11 @@ def _analyze_and_split(clean_query: str) -> List[str]:
                 "    into a single sub-query with the pronoun replaced by its referent.\n"
                 "    A sub-query must be fully self-contained and independently understandable.\n"
                 "  ✗ Do all sub-queries together faithfully reconstruct the original intent\n"
-                "    with no added or lost meaning? If no → revise.\n\n"
+                "    with no added or lost meaning? If no → revise.\n"
+                "  ✗ Is one sub-query a course-completion premise ('I finished/passed/got X')\n"
+                "    and another sub-query is the consequence question ('what does X unlock?',\n"
+                "    'what can I take?') for those SAME courses? → that is a CAUSAL clause;\n"
+                "    merge both halves into a single sub-query.\n\n"
                 "══ OUTPUT RULES ══\n"
                 "  • Write sub-queries using the RESOLVED query text from Step 0 (pronouns replaced).\n"
                 "  • Otherwise copy verbatim — no extra rephrasing or reformatting.\n"
@@ -434,10 +453,21 @@ def _analyze_and_split(clean_query: str) -> List[str]:
                 '  FACTUAL, multiple attributes of one course — stays atomic:\n'
                 '  "how many credits is ML and what are its prerequisites"\n'
                 '  → ["how many credits is ML and what are its prerequisites"]\n\n'
+                '  CAUSAL — premise + consequence stays atomic:\n'
+                '  "I finished \'data structures\' and \'design & analysis of algorithms\' and \'object oriented programming\' — what does that unlock in artificial intelligence & machine learning?"\n'
+                '  → ["I finished \'data structures\' and \'design & analysis of algorithms\' and \'object oriented programming\' — what does that unlock in artificial intelligence & machine learning?"]\n\n'
+                '  CAUSAL — single course completion + question, stays atomic:\n'
+                '  "I passed machine learning, what am I eligible for now?"\n'
+                '  → ["I passed machine learning, what am I eligible for now?"]\n\n'
+                '  CAUSAL + separate FACTUAL (two distinct intents):\n'
+                '  "I finished machine learning, what does it unlock, and also what is deep learning about?"\n'
+                '  → ["I finished machine learning, what does it unlock?",\n'
+                '     "what is deep learning about?"]\n\n'
                 '  Already atomic:\n'
                 '  "what is ML about?" → ["what is ML about?"]\n\n'
                 f'Query: "{clean_query}"\n\n'
-                'Return JSON only: {"sub_queries": ["..."]}'
+                'Apply the rules above silently. Output ONLY this JSON and nothing else:\n'
+                '{"sub_queries": ["..."]}'
             ),
         )
         # llm_call_json returns a raw string — extract the JSON object robustly.

@@ -108,10 +108,8 @@ COURSE_ALIASES: Dict[str, str] = {
     "cn":              "computer networks",
     "net":             "computer networks",
     "oop":             "object oriented programming",
-    "dsa":             "'data structures', 'design & analysis of algorithms'",
-    "algo":            "algorithms",
-    "alg":             "algorithms",
-    "ds&a":            "data structures and algorithms",
+    "algo":            "design & analysis of algorithms",
+    "alg":             "design & analysis of algorithms",
 
     # Core / foundations
     "prob":            "probability",
@@ -135,6 +133,15 @@ COURSE_ALIASES: Dict[str, str] = {
     "aim423":          "special topics in advanced machine learning",
     "das420":          "advanced machine learning",
     "das313":          "applied multivariate analysis",
+}
+
+# ── Multi-course aliases ───────────────────────────────────────────────────────
+# One shorthand that expands to TWO canonical courses simultaneously.
+# All keys are lowercase.
+MULTI_COURSE_ALIASES: Dict[str, List[str]] = {
+    "dsa":                            ["data structures", "design & analysis of algorithms"],
+    "ds&a":                           ["data structures", "design & analysis of algorithms"],
+    "data structures and algorithms": ["data structures", "design & analysis of algorithms"],
 }
 
 # ── Track / program aliases ───────────────────────────────────────────────────
@@ -308,7 +315,7 @@ ENTITY_BLOCKLIST: set = {
     # Course category code prefixes — used as structural qualifiers in the curriculum,
     # NOT as individual course names or track names.
     # (e.g. "show BCS, BAS, and GEN courses" — BCS/BAS/GEN are category labels)
-    "bcs", "bas", "gen", "specialized",
+    "bcs", "bas", "gen",
 }
 
 
@@ -814,6 +821,8 @@ class QueryPreprocessor:
         resolved_course_occ: List[Tuple[str, int, str]] = [
             (o, p, c) for o, p, d, c in step25_resolved_occ
         ]
+        # Multi-course aliases: (original_term, char_pos, [canonical, ...])
+        multi_course_occ: List[Tuple[str, int, List[str]]] = []
         course_debug_lines: List[str] = [
             f'"{orig}"  →  "{canon}"  [from Step 2.5]'
             for orig, canon in step25_course_resolutions.items()
@@ -822,7 +831,14 @@ class QueryPreprocessor:
         for original, pos, deduped in course_occurrences:
             result = self._map_course(deduped)
 
-            if result["status"] == "resolved":
+            if result["status"] == "multi_course":
+                canonical_list = result["canonical_list"]
+                multi_course_occ.append((original, pos, canonical_list))
+                course_debug_lines.append(
+                    f'"{original}" @{pos}  →  {canonical_list}  [multi_alias]'
+                )
+
+            elif result["status"] == "resolved":
                 canonical = result["canonical"]
                 method    = result.get("method", "fuzzy match")
                 resolved_courses[original] = canonical
@@ -990,10 +1006,19 @@ class QueryPreprocessor:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         annotated_replacements: List[Tuple[int, int, str]] = []
 
+        # Multi-course aliases → joined canonical names (e.g. 'data structures' and 'design & analysis of algorithms' courses)
+        multi_course_originals: set = set()
+        for original, pos, canonical_list in multi_course_occ:
+            multi_course_originals.add(original.lower())
+            joined = " and ".join(f"'{c}'" for c in canonical_list)
+            annotated_replacements.append((pos, pos + len(original), f"{joined} courses"))
+
         # Course occurrences (Step 2.5 auto + Step 3) → " course" suffix
         for o, p, ded, canon in step25_resolved_occ:
             annotated_replacements.append((p, p + len(o), f"'{canon}' course"))
         for original, pos, deduped in course_occurrences:
+            if original.lower() in multi_course_originals:
+                continue  # already handled above
             if original in resolved_courses:
                 canon = resolved_courses[original]
                 annotated_replacements.append((pos, pos + len(original), f"'{canon}' course"))
@@ -1030,7 +1055,8 @@ class QueryPreprocessor:
         # result, the term was not literally found in text (implied / abbreviated).
         dict_replacements: Dict[str, str] = {}
         for k, v in resolved_courses.items():
-            dict_replacements[k] = f"'{v}' course"
+            if k.lower() not in multi_course_originals:
+                dict_replacements[k] = f"'{v}' course"
         for o, p, _d, c in step25_resolved_occ:
             dict_replacements[o] = f"'{c}' course"
         for k, v in resolved_tracks.items():
@@ -1041,6 +1067,7 @@ class QueryPreprocessor:
             replacement.lower() not in clean.lower()
             for orig, replacement in dict_replacements.items()
             if orig.lower() != replacement.lower()
+            and orig.lower() not in multi_course_originals
         )
         if still_unreplaced:
             clean = self._rewrite_query(resolved, dict_replacements)
@@ -1503,7 +1530,6 @@ Rules:
     BCS (Basic Computing Sciences category)
     BAS (Basic Sciences / Math category)
     GEN (General Education category)
-    "specialized" (curriculum category label)
   These are structural qualifiers about groups of courses, not course names or track names.
 - Full course codes like "BCS311" ARE valid and should be extracted as courses.
 - Use the EXACT wording from the question.
@@ -1634,6 +1660,10 @@ Examples:
             {"status": "not_found"}
         """
         term_lower = term.lower().strip()
+
+        # ── a0) Check multi-course aliases ────────────────────────────────
+        if term_lower in MULTI_COURSE_ALIASES:
+            return {"status": "multi_course", "canonical_list": MULTI_COURSE_ALIASES[term_lower], "method": "multi_alias"}
 
         # ── a) Check aliases first ────────────────────────────────────────
         if term_lower in COURSE_ALIASES:
@@ -1793,6 +1823,8 @@ Examples:
         close courses).  Returns None if no course matches above threshold.
         """
         term_lower = term.lower().strip()
+        if term_lower in MULTI_COURSE_ALIASES:
+            return MULTI_COURSE_ALIASES[term_lower][0]
         if term_lower in COURSE_ALIASES:
             return COURSE_ALIASES[term_lower]
         result = self._map_course(term)
@@ -1818,6 +1850,9 @@ Examples:
         """
         ded_lower = deduped.lower().strip()
 
+        if ded_lower in MULTI_COURSE_ALIASES:
+            return [{"name": c, "code": "", "confidence": 1.0} for c in MULTI_COURSE_ALIASES[ded_lower]]
+
         if ded_lower in COURSE_ALIASES:
             return [{"name": COURSE_ALIASES[ded_lower], "code": "", "confidence": 1.0}]
 
@@ -1833,6 +1868,8 @@ Examples:
         # deduped itself matched nothing — try the resolved track name
         if track_canon and track_canon.lower().strip() != ded_lower:
             tc_lower = track_canon.lower().strip()
+            if tc_lower in MULTI_COURSE_ALIASES:
+                return [{"name": c, "code": "", "confidence": 1.0} for c in MULTI_COURSE_ALIASES[tc_lower]]
             if tc_lower in COURSE_ALIASES:
                 return [{"name": COURSE_ALIASES[tc_lower], "code": "", "confidence": 1.0}]
             if tc_lower in KNOWN_CONFLICT_COURSES:
