@@ -172,17 +172,33 @@ START → agent → dedup → tools → collect → judge
 - `original_query` — never changes after init
 - `current_query` — may be replaced by reformulate node
 - `satisfied` — set by judge node (bool)
-- `judge_missing`, `judge_tools_this_round` — judge metadata
+- `judge_missing` — what the judge (or Python post-check) says is still missing
+- `judge_missing_source` — `"llm"` or `"python_override"` (who set `judge_missing`)
+- `judge_deps_check_info` — result string from `_multi_course_deps_missing` check; shown in debug box
+- `judge_tools_this_round` — judge metadata snapshot of tool round counter
 
 **Graph nodes:**
 - **agent** — selects next tool. Uses `GROQ_MODEL_AGENT`. Retries on `tool_use_failed` (Groq 400).
 - **dedup** — injects fake `[SKIPPED]` ToolMessage for duplicate calls.
 - **tools** — `ToolNode(ALL_TOOLS)`, executes tool calls.
 - **collect** — appends ToolMessage content to `accumulated_context` (or `silent_context` for tools in `_SILENT_TOOLS = {"store_preference"}`), increments round counter.
-- **judge** — LLM evaluates if context fully answers `original_query`. If `start_course_planning` was called → always `satisfied=true`. Handles PURE PREFERENCE STATEMENT rule: if query is only a sentiment/interest statement and `store_preference` ran → `satisfied=true` immediately.
+- **judge** — LLM evaluates if context fully answers `original_query`. If `start_course_planning` was called → always `satisfied=true`. Handles PURE PREFERENCE STATEMENT rule: if query is only a sentiment/interest statement and `store_preference` ran → `satisfied=true` immediately. After the LLM verdict, runs the `_multi_course_deps_missing` Python post-check (see below).
 - **answer** — generates final answer from `accumulated_context`. If planning tool was called → relays planning output directly.
 - **reformulate** — generates new `current_query` with a different angle (7 fixed angles in order). Resets `tool_calls_this_round` to 0.
 - **clarify** — polite last-resort clarification request after all reformulations exhausted.
+
+**Judge Python post-check — `_multi_course_deps_missing`:**
+Runs after the LLM judge returns `satisfied=true`. Deterministically verifies that every quoted course name in `original_query` has its own `[get_course_dependencies(...)]` header in `accumulated_context`.
+
+- **Gate:** only activates when `accumulated_context` already contains at least one `get_course_dependencies` header (meaning the agent already identified this as a deps-type query). Direction-agnostic: works for prereq-only, dependents-only, or both.
+- **Program filter:** quoted terms immediately followed by the word `"program"` in the query text are skipped (they are program-scope filters, not courses to check).
+- **Override:** if any quoted course lacks its own header, `satisfied` is flipped to `False` and `judge_missing` is set to that course name. `judge_missing_source` is set to `"python_override"`.
+- **Why needed:** the LLM judge can be fooled into marking a course as covered when that course name appears only inside the result *body* of another course's dependency query (e.g. in a `dep_prereq` list). The Python check enforces coverage purely on tool-call headers, which is unambiguous.
+- **Debug box:** the judge box always shows a `Deps check` line with one of three states:
+  - `skipped — LLM already not satisfied` (LLM returned False; check never ran)
+  - `ran → all courses covered ✓` (LLM returned True; no override needed)
+  - `ran → override triggered, missing: <course>` (LLM returned True; Python flipped to False)
+- The `Missing` line in the judge box is prefixed with `[LLM]` or `[Python override]` accordingly.
 
 ### Preprocessing Pipeline (`preprocessor.py`)
 
@@ -611,4 +627,5 @@ DEBUG_LEVEL=
 15. **Preference inference from conversation** — the agent system prompt includes rules for detecting preference signals ("I love X", "I'm good at Y", "I hate Z") and routing them to `store_preference` before (or instead of) any factual tool calls. Pure preference statements (no factual question) are fully satisfied after `store_preference` alone — the judge marks them satisfied immediately.
 16. **Agent rules for preference vs. course completion** — the agent distinguishes "I got ML" (course completion → call `get_course_dependencies`) from "I love NLP" (preference → call `store_preference`). A `COURSE COMPLETION STATEMENT` triggers dependency lookup; a `PREFERENCE DETECTION` trigger only applies when the student expresses genuine interest/skill, not course completion.
 17. **Comparison tools kept atomic** — `compare_programs` and `compare_courses` gather full data for all items in a single call. The query splitter treats any comparison/recommend clause as a single atomic sub-query; it never breaks out individual compared items as separate sub-queries.
-18. **Course code split across node vs. relationship** — six courses (`machine learning`, `natural language processing`, `image processing`, `deep learning`, `computer vision`, `data mining`) have program-specific codes that differ per program. Their `code` property was removed from the Course node and migrated to the `BELONGS_TO` relationship (`r.code`). All Cypher queries follow a 3-case rule: (1/2) program context available → `COALESCE(c.code, r.code)` returning a plain string; (3) no program context → `CASE WHEN c.code IS NOT NULL` returning a `[{program, code}]` list, unwrapped by `_resolve_code()`. The `_query_courses_by_code_prefix()` filter in `neo4j_track_functions.py` uses `(c.code STARTS WITH $prefix OR r.code STARTS WITH $prefix)` so these courses are still found by prefix. The fuzzy code matchers (`course_name_mapper.py`, `preprocessor.py`) use `OPTIONAL MATCH + collect(r.code)[0]` to get any one code for matching, which is sufficient for string-identity matching.
+18. **Python post-check for multi-course dependency coverage** — the LLM judge can be fooled into marking `satisfied=true` when a course name appears in the *body* of another course's dependency result (e.g. in a `dep_prereq` list). `_multi_course_deps_missing()` runs after the LLM verdict and deterministically verifies every quoted course in the query has its own `get_course_dependencies` header in context. If not, it overrides the verdict to `satisfied=false`. This prevents the judge from skipping uncovered courses while remaining direction-agnostic (works for prereq, dependents, or both queries). The debug box labels the missing source as `[LLM]` or `[Python override]` for traceability.
+19. **Course code split across node vs. relationship** — six courses (`machine learning`, `natural language processing`, `image processing`, `deep learning`, `computer vision`, `data mining`) have program-specific codes that differ per program. Their `code` property was removed from the Course node and migrated to the `BELONGS_TO` relationship (`r.code`). All Cypher queries follow a 3-case rule: (1/2) program context available → `COALESCE(c.code, r.code)` returning a plain string; (3) no program context → `CASE WHEN c.code IS NOT NULL` returning a `[{program, code}]` list, unwrapped by `_resolve_code()`. The `_query_courses_by_code_prefix()` filter in `neo4j_track_functions.py` uses `(c.code STARTS WITH $prefix OR r.code STARTS WITH $prefix)` so these courses are still found by prefix. The fuzzy code matchers (`course_name_mapper.py`, `preprocessor.py`) use `OPTIONAL MATCH + collect(r.code)[0]` to get any one code for matching, which is sufficient for string-identity matching.
