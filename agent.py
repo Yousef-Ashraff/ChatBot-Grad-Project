@@ -144,11 +144,9 @@ _AGENT_SYSTEM = (
     "explicit first-person language stating they finished a course: 'I got X', 'I passed X', "
     "'I completed X', 'I finished X', 'I have X done'. A QUESTION about a course ('what "
     "close X?', 'what does X unlock?', 'what courses need X?') is NEVER a course completion "
-    "statement, even if it mentions a course name. When the pattern matches and N courses "
-    "are mentioned: call get_course_dependencies(prereq=False, dependents=True) ONCE FOR "
-    "EACH of the N courses in the SAME round — do NOT wait for the judge between them. "
-    "For example, 'I finished X and Y' → two tool calls: one for X, one for Y. "
-    "Do NOT call store_preference for course completion statements.\n"
+    "statement, even if it mentions a course name. When the pattern matches: call "
+    "get_course_dependencies with prereq=False, dependents=True (show what completing X "
+    "enables). Do NOT call store_preference for course completion statements.\n"
     "7b. CHOOSING FLAGS for get_course_dependencies — ask ONE question:\n"
     "  'Is the student asking about what comes BEFORE X, or what comes AFTER X?'\n"
     "  BEFORE X (courses the student must complete to reach/access X) → prereq=True, dependents=False\n"
@@ -653,13 +651,6 @@ def _make_judge_node():
             f'  sufficient for an AFTER-X query — do not mark as missing because the other field\n'
             f'  is absent.\n'
             f'  Surface keywords never reliably indicate BEFORE vs AFTER — reason from meaning.\n'
-            f'  MULTIPLE COMPLETED COURSES — coverage requires a HEADER, not a body mention:\n'
-            f'    When the student says "I completed C1, C2, ..., Cn — what does that unlock?",\n'
-            f'    each course Ci is a separate entity. A course Cj is covered ONLY if a context\n'
-            f'    block header [get_course_dependencies(course_name=Cj, dependents=True)] exists.\n'
-            f'    A course name appearing ONLY inside the result BODY of another course\'s query\n'
-            f'    (e.g. in a dep_prereq list, or as a dependent entry) does NOT satisfy an\n'
-            f'    AFTER-Cj query. Check HEADERS, not body content, to confirm coverage.\n'
             f'• Course description / info / credits:\n'
             f'  → satisfied by a get_course_info result for course X.\n'
             f'• Timing / semester / year offered:\n'
