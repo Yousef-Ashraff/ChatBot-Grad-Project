@@ -99,6 +99,8 @@ class AgentState(TypedDict):
     current_query:             str   # replaced by reformulate node
     satisfied:                 bool  # set by judge node
     judge_missing:             str   # set by judge — what was still missing
+    judge_missing_source:      str   # "llm" or "python_override"
+    judge_deps_check_info:     str   # result of _multi_course_deps_missing check
     judge_tools_this_round:    int   # set by judge — snapshot of tool_calls_this_round
 
 
@@ -142,9 +144,11 @@ _AGENT_SYSTEM = (
     "explicit first-person language stating they finished a course: 'I got X', 'I passed X', "
     "'I completed X', 'I finished X', 'I have X done'. A QUESTION about a course ('what "
     "close X?', 'what does X unlock?', 'what courses need X?') is NEVER a course completion "
-    "statement, even if it mentions a course name. When the pattern matches: call "
-    "get_course_dependencies with prereq=False, dependents=True (show what completing X "
-    "enables). Do NOT call store_preference for course completion statements.\n"
+    "statement, even if it mentions a course name. When the pattern matches and N courses "
+    "are mentioned: call get_course_dependencies(prereq=False, dependents=True) ONCE FOR "
+    "EACH of the N courses in the SAME round — do NOT wait for the judge between them. "
+    "For example, 'I finished X and Y' → two tool calls: one for X, one for Y. "
+    "Do NOT call store_preference for course completion statements.\n"
     "7b. CHOOSING FLAGS for get_course_dependencies — ask ONE question:\n"
     "  'Is the student asking about what comes BEFORE X, or what comes AFTER X?'\n"
     "  BEFORE X (courses the student must complete to reach/access X) → prereq=True, dependents=False\n"
@@ -481,6 +485,51 @@ def _collect_node(state: AgentState) -> dict:
     }
 
 
+def _multi_course_deps_missing(original_query: str, accumulated_context: list) -> str:
+    """
+    When a query involves get_course_dependencies for multiple courses (completion,
+    prereq, unlock, or mixed), check that every quoted course in the query has its
+    own get_course_dependencies header in context (any direction).
+
+    Gate: only activates when the context already contains at least one
+    get_course_dependencies header — meaning the agent already identified this as a
+    deps-type query. Direction-agnostic: works for prereq-only, dependents-only, both.
+
+    Program names are detected by the pattern 'TERM' followed by the word 'program'
+    in the query text and are excluded from the coverage check.
+
+    Returns the first uncovered course name, or "" if all covered or not applicable.
+    """
+    # Gate: only fire if the agent already made at least one get_course_dependencies call
+    if not any('[get_course_dependencies(' in ctx for ctx in accumulated_context):
+        return ""
+
+    quoted = re.findall(r"'([^']+)'", original_query)
+    if not quoted:
+        return ""
+
+    # Build set of course_names that had get_course_dependencies called (any direction)
+    queried_deps: set = set()
+    for ctx in accumulated_context:
+        m = re.search(r'\[get_course_dependencies\(([^)]+)\)', ctx)
+        if m:
+            cn = re.search(r'course_name=([^,)]+)', m.group(1))
+            if cn:
+                queried_deps.add(cn.group(1).strip().lower())
+
+    for term in quoted:
+        is_program = bool(re.search(
+            r"'" + re.escape(term) + r"'\s*program",
+            original_query, re.IGNORECASE
+        ))
+        if is_program:
+            continue
+        if term.lower() not in queried_deps:
+            return term
+    return ""
+
+
+
 def _make_judge_node():
     """
     Judge node — evaluates whether accumulated_context fully answers the
@@ -545,6 +594,8 @@ def _make_judge_node():
             return {
                 "satisfied":             True,
                 "judge_missing":         "",
+                "judge_missing_source":  "llm",
+                "judge_deps_check_info": "skipped — planning tool detected",
                 "judge_tools_this_round": tools_used,
             }
 
@@ -591,10 +642,24 @@ def _make_judge_node():
             f'  To judge which field is expected: reconstruct what the correct answer contains.\n'
             f'    "Courses you must finish to reach X" → BEFORE → expect `prerequisites`.\n'
             f'    "Courses you can take once you have X" → AFTER → expect `dependents`.\n'
-            f'  An empty list IS a valid answer. ONLY `prerequisites` is sufficient for a\n'
-            f'  BEFORE-X query; ONLY `dependents` is sufficient for an AFTER-X query —\n'
-            f'  do not mark as missing because the other field is absent.\n'
+            f'  EMPTY RESULT MEANING — read this carefully:\n'
+            f'    `"dependents": []`  → course X unlocks NOTHING further. This IS a complete,\n'
+            f'      correct answer to "what does completing X enable?". Mark present_in_context=true.\n'
+            f'      Do NOT ask for another tool call. Do NOT mark the entity as missing.\n'
+            f'    `"prerequisites": []` → course X has NO prerequisites. This IS a complete,\n'
+            f'      correct answer to "what must I finish before X?". Mark present_in_context=true.\n'
+            f'      Do NOT ask for another tool call. Do NOT mark the entity as missing.\n'
+            f'  ONLY `prerequisites` is sufficient for a BEFORE-X query; ONLY `dependents` is\n'
+            f'  sufficient for an AFTER-X query — do not mark as missing because the other field\n'
+            f'  is absent.\n'
             f'  Surface keywords never reliably indicate BEFORE vs AFTER — reason from meaning.\n'
+            f'  MULTIPLE COMPLETED COURSES — coverage requires a HEADER, not a body mention:\n'
+            f'    When the student says "I completed C1, C2, ..., Cn — what does that unlock?",\n'
+            f'    each course Ci is a separate entity. A course Cj is covered ONLY if a context\n'
+            f'    block header [get_course_dependencies(course_name=Cj, dependents=True)] exists.\n'
+            f'    A course name appearing ONLY inside the result BODY of another course\'s query\n'
+            f'    (e.g. in a dep_prereq list, or as a dependent entry) does NOT satisfy an\n'
+            f'    AFTER-Cj query. Check HEADERS, not body content, to confirm coverage.\n'
             f'• Course description / info / credits:\n'
             f'  → satisfied by a get_course_info result for course X.\n'
             f'• Timing / semester / year offered:\n'
@@ -720,11 +785,30 @@ def _make_judge_node():
             satisfied = False
             missing   = "parse error — defaulting to not satisfied"
 
+        # Python post-check: if LLM says satisfied but a course mentioned in a
+        # deps-type query has no own get_course_dependencies call, override to False.
+        missing_source    = "llm"
+        deps_check_info   = "skipped — LLM already not satisfied"
+        if satisfied:
+            missing_course = _multi_course_deps_missing(original_query, accum_ctx)
+            if missing_course:
+                satisfied      = False
+                missing        = missing_course
+                missing_source = "python_override"
+                deps_check_info = f"ran → override triggered, missing: {missing_course}"
+                logger.warning(
+                    "[Judge] Python override: '%s' has no get_course_dependencies call in context",
+                    missing_course,
+                )
+            else:
+                deps_check_info = "ran → all courses covered ✓"
 
         # Store round count in a valid state field for display
         return {
             "satisfied":             satisfied,
             "judge_missing":         missing,
+            "judge_missing_source":  missing_source,
+            "judge_deps_check_info": deps_check_info,
             "judge_tools_this_round": tools_used,
         }
 
@@ -1070,12 +1154,17 @@ def _print_step(
 
     # ── JUDGE ─────────────────────────────────────────────────────────────
     elif node_name == "judge":
-        satisfied  = node_output.get("satisfied", False)
-        missing    = node_output.get("judge_missing", "")
-        tools_used = node_output.get("judge_tools_this_round", 0)
+        satisfied       = node_output.get("satisfied", False)
+        missing         = node_output.get("judge_missing", "")
+        src             = node_output.get("judge_missing_source", "llm")
+        tools_used      = node_output.get("judge_tools_this_round", 0)
+        deps_check_info = node_output.get("judge_deps_check_info", "")
         body = [f"Tools used this round : {tools_used} / {MAX_TOOL_CALLS_PER_ROUND}"]
+        if deps_check_info:
+            body.append(f"Deps check    : {deps_check_info}")
         if not satisfied and missing:
-            body.append(f"Missing : {missing}")
+            prefix = "[Python override]" if src == "python_override" else "[LLM]"
+            body.append(f"Missing {prefix} : {missing}")
         _box(
             f"⚖️   JUDGE  →  {'satisfied ✅' if satisfied else 'not yet satisfied ❌'}",
             body,
@@ -1374,6 +1463,8 @@ class BNUAdvisorAgent:
             "current_query":             query,
             "satisfied":                 False,
             "judge_missing":             "",
+            "judge_missing_source":      "llm",
+            "judge_deps_check_info":     "",
             "judge_tools_this_round":    0,
         }
 
@@ -1452,6 +1543,8 @@ class BNUAdvisorAgent:
             "current_query":           query,
             "satisfied":               False,
             "judge_missing":           "",
+            "judge_missing_source":    "llm",
+            "judge_deps_check_info":   "",
             "judge_tools_this_round":  0,
         }
 
