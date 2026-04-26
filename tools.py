@@ -868,8 +868,8 @@ def compare_programs(program_names: List[str]) -> str:
 @tool
 def compare_courses(course_names: List[str], program_name: Optional[str] = None) -> str:
     """
-    Aggregates full course data (description, credits, code, classification,
-    prerequisites, and dependents) for two or more courses in one call,
+    Aggregates course data for two or more courses in one call, enabling side-by-side comparison.
+    for two or more courses in one call,
     enabling side-by-side comparison.
 
     Belongs to any request to compare, contrast, evaluate, or choose between

@@ -250,6 +250,30 @@ _ANSWER_SYSTEM = (
     "- Include all relevant fields for every item — never summarize or truncate a list.\n"
     "- Do not refer the student to an advisor or external source as a substitute for "
     "  information you already have access to.\n\n"
+    "DEPENDENCY QUERY RULE:\n"
+    "Whenever the student's question asks about prerequisites, what a course requires, "
+    "what a course unlocks, what a course closes, or any form of dependency information, "
+    "ALWAYS output BOTH Section A and Section B — NEVER skip or omit either section. "
+    "The content inside each section depends on exactly one of three states:\n"
+    "  Section A '📋 Prerequisites:'\n"
+    "    STATE 1 — key present in context AND list is non-empty → list every prerequisite course.\n"
+    "    STATE 2 — key present in context AND list is explicitly empty (\"prerequisites\": []) → write: "
+    "'This course has no prerequisites — anyone can enroll.'\n"
+    "    STATE 3 — key NOT present in context at all → write: "
+    "'Want to know what you need before taking this course? Just ask and I will look it up for you!'\n"
+    "  Section B '🔓 Unlocks (Dependents):'\n"
+    "    STATE 1 — key present in context AND list is non-empty → for each dependent course show it "
+    "as a sub-entry with ALL of its prerequisites (the full dep_prereq list including the "
+    "current course itself). Format: '- **<Name>** — requires: <prereq1>, <prereq2>, ...'. "
+    "If a dependent's dep_prereq list is empty write '— requires: (none listed)'.\n"
+    "    STATE 2 — key present in context AND list is explicitly empty (\"dependents\": []) → write: "
+    "'This course does not directly unlock any other courses.'\n"
+    "    STATE 3 — key NOT present in context at all → write: "
+    "'Want to know which courses this one unlocks? Just ask and I will look it up for you!'\n"
+    "ABSOLUTE RULES:\n"
+    "  • NEVER remove or skip Section A or Section B regardless of which state applies.\n"
+    "  • STATE 2 (empty list []) and STATE 3 (key absent) are completely different — never confuse them.\n"
+    "  • An empty list means the data was fetched and the answer is 'none'. A missing key means the data was never fetched.\n\n"
     "COMPARISON FOLLOW-UP RULE:\n"
     "Whenever the context was gathered using compare_programs or compare_courses, "
     "end your response with a friendly follow-up question asking the student whether "
@@ -372,11 +396,21 @@ def _make_agent_node(llm_with_tools):
                 + "\nYou MUST choose a different tool OR different parameters."
             )
 
+        # ── Build judge hint block (only when judge already ran and flagged missing info)
+        judge_missing = state.get("judge_missing", "").strip()
+        judge_hint = (
+            f"\n\nJUDGE FEEDBACK: The previous tool round was not sufficient. "
+            f"Still missing: '{judge_missing}'. "
+            f"Your next tool call MUST target this missing information."
+            if judge_missing else ""
+        )
+
         user_msg = (
             f"Student query: {original_query}"
             f"{reformulation_note}"
             f"{context_block}"
-            f"{called_block}\n\n"
+            f"{called_block}"
+            f"{judge_hint}\n\n"
             "Call the next most useful tool to answer this query. "
             "Do NOT repeat any already-called tool with the same parameters."
         )
@@ -650,6 +684,22 @@ def _make_judge_node():
             f'  ONLY `prerequisites` is sufficient for a BEFORE-X query; ONLY `dependents` is\n'
             f'  sufficient for an AFTER-X query — do not mark as missing because the other field\n'
             f'  is absent.\n'
+            f'  SATISFYING A DEPENDENCY QUERY — MECHANICAL CHECK (follow exactly):\n'
+            f'  A. Find a call header `get_course_dependencies(course_name=X, ...)` in context.\n'
+            f'  B. Determine direction from MEANING, not surface keywords:\n'
+            f'       AFTER-X: X is the STARTING POINT (already completed/possessed).\n'
+            f'         Student asks what X opens up, gives access to, or closes for them.\n'
+            f'         (e.g. "what does X close", "what does passing X unlock", "I finished X, now what?")\n'
+            f'         → need dependents=True in header OR "dependents" key in result body.\n'
+            f'       BEFORE-X: X is the DESTINATION/GOAL (not yet achieved).\n'
+            f'         Student asks what is required to reach X, what closes/unlocks X itself.\n'
+            f'         (e.g. "what closes X", "what courses unlock X", "what must I finish before X")\n'
+            f'         → need prereq=True in header OR "prerequisites" key in result body.\n'
+            f'  C. If A and B hold → present_in_context=true for X. STOP. Do not inspect\n'
+            f'     nested sub-fields (dep_prereq, etc.) to re-evaluate presence.\n'
+            f'  dep_prereq inside a dependents entry lists prerequisites of THAT dependent\n'
+            f'  course — NOT prerequisites of X. X appearing there is expected and changes\n'
+            f'  nothing about whether X\'s own dependency query is satisfied.\n'
             f'  Surface keywords never reliably indicate BEFORE vs AFTER — reason from meaning.\n'
             f'• Course description / info / credits:\n'
             f'  → satisfied by a get_course_info result for course X.\n'
@@ -668,6 +718,11 @@ def _make_judge_node():
             f'  type="course"  → a specific course the query is asking about\n'
             f'  type="program" → an academic track/program the query is asking about\n'
             f'  type="other"   → anything else (GPA policy, graduation rules, bylaws, etc.)\n'
+            f'\n'
+            f'DATA TYPES ARE NOT ENTITIES: Terms like `prerequisites`, `dependents`,\n'
+            f'`eligibility`, `credits`, `timing`, `closes`, `unlocks` describe WHAT information\n'
+            f'to retrieve about an entity — they are query intents, not entities themselves.\n'
+            f'List only COURSES, PROGRAMS, or TOPIC AREAS (e.g. bylaws, GPA policy) as entities.\n'
             f'\n'
             f'SUBJECT vs FILTER:\n'
             f'  Ask: "Is this name the SUBJECT of the question, or just a scope/filter?"\n'

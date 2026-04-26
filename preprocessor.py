@@ -86,6 +86,7 @@ COURSE_ALIASES: Dict[str, str] = {
     "dl":              "deep learning",
     "cv":              "computer vision",
     "nlp":             "natural language processing",
+    "nlu":             "natural language understanding",
     "rl":              "reinforcement learning",
     "nn":              "neural networks",
     "aml":             "advanced machine learning",
