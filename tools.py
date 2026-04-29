@@ -780,6 +780,69 @@ def get_all_not_specialized_courses(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Recommendation tools ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def get_program_recommendation() -> str:
+    """
+    Recommend the best-fitting academic program (AIM / SAD / Data Science)
+    for the current student based on their preference profile.
+
+    Combines three preference sources with weighted scoring:
+      - degree_preference (45%) — inferred from uploaded transcript grades
+      - user_preference   (35%) — filled by student at signup
+      - ai_preference     (20%) — inferred by agent during conversation
+
+    Returns a ranked list of all 3 programs with match percentages and the
+    key interest areas that drove each score.
+
+    Use this when the student asks:
+    - "Which program should I choose?"
+    - "AIM or SAD — which suits me better?"
+    - "What track fits my interests?"
+    - "Recommend a program for me"
+    - "Which is better for me — data science or AI?"
+    """
+    sid = _get_student_id()
+    try:
+        from recommendation_service import recommend_programs
+        return recommend_programs(sid)
+    except Exception as exc:
+        return f"Error generating program recommendation: {exc}"
+
+
+@tool
+def get_elective_recommendation(program_name: str) -> str:
+    """
+    Recommend the best-fitting elective courses for the current student
+    within their program, based on their preference profile.
+
+    Scores every elective in the programme catalogue using the student's
+    merged preference vector (degree + user + ai preferences) and returns
+    the top 5 matches with match percentages and matching interest areas.
+
+    Use this when the student asks:
+    - "Which electives should I take?"
+    - "What electives fit my interests in the AIM program?"
+    - "Recommend electives for me"
+    - "Which optional courses suit me best?"
+
+    Args:
+        program_name: The student's program. Accepts full names or aliases:
+                      "AIM", "artificial intelligence and machine learning",
+                      "SAD", "software and application development",
+                      "data science", "DAS", "DS".
+    """
+    sid = _get_student_id()
+    try:
+        from recommendation_service import recommend_electives
+        return recommend_electives(sid, program_name)
+    except Exception as exc:
+        return f"Error generating elective recommendation: {exc}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ── Preference storage ───────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -857,12 +920,63 @@ def compare_programs(program_names: List[str]) -> str:
     """
     from neo4j_track_functions import get_program_info as _fn
     results = {}
+    shared_note = None
     for prg in program_names:
         try:
-            results[prg] = _fn(prg, course_info=True, desc_info=True)
+            data = _fn(prg, course_info=True, desc_info=True)
+            if isinstance(data, dict):
+                shared_note = shared_note or data.pop("shared_courses_note", None)
+            results[prg] = data
         except Exception as exc:
             results[prg] = f"Error fetching info for '{prg}': {exc}"
-    return _to_str(results)
+
+    output_data = results
+    if shared_note:
+        output_data = {"shared_courses_note": shared_note, **results}
+
+    output = _to_str(output_data)
+
+    sid = _get_student_id()
+    student_prog = None
+    try:
+        from eligibility import get_student_context
+        student_prog = get_student_context(sid).get("program_name")
+    except Exception:
+        pass
+
+    # Presentation instruction — always appended regardless of specialization status.
+    output += (
+        "\n\n[ADVISOR NOTE — RESPONSE STYLE] You are explaining these programs to a student "
+        "who may have no prior knowledge of what each track involves. Be thorough and clear: "
+        "list ALL courses in every category (humanities, math/science, basic computing, specialized core, electives) "
+        "by name — do not summarise or truncate; "
+        "explain what each category means in plain terms; "
+        "and describe what studying each program actually looks like in practice, not just its label."
+    )
+
+    if not student_prog:
+        # Student not yet specialized (Year 1/2) — recommend a program based on their profile.
+        try:
+            from recommendation_service import recommend_programs
+            rec = recommend_programs(sid)
+            output += "\n\n" + rec
+        except Exception:
+            pass
+        output += (
+            "\n\n[ADVISOR NOTE] This student has not yet chosen a specialization. "
+            "Use the program recommendation above (if available) to suggest the best-fit "
+            "track based on their preference profile. Encourage them to share their "
+            "interests if no preference data exists yet."
+        )
+    else:
+        output += (
+            f"\n\n[ADVISOR NOTE] This student is already enrolled in the "
+            f"{student_prog.title()} program. Do not recommend switching programs. "
+            f"Ask if they would like to know more about their program's courses, "
+            f"electives, prerequisites, or schedule."
+        )
+
+    return output
 
 
 @tool
@@ -899,7 +1013,103 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
         except Exception as exc:
             entry["prerequisites_and_dependents"] = f"Error: {exc}"
         results[name] = entry
-    return _to_str(results)
+
+    output = _to_str(results)
+
+    # Elective recommendation — filtered to the student's own program.
+    all_electives = [
+        name for name, entry in results.items()
+        if isinstance(entry.get("info"), list)
+        and any(
+            off.get("course_type") == "yes"
+            for row in entry["info"]
+            for off in row.get("program_offerings", [])
+        )
+    ]
+    if len(all_electives) >= 2:
+        sid = _get_student_id()
+        prog = program_name
+        if not prog:
+            try:
+                from eligibility import get_student_context
+                prog = get_student_context(sid).get("program_name")
+            except Exception:
+                prog = None
+        if prog:
+            prog_lower = prog.lower().strip()
+            in_prog = [
+                name for name in all_electives
+                if any(
+                    off.get("course_type") == "yes"
+                    and (off.get("program") or "").lower().strip() == prog_lower
+                    for row in results[name]["info"]
+                    for off in row.get("program_offerings", [])
+                )
+            ]
+            out_of_prog = [n for n in all_electives if n not in in_prog]
+
+            if len(in_prog) >= 2:
+                try:
+                    from recommendation_service import recommend_electives
+                    rec = recommend_electives(sid, prog, course_names=in_prog, skip_course_info=True)
+                    output += "\n\n" + rec
+                except Exception:
+                    pass
+                if out_of_prog:
+                    out_t = ", ".join(n.title() for n in out_of_prog)
+                    in_t  = ", ".join(n.title() for n in in_prog)
+                    output += (
+                        f"\n\n[ADVISOR NOTE] {out_t} "
+                        f"{'is' if len(out_of_prog) == 1 else 'are'} not in the student's program "
+                        f"({prog.title()}); do not recommend {'it' if len(out_of_prog) == 1 else 'them'}. "
+                        f"The elective recommendation above covers only: {in_t}."
+                    )
+            elif len(in_prog) == 1:
+                in_t  = in_prog[0].title()
+                out_t = ", ".join(n.title() for n in out_of_prog)
+                elig_suffix = ""
+                try:
+                    from recommendation_service import _eligibility_for
+                    elig = _eligibility_for(sid, in_prog[0])
+                    if elig.get("eligible") is True:
+                        elig_suffix = (
+                            f" The student has completed all prerequisites for {in_t} "
+                            f"and can enroll in it."
+                        )
+                    elif elig.get("eligible") is False:
+                        missing = [p.get("name", "?") for p in elig.get("missing_prerequisites", [])]
+                        credit_req = elig.get("credit_requirement")
+                        credit_met = elig.get("credit_requirement_met", True)
+                        earned = elig.get("earned_credits", "?")
+                        reasons = []
+                        if missing:
+                            reasons.append(f"has not completed the required prerequisites: {', '.join(missing)}")
+                        if not credit_met:
+                            reasons.append(f"needs {credit_req} credit hours but only has {earned}")
+                        reasons_str = " and ".join(reasons) if reasons else "prerequisites are not met"
+                        elig_suffix = (
+                            f" However, the student cannot enroll in {in_t} yet "
+                            f"because the student {reasons_str}."
+                        )
+                except Exception:
+                    pass
+                output += (
+                    f"\n\n[ADVISOR NOTE] Only {in_t} is an elective in the student's program "
+                    f"({prog.title()}). "
+                    f"{out_t} {'is' if len(out_of_prog) == 1 else 'are'} not in their program. "
+                    f"Inform the student that {in_t} is their only selectable option from these electives. "
+                    f"{elig_suffix}".rstrip()
+                )
+            else:  # 0 electives in student's program
+                all_t = ", ".join(n.title() for n in all_electives)
+                output += (
+                    f"\n\n[ADVISOR NOTE] None of the compared electives ({all_t}) "
+                    f"belong to the student's program ({prog.title()}). "
+                    f"Do not recommend any of them; inform the student these electives "
+                    f"are not available in their program."
+                )
+
+    return output
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -935,6 +1145,9 @@ ALL_TOOLS = [
     # Comparison tools
     compare_programs,
     compare_courses,
+    # Recommendation tools
+    get_program_recommendation,
+    get_elective_recommendation,
     # Preference storage
     store_preference,
 ]

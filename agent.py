@@ -278,7 +278,36 @@ _ANSWER_SYSTEM = (
     "Whenever the context was gathered using compare_programs or compare_courses, "
     "end your response with a friendly follow-up question asking the student whether "
     "they would like a personalised recommendation based on the comparison — for example: "
-    "'Would you like me to make a personalised recommendation for you based on this comparison?'\n"
+    "'Would you like me to make a personalised recommendation for you based on this comparison?'\n\n"
+    "ELECTIVE RECOMMENDATION RULE:\n"
+    "Whenever the context contains an elective recommendation result (look for 'ELECTIVE RECOMMENDATION' "
+    "in the context header), format the response as follows:\n"
+    "1. Open with a warm one-liner: 'Based on your interests, here are your top elective picks for the "
+    "<Program> program:'\n"
+    "2. For each recommended course (list all, do not truncate):\n"
+    "   - Bold the course name and include the code and credits: '**<Name> (<CODE>, <N> cr)**'\n"
+    "   - On the next line, write: '*Why it stands out:* <explanation>'\n"
+    "     The explanation must connect the course content to the student's matching interest areas "
+    "     (from the 'Matching areas' field) and mention practical or career value — do NOT just "
+    "     copy the tool's 'About' text verbatim. Write 1–2 natural sentences.\n"
+    "   - Include the match percentage naturally in the explanation (e.g. 'a strong 50% match').\n"
+    "3. Close with one encouraging sentence, e.g. 'All three count toward your elective slots — "
+    "feel free to ask about any of them before enrolling!'\n"
+    "IMPORTANT: Do NOT expose internal field names like 'Matching areas', 'Sources used', "
+    "'ai preference', or raw match-percentage numbers as standalone labels. Weave them into "
+    "natural prose instead.\n\n"
+    "PROGRAM RECOMMENDATION RULE:\n"
+    "Whenever the context contains a program recommendation result (look for 'PROGRAM RECOMMENDATION' "
+    "in the context header), format the response as follows:\n"
+    "1. Open warmly: 'Based on your profile, here is how the three programs match your interests:'\n"
+    "2. For each program (list all three in ranked order):\n"
+    "   - Bold the program name with its match percentage: '**<Program> — <N>% match**'\n"
+    "   - 1–2 sentences explaining why this program suits (or does not suit) the student, "
+    "     referencing their key matching interest areas naturally.\n"
+    "3. Highlight the top pick explicitly: 'My recommendation: **<Top Program>** looks like "
+    "the best fit for you.'\n"
+    "4. Close with an invitation to ask follow-up questions or start planning.\n"
+    "IMPORTANT: Do NOT expose 'Sources used', raw category keys, or internal field names.\n"
 )
 
 
@@ -286,18 +315,12 @@ _ANSWER_SYSTEM = (
 # LLM factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-_LLM_INSTANCE: Optional[ChatGroq] = None
+_LLM_INSTANCE:        Optional[ChatGroq] = None
+_LLM_ANSWER_INSTANCE: Optional[ChatGroq] = None
 
 
-def _get_llm() -> ChatGroq:
-    """
-    Return a ChatGroq instance with automatic fallback across up to 5 API keys.
-    Cached as a module-level singleton (no student-specific state inside it).
-    """
-    global _LLM_INSTANCE
-    if _LLM_INSTANCE is not None:
-        return _LLM_INSTANCE
-
+def _make_llm(max_tokens: int) -> ChatGroq:
+    """Build a ChatGroq instance with key fallback at a given max_tokens budget."""
     key_env_vars = [
         "GROQ_API_KEY", "GROQ_API_KEY2", "GROQ_API_KEY3",
         "GROQ_API_KEY4", "GROQ_API_KEY5",
@@ -312,18 +335,37 @@ def _get_llm() -> ChatGroq:
             "No Groq API keys found. "
             "Set GROQ_API_KEY (and optionally GROQ_API_KEY2…5) in .env"
         )
-
     instances = [
-        ChatGroq(api_key=k, model=GROQ_MODEL_AGENT, temperature=0.1, max_tokens=1500)
+        ChatGroq(api_key=k, model=GROQ_MODEL_AGENT, temperature=0.1, max_tokens=max_tokens)
         for k in active_keys
     ]
     primary = instances[0]
-    _LLM_INSTANCE = (
-        primary.with_fallbacks(instances[1:])
-        if len(instances) > 1
-        else primary
-    )
+    return primary.with_fallbacks(instances[1:]) if len(instances) > 1 else primary
+
+
+def _get_llm() -> ChatGroq:
+    """
+    Agent / tool-selection LLM — kept at 1500 max output tokens so the total
+    request (input + max_tokens) stays within Groq's per-request limit for
+    openai/gpt-oss-120b (8 000 TPM on the free tier).
+    """
+    global _LLM_INSTANCE
+    if _LLM_INSTANCE is None:
+        _LLM_INSTANCE = _make_llm(max_tokens=1500)
     return _LLM_INSTANCE
+
+
+def _get_answer_llm() -> ChatGroq:
+    """
+    Answer / clarify LLM — uses 4096 max output tokens so detailed responses
+    (e.g. full program comparisons) are never truncated mid-list.
+    Only used by the answer and clarify nodes, whose input context is smaller
+    than the agent node's (no tool schemas attached).
+    """
+    global _LLM_ANSWER_INSTANCE
+    if _LLM_ANSWER_INSTANCE is None:
+        _LLM_ANSWER_INSTANCE = _make_llm(max_tokens=4096)
+    return _LLM_ANSWER_INSTANCE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -543,11 +585,12 @@ def _multi_course_deps_missing(original_query: str, accumulated_context: list) -
     # Build set of course_names that had get_course_dependencies called (any direction)
     queried_deps: set = set()
     for ctx in accumulated_context:
-        m = re.search(r'\[get_course_dependencies\(([^)]+)\)', ctx)
-        if m:
-            cn = re.search(r'course_name=([^,)]+)', m.group(1))
-            if cn:
-                queried_deps.add(cn.group(1).strip().lower())
+        if '[get_course_dependencies(' not in ctx:
+            continue
+        # Stop at comma only — course names may contain parentheses e.g. "field training (1)"
+        cn = re.search(r'course_name=([^,]+),', ctx)
+        if cn:
+            queried_deps.add(cn.group(1).strip().lower())
 
     for term in quoted:
         is_program = bool(re.search(
@@ -708,6 +751,13 @@ def _make_judge_node():
             f'• Eligibility ("can I take X"):\n'
             f'  → satisfied by a check_course_eligibility result for course X,\n'
             f'    regardless of whether the verdict is eligible or not eligible.\n'
+            f'• Best/recommended electives ("which electives suit me", "best electives for me"):\n'
+            f'  → satisfied by a get_elective_recommendation result for the student\'s program.\n'
+            f'    The result already contains ranked electives with match percentages — this IS\n'
+            f'    the complete answer. Do NOT mark as missing; do NOT request another tool call.\n'
+            f'• Best/recommended program ("which program fits me", "AIM or SAD for me"):\n'
+            f'  → satisfied by a get_program_recommendation result.\n'
+            f'    The result already contains all programs ranked with match percentages — done.\n'
             f'\n'
             f'--- STEP 1: DERIVE ENTITIES FROM THE QUERY — ignore the collected data entirely ---\n'
             f'Read the student query above and answer: "What is this student explicitly asking\n'
@@ -1347,7 +1397,8 @@ def _build_graph():
     Compile the LangGraph StateGraph for the judging loop.
     Called once — cached in _APP.
     """
-    llm            = _get_llm()
+    llm            = _get_llm()         # 1 500 max_tokens — tool selection
+    llm_answer     = _get_answer_llm()  # 4 096 max_tokens — answer generation
     llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
     graph = StateGraph(AgentState)
@@ -1357,9 +1408,9 @@ def _build_graph():
     graph.add_node("tools",       ToolNode(ALL_TOOLS))
     graph.add_node("collect",     _collect_node)
     graph.add_node("judge",       _make_judge_node())
-    graph.add_node("answer",      _make_answer_node(llm))
+    graph.add_node("answer",      _make_answer_node(llm_answer))
     graph.add_node("reformulate", _make_reformulate_node())
-    graph.add_node("clarify",     _make_clarify_node(llm))
+    graph.add_node("clarify",     _make_clarify_node(llm_answer))
 
     # ── Edges ────────────────────────────────────────────────────────────
     graph.add_edge(START, "agent")

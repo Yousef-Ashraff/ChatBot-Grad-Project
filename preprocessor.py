@@ -66,7 +66,7 @@ from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
 
 from llm_client import llm_call_json, llm_call_text
-from debug_box import box
+from debug_box import box, is_verbose
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ COURSE_ALIASES: Dict[str, str] = {
     "rl":              "reinforcement learning",
     "nn":              "neural networks",
     "aml":             "advanced machine learning",
-
+    "advanced ml":   "advanced machine learning",
     # Data science
     "ds":              "data science",
     "da":              "data analytics",
@@ -1064,19 +1064,22 @@ class QueryPreprocessor:
             if k not in dict_replacements:
                 dict_replacements[k] = f"'{v}' program"
 
-        still_unreplaced = any(
-            replacement.lower() not in clean.lower()
+        failed = [
+            orig
             for orig, replacement in dict_replacements.items()
             if orig.lower() != replacement.lower()
             and orig.lower() not in multi_course_originals
-        )
-        if still_unreplaced:
+            and replacement.lower() not in clean.lower()
+        ]
+        rewrite_method = "positional"
+        if failed:
             clean = self._rewrite_query(resolved, dict_replacements)
+            rewrite_method = "LLM fallback"
 
-        box(
-            "📝  STEP 5 — Clean Query (sent to agent)",
-            [f"Original : {query}", f"Clean    : {clean}"],
-        )
+        box_lines = [f"Original : {query}", f"Clean    : {clean}", f"Method   : {rewrite_method}"]
+        if failed and is_verbose():
+            box_lines.append(f"LLM reason : regex missed → {', '.join(failed)}")
+        box("📝  STEP 5 — Clean Query (sent to agent)", box_lines)
 
         return PreprocessResult(status="ready", clean_query=clean, resolved_courses=resolved_courses)
 
@@ -1326,8 +1329,10 @@ class QueryPreprocessor:
                 if not any(r[0] == p for r in pos_replacements):  # not already replaced
                     pos_replacements.append((p, p + len(o), ded))
 
+        rewrite_method = "no replacements"
         if pos_replacements:
             clean = self._rewrite_query_positional(pending.original_query, pos_replacements)
+            rewrite_method = "positional"
             # LLM fallback if any expected canonical is still missing
             dict_rep: Dict[str, str] = {}
             for o, p, canon in all_course_occ:
@@ -1335,23 +1340,20 @@ class QueryPreprocessor:
             for o, p, canon in resolved_track_occ:
                 if o not in dict_rep:
                     dict_rep[o] = f"'{canon}' program"
-            still_unreplaced = any(
-                v.lower() not in clean.lower()
-                for k, v in dict_rep.items()
-                if k.lower() != v.lower()
-            )
-            if still_unreplaced:
+            failed = [
+                k for k, v in dict_rep.items()
+                if k.lower() != v.lower() and v.lower() not in clean.lower()
+            ]
+            if failed:
                 clean = self._rewrite_query(pending.original_query, dict_rep)
+                rewrite_method = "LLM fallback"
         else:
             clean = pending.original_query
 
-        box(
-            "📝  CLEAN QUERY (sent to agent)",
-            [
-                f"Original : {pending.original_query}",
-                f"Clean    : {clean}",
-            ],
-        )
+        box_lines = [f"Original : {pending.original_query}", f"Clean    : {clean}", f"Method   : {rewrite_method}"]
+        if rewrite_method == "LLM fallback" and is_verbose():
+            box_lines.append(f"LLM reason : regex missed → {', '.join(failed)}")
+        box("📝  CLEAN QUERY (sent to agent)", box_lines)
 
         return PreprocessResult(status="ready", clean_query=clean, resolved_courses=all_courses)
 
@@ -1521,7 +1523,7 @@ Return ONLY this JSON (no explanation, no markdown):
 }}
 
 Rules:
-- courses: every course name, code, or abbreviation (e.g. "ml", "BCS311", "machine learning", "soft eng", "probability")
+- courses: every course name, code, or abbreviation (e.g. "ml", "NLU", "NLP", "BCS311", "machine learning", "soft eng", "probability", "advanced ML", "advanced dl")
 - tracks: every program/track name or abbreviation — these are the ONLY valid track abbreviations:
     aim, ai, aiml → artificial intelligence & machine learning
     sad, software, sw, app dev → software & application development
@@ -1541,7 +1543,8 @@ Examples:
   "what electives at ai?" → {{"courses": [], "tracks": ["ai"]}}
   "can i take ml in sad?" → {{"courses": ["ml"], "tracks": ["sad"]}}
   "prereqs for BCS311?" → {{"courses": ["BCS311"], "tracks": []}}
-  "show AIM curriculum by BCS, BAS, GEN" → {{"courses": [], "tracks": ["AIM"]}}"""
+  "show AIM curriculum by BCS, BAS, GEN" → {{"courses": [], "tracks": ["AIM"]}}
+  "NLU or advanced ML" → {{"courses": ["NLU", "advanced ML"], "tracks": []}}"""
 
         try:
             raw = llm_call_json(prompt, temperature=0, max_tokens=200)
@@ -1606,6 +1609,26 @@ Examples:
             # two independent (term, position) entries.
             course_occurrences = self._find_all_char_occurrences(query, courses)
             track_occurrences  = self._find_all_char_occurrences(query, tracks)
+
+            # Expand numbered shorthand: "training 1 and 2" → also add "training 2"
+            # If the LLM extracted "X N" and the original query has "X N and M"
+            # immediately after, synthesise "X M" and find its position.
+            extra: List[Tuple[str, int]] = []
+            for term, pos in course_occurrences:
+                num_m = re.search(r'^(.*\S)\s+(\d+)$', term)
+                if not num_m:
+                    continue
+                prefix = num_m.group(1)          # e.g. "training"
+                after  = query[pos + len(term):]
+                and_m  = re.match(r'\s+and\s+(\d+)\b', after, re.IGNORECASE)
+                if not and_m:
+                    continue
+                new_num  = and_m.group(1)        # e.g. "2"
+                new_term = f"{prefix} {new_num}" # e.g. "training 2"
+                new_pos  = pos + len(term) + and_m.start(1)
+                if not any(t == new_term for t, _ in course_occurrences + extra):
+                    extra.append((new_term, new_pos))
+            course_occurrences = course_occurrences + extra
 
             return course_occurrences, track_occurrences
         except Exception as exc:
@@ -2526,28 +2549,30 @@ Examples:
                 if not any(r[0] == p for r in pos_replacements):
                     pos_replacements.append((p, p + len(o), ded))
 
+        rewrite_method = "no replacements"
         if pos_replacements:
             clean = self._rewrite_query_positional(pending.dereferenced, pos_replacements)
+            rewrite_method = "positional"
             dict_rep: Dict[str, str] = {}
             for o, p, canon in all_course_occ:
                 dict_rep[o] = f"'{canon}' course"
             for o, p, canon in resolved_track_occ:
                 if o not in dict_rep:
                     dict_rep[o] = f"'{canon}' program"
-            still_unreplaced = any(
-                v.lower() not in clean.lower()
-                for k, v in dict_rep.items()
-                if k.lower() != v.lower()
-            )
-            if still_unreplaced:
+            failed = [
+                k for k, v in dict_rep.items()
+                if k.lower() != v.lower() and v.lower() not in clean.lower()
+            ]
+            if failed:
                 clean = self._rewrite_query(pending.dereferenced, dict_rep)
+                rewrite_method = "LLM fallback"
         else:
             clean = pending.dereferenced
 
-        box(
-            "📝  CLEAN QUERY (sent to agent)",
-            [f"Original : {pending.original_query}", f"Clean    : {clean}"],
-        )
+        box_lines = [f"Original : {pending.original_query}", f"Clean    : {clean}", f"Method   : {rewrite_method}"]
+        if rewrite_method == "LLM fallback" and is_verbose():
+            box_lines.append(f"LLM reason : regex missed → {', '.join(failed)}")
+        box("📝  CLEAN QUERY (sent to agent)", box_lines)
 
         return PreprocessResult(status="ready", clean_query=clean, resolved_courses=all_courses)
 
@@ -2585,40 +2610,13 @@ Examples:
         replacements: Dict[str, str],
     ) -> str:
         """
-        Substitute resolved names back into the query naturally.
-        replacements: {original_term -> canonical_name_or_deduped_spelling}
-
-        Uses simple regex substitution first (fast path), then falls back to
-        the LLM for cases where simple replacement leaves the term unchanged
-        (e.g. multi-word partial matches like "soft eng" -> "software engineering").
+        LLM fallback for query rewriting — called only when positional rewriter
+        could not place one or more canonical names (term had no literal position
+        in the query). Passes all replacements to the LLM in one call.
         """
         if not replacements:
             return query
-
-        all_replacements = replacements
-
-        # Try simple case-insensitive substitution first (fast path)
-        result = query
-        for term, canonical in all_replacements.items():
-            # Case-insensitive whole-word-ish replace
-            import re
-            pattern = re.compile(re.escape(term), re.IGNORECASE)
-            result  = pattern.sub(canonical, result)
-
-        # Fall back to LLM if any canonical name is missing from the result.
-        # This handles two failure modes:
-        #   1. Partial matches: "soft eng" → "software engineering" (original still in result)
-        #   2. Implied terms: "training 1 and 2" → entity "training 2" never existed as a
-        #      literal substring, so regex substitution silently did nothing.
-        still_unreplaced = any(
-            canonical.lower() not in result.lower()
-            for term, canonical in all_replacements.items()
-            if term.lower() != canonical.lower()
-        )
-        if still_unreplaced:
-            result = self._llm_rewrite(query, all_replacements)
-
-        return result
+        return self._llm_rewrite(query, replacements)
 
     def _llm_rewrite(self, query: str, replacements: Dict[str, str]) -> str:
         """Ask the LLM to rewrite the query with canonical names."""

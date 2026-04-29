@@ -513,8 +513,8 @@ def _split_and_run(
     When verbose=True each sub-query run streams its debug boxes so the
     user can follow tool selection, results, and judge verdicts.
     """
-    from agent import BNUAdvisorAgent
-    from llm_client import llm_call_text
+    from agent import BNUAdvisorAgent, _get_answer_llm, _ANSWER_SYSTEM
+    from langchain_core.messages import SystemMessage, HumanMessage
     from debug_box import box as _box, is_verbose as _is_verbose
 
     verbose = verbose or _is_verbose()
@@ -557,16 +557,15 @@ def _split_and_run(
             # planning prompt so the student gets both pieces of info.
             if verbose:
                 _box("✅  ANSWER NODE  →  generating final response", [], force=True)
-            from agent import _ANSWER_SYSTEM
-            other_answer = llm_call_text(
-                system=_ANSWER_SYSTEM,
-                user=(
+            other_answer = _get_answer_llm().invoke([
+                SystemMessage(content=_ANSWER_SYSTEM),
+                HumanMessage(content=(
                     f"Student question: {clean_query}\n\n"
                     f"Information from the BNU database:\n"
                     + "\n\n---\n\n".join(non_planning_ctxs)
                     + "\n\nAnswer only the non-planning part of the question."
-                ),
-            )
+                )),
+            ]).content
             return f"{other_answer}\n\n---\n\n{planning_output}"
         # Only planning context — return it directly
         return planning_output
@@ -575,16 +574,15 @@ def _split_and_run(
         _box("✅  ANSWER NODE  →  generating final response", [], force=True)
 
     # One final synthesis from all collected context
-    from agent import _ANSWER_SYSTEM
     combined = "\n\n---\n\n".join(all_contexts)
-    return llm_call_text(
-        system=_ANSWER_SYSTEM,
-        user=(
+    return _get_answer_llm().invoke([
+        SystemMessage(content=_ANSWER_SYSTEM),
+        HumanMessage(content=(
             f"Student question: {clean_query}\n\n"
             f"Information from the BNU database:\n{combined}\n\n"
             "Answer the question clearly and concisely based on the information above."
-        ),
-    )
+        )),
+    ]).content
 
 
 def _advance_planning(student_id: str, reply: str, state: Any) -> str:
