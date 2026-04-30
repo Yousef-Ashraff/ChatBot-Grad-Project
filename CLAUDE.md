@@ -264,6 +264,7 @@ The inline electives Cypher query inside `get_all_electives` uses `COALESCE(c.co
 | `get_all_not_specialized_courses` | "What courses are shared between all programs?" |
 | `compare_programs` | "Compare AIM and SAD", "What's the difference between DAS and AIM?" |
 | `compare_courses` | "Compare ML and DL", "What's the difference between OS and networks?" |
+| `recommend_core` | "What core courses should I take?", "Which mandatory courses can I register for?", "Recommend the most important core course for me", "Of [X, Y, Z], which should I prioritize?" |
 | `store_preference` *(silent)* | Automatically called when student expresses interest/skill/dislike ("I love NLP", "I'm good at math", "I hate theory") |
 
 ## Data Sources

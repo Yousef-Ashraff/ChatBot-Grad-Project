@@ -85,7 +85,7 @@ def _get_student_row(student_id: str) -> Optional[dict]:
             supabase.table("students")
             .select(
                 "student_id, first_name, last_name, track, "
-                "courses_degrees, total_hours_earned, university_year, gpa"#, current_term"
+                "courses_degrees, total_hours_earned, university_year, gpa"  # current_term not yet in DB
             )
             .eq("student_id", str(student_id))
             .single()

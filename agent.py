@@ -399,11 +399,7 @@ def _make_agent_node(llm_with_tools):
         messages       = state.get("messages", [])
 
         # ── Build query block ─────────────────────────────────────────────
-        reformulation_note = (
-            f"\n(Reformulated as: {current_query})"
-            if current_query != original_query
-            else ""
-        )
+        is_reformulated = current_query != original_query
 
         # ── Build compact context summary ─────────────────────────────────
         context_block = ""
@@ -447,9 +443,16 @@ def _make_agent_node(llm_with_tools):
             if judge_missing else ""
         )
 
+        if is_reformulated:
+            query_block = (
+                f"Student query (current focus): {current_query}"
+                f"\n(Original query was: {original_query})"
+            )
+        else:
+            query_block = f"Student query: {original_query}"
+
         user_msg = (
-            f"Student query: {original_query}"
-            f"{reformulation_note}"
+            f"{query_block}"
             f"{context_block}"
             f"{called_block}"
             f"{judge_hint}\n\n"
@@ -572,7 +575,8 @@ def _multi_course_deps_missing(original_query: str, accumulated_context: list) -
     Program names are detected by the pattern 'TERM' followed by the word 'program'
     in the query text and are excluded from the coverage check.
 
-    Returns the first uncovered course name, or "" if all covered or not applicable.
+    Returns a "; "-joined string of all uncovered course dependency descriptions,
+    or "" if all covered or not applicable.
     """
     # Gate: only fire if the agent already made at least one get_course_dependencies call
     if not any('[get_course_dependencies(' in ctx for ctx in accumulated_context):
@@ -592,6 +596,7 @@ def _multi_course_deps_missing(original_query: str, accumulated_context: list) -
         if cn:
             queried_deps.add(cn.group(1).strip().lower())
 
+    missing = []
     for term in quoted:
         is_program = bool(re.search(
             r"'" + re.escape(term) + r"'\s*program",
@@ -600,8 +605,9 @@ def _multi_course_deps_missing(original_query: str, accumulated_context: list) -
         if is_program:
             continue
         if term.lower() not in queried_deps:
-            return term
-    return ""
+            missing.append(term)
+
+    return "; ".join(missing)
 
 
 
@@ -617,6 +623,7 @@ def _make_judge_node():
     """
     def judge_node(state: AgentState) -> dict:
         original_query = state.get("original_query", "")
+        current_query  = state.get("current_query", "")
         accum_ctx      = state.get("accumulated_context", [])
         silent_ctx     = state.get("silent_context", [])
         tools_used     = state.get("tool_calls_this_round", 0)
@@ -692,8 +699,13 @@ def _make_judge_node():
         # This prevents the LLM from confusing a COURSE named "X" with a
         # PROGRAM named "X" (e.g. "artificial intelligence" course ≠
         # "artificial intelligence & machine learning" program).
+        reformulation_note = (
+            f'\nCurrent focus (reformulated): "{current_query}"'
+            if current_query and current_query != original_query
+            else ""
+        )
         prompt = (
-            f'Student query: "{original_query}"\n\n'
+            f'Student query: "{original_query}"{reformulation_note}\n\n'
             f'Data collected from the BNU database:\n{context}\n\n'
             f'Determine whether the collected data is sufficient to fully answer '
             f'the student query.\n'
@@ -801,7 +813,11 @@ def _make_judge_node():
             f'\n'
             f'--- SATISFACTION RULES ---\n'
             f'1. satisfied=true  ONLY when every entity has present_in_context=true.\n'
-            f'2. satisfied=false if ANY entity is absent — name the missing one.\n'
+            f'2. satisfied=false if ANY entity is absent — list ALL missing items in the "missing"\n'
+            f'   array. Each entry must be a descriptive string explaining WHAT is missing and in\n'
+            f'   what context, e.g. "NLP course info in AIM program", "elective courses for DAS",\n'
+            f'   "year 2 courses for SAD", "deep learning comparison data". Never put just a bare\n'
+            f'   name — always include what information about it is needed.\n'
             f'3. For comparison queries, ALL compared items must be present.\n'
             f'4. Tool errors or missing student_id alone do NOT make satisfied=false '
             f'   if the other results already answer the query.\n'
@@ -835,7 +851,7 @@ def _make_judge_node():
             f'    ...\n'
             f'  ],\n'
             f'  "satisfied": true,\n'
-            f'  "missing": ""\n'
+            f'  "missing": []\n'
             f'}}'
         )
 
@@ -854,7 +870,15 @@ def _make_judge_node():
 
             # Primary read: top-level satisfied field
             satisfied = bool(data.get("satisfied", False))
-            missing   = data.get("missing", "")
+            raw_missing = data.get("missing", [])
+            # Normalise: accept list (new) or plain string (legacy / hallucination)
+            if isinstance(raw_missing, list):
+                missing_list = [str(m).strip() for m in raw_missing if str(m).strip()]
+            elif isinstance(raw_missing, str) and raw_missing.strip():
+                missing_list = [raw_missing.strip()]
+            else:
+                missing_list = []
+            missing = "; ".join(missing_list)
 
             # Safety cross-check: if any entity is marked present_in_context=false,
             # override a (hallucinated) satisfied=true.
@@ -867,7 +891,13 @@ def _make_judge_node():
                 ]
                 if absent and satisfied:
                     satisfied = False
-                    missing   = missing or f"missing data for: {', '.join(absent)}"
+                    # Merge absent names into missing list (avoid duplicates)
+                    absent_descs = [f"missing data for: {a}" for a in absent
+                                    if f"missing data for: {a}" not in missing_list
+                                    and a not in missing]
+                    if absent_descs:
+                        missing_list.extend(absent_descs)
+                        missing = "; ".join(missing_list)
                     logger.warning(
                         "[Judge] overriding satisfied=true — absent entities: %s", absent
                     )
@@ -1054,7 +1084,10 @@ def _make_reformulate_node():
             "1. Return ONLY one plain sentence — the rewritten query.\n"
             "2. The output MUST be different from every query listed as already tried.\n"
             "3. Never use pronouns or references (it, them, this, that, the course). "
-            "Always spell out the full explicit name of every course or program."
+            "Always spell out the full explicit name of every course or program.\n"
+            "4. Do NOT add any factual information that is not present in the original query. "
+            "Do not assume or invent which program a course belongs to, what prerequisites exist, "
+            "or any other facts. Only rephrase — never add knowledge."
         )
 
         # Try up to 3 times to get a query that is not a duplicate
@@ -1266,7 +1299,13 @@ def _print_step(
             body.append(f"Deps check    : {deps_check_info}")
         if not satisfied and missing:
             prefix = "[Python override]" if src == "python_override" else "[LLM]"
-            body.append(f"Missing {prefix} : {missing}")
+            missing_items = [m.strip() for m in missing.split(";") if m.strip()]
+            if len(missing_items) == 1:
+                body.append(f"Missing {prefix} : {missing_items[0]}")
+            else:
+                body.append(f"Missing {prefix} :")
+                for item in missing_items:
+                    body.append(f"  • {item}")
         _box(
             f"⚖️   JUDGE  →  {'satisfied ✅' if satisfied else 'not yet satisfied ❌'}",
             body,

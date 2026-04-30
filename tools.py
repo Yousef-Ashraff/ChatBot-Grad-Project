@@ -813,7 +813,7 @@ def get_program_recommendation() -> str:
 
 
 @tool
-def get_elective_recommendation(program_name: str) -> str:
+def get_elective_recommendation(top_n: Optional[int] = None) -> str:
     """
     Recommend the best-fitting elective courses for the current student
     within their program, based on their preference profile.
@@ -821,25 +821,425 @@ def get_elective_recommendation(program_name: str) -> str:
     Scores every elective in the programme catalogue using the student's
     merged preference vector (degree + user + ai preferences) and returns
     the top 5 matches with match percentages and matching interest areas.
+    If top_n is set, returns only that many top matches instead of the default 5.
 
     Use this when the student asks:
     - "Which electives should I take?"
-    - "What electives fit my interests in the AIM program?"
+    - "What electives fit my interests?"
     - "Recommend electives for me"
     - "Which optional courses suit me best?"
-
-    Args:
-        program_name: The student's program. Accepts full names or aliases:
-                      "AIM", "artificial intelligence and machine learning",
-                      "SAD", "software and application development",
-                      "data science", "DAS", "DS".
     """
     sid = _get_student_id()
     try:
+        from eligibility import get_student_context
         from recommendation_service import recommend_electives
+        program_name = get_student_context(sid).get("program_name")
+        if not program_name:
+            return "Could not determine your program. Please contact the registrar."
+        if top_n is not None:
+            return recommend_electives(sid, program_name, top_n=top_n)
         return recommend_electives(sid, program_name)
     except Exception as exc:
         return f"Error generating elective recommendation: {exc}"
+
+
+def _recommend_core(
+    sid: str,
+    course_names: Optional[List[str]] = None,
+    top_n: Optional[int] = None,
+) -> str:
+    try:
+        from eligibility import check_course_eligibility as _check_elig, get_student_context
+        from neo4j_course_functions import (
+            get_courses_by_term as _term_fn,
+            get_course_closes as _closes_fn,
+            get_course_info as _info_fn,
+            normalize_level,
+            normalize_semester,
+        )
+
+        ctx = get_student_context(sid)
+        program_name = ctx.get("program_name")
+        university_year = ctx.get("university_year")
+        current_term = ctx.get("current_term") or 1  # 1 or 2 from DB, default to 1
+
+        if not program_name:
+            return "Could not determine your program. Please contact the registrar."
+        if not university_year:
+            return "Could not determine your current academic year. Please contact the registrar."
+
+        current_year_str = normalize_level(university_year)
+        current_sem_str = normalize_semester(current_term)   # "First" or "Second"
+        current_term_label = f"{current_year_str}, {current_sem_str} Semester"
+
+        # ── helpers ──────────────────────────────────────────────────────────
+
+        def _get_info(name: str) -> dict:
+            try:
+                info_list = _info_fn(name, program_name=program_name)
+                return info_list[0] if info_list else {}
+            except Exception:
+                return {}
+
+        def _get_closes_count(name: str) -> int:
+            try:
+                return len(_closes_fn(name, program_name=program_name))
+            except Exception:
+                return 0
+
+        def _elig(name: str) -> dict:
+            try:
+                return _check_elig(sid, name)
+            except Exception:
+                return {"eligible": False, "missing_prerequisites": [], "credit_requirement_met": True}
+
+        def _missing_str(elig_result: dict) -> list:
+            parts = [p.get("name", "?") for p in elig_result.get("missing_prerequisites", [])]
+            if not elig_result.get("credit_requirement_met", True):
+                cr = elig_result.get("credit_requirement")
+                earned = elig_result.get("earned_credits", 0)
+                parts.append(f"need {cr} credit hours (have {earned})")
+            return parts
+
+        def _technical_score(course_code) -> int:
+            """0 for general-track (GEN prefix), 1 for all technical courses.
+            Used as a tiebreaker so technical courses rank above general ones
+            when they share the same closes count."""
+            if not course_code:
+                return 1
+            return 0 if str(course_code).upper().startswith("GEN") else 1
+
+        def _sort_key(c):
+            return (c["closes_courses_count"], _technical_score(c.get("course_code", "")))
+
+        # ── MODE 1 ───────────────────────────────────────────────────────────
+        if not course_names:
+            # Fetch the full year (both semesters) so we can split and note
+            # other-semester courses instead of silently dropping them.
+            year_data = _term_fn(university_year, semester=None, program_name=program_name)
+
+            current_term_mandatory = []   # courses in student's current semester
+            other_term_mandatory = []     # mandatory courses scheduled for the other semester
+
+            for _yr, semesters in year_data.items():
+                for sem, programs in semesters.items():
+                    for _prog, courses in programs.items():
+                        for c in courses:
+                            if c["course_type"] == "mandatory":
+                                entry = {
+                                    "course_name": c["course_name"],
+                                    "course_code": c["course_code"],
+                                    "credit_hours": c["credit_hours"],
+                                    "semester": sem,
+                                }
+                                if sem == current_sem_str:
+                                    current_term_mandatory.append(entry)
+                                else:
+                                    other_term_mandatory.append(entry)
+
+            if not current_term_mandatory and not other_term_mandatory:
+                return f"No mandatory courses found for {program_name} in {current_year_str}."
+
+            eligible_courses = []
+            not_eligible_list = []
+
+            # Check eligibility only for current-semester courses
+            for course in current_term_mandatory:
+                er = _elig(course["course_name"])
+                if er["eligible"]:
+                    eligible_courses.append(dict(course))
+                else:
+                    not_eligible_list.append({
+                        "course_name": course["course_name"],
+                        "missing_prerequisites": _missing_str(er),
+                    })
+
+            # Enrich eligible courses with description + closes count
+            for course in eligible_courses:
+                info = _get_info(course["course_name"])
+                course["description"] = info.get("description") or ""
+                course["motivation"] = info.get("motivation") or ""
+                course["closes_courses_count"] = _get_closes_count(course["course_name"])
+
+            # Sort by closes count desc; technical courses break ties over general ones
+            eligible_courses.sort(key=_sort_key, reverse=True)
+
+            def _ne_note(entries):
+                if not entries:
+                    return "none"
+                parts = []
+                for ne in entries:
+                    m = ", ".join(ne["missing_prerequisites"]) if ne["missing_prerequisites"] else "unmet requirements"
+                    parts.append(f"{ne['course_name'].title()} (missing: {m})")
+                return "; ".join(parts)
+
+            not_elig_note = _ne_note(not_eligible_list)
+
+            # Other-semester note
+            other_term_note = (
+                "; ".join(c["course_name"].title() for c in other_term_mandatory)
+                if other_term_mandatory else "none"
+            )
+            other_sem_str = "Second" if current_sem_str == "First" else "First"
+
+            def _closes_label(c):
+                n = c["closes_courses_count"]
+                return f"{c['course_name'].title()} (unlocks {n} future course{'s' if n != 1 else ''})"
+
+            # ── Mode 1a: return all eligible with closes counts ───────────────
+            if top_n is None or top_n >= len(eligible_courses):
+                output_data = {
+                    "student_year": current_year_str,
+                    "current_semester": current_sem_str,
+                    "program": program_name,
+                    "eligible_core_courses": eligible_courses,
+                    "not_eligible_courses": not_eligible_list,
+                    "not_current_term_courses": [c["course_name"] for c in other_term_mandatory],
+                }
+                output = _to_str(output_data)
+                output += (
+                    f"\n\n[ADVISOR NOTE] Present to the student: "
+                    f"These are all the eligible mandatory (core) courses in your current term ({current_term_label}), "
+                    f"listed with how many future courses each one unlocks. "
+                    f"List each eligible course with its name, semester, credit hours, description, and closes count. "
+                    f"Then guide the student: 'If you can take all of them this term, go ahead! "
+                    f"But if you need to choose only some, prioritize the ones that unlock the most future "
+                    f"courses in coming years and semesters — they give you the most academic momentum. "
+                    f"When two courses unlock the same number of future courses, prefer the more technical one.' "
+                    f"Then inform: 'These mandatory courses are not in your current term ({other_sem_str} Semester) — "
+                    f"you will take them next: {other_term_note}.' "
+                    f"Finally inform: 'You cannot enroll in these courses yet: {not_elig_note}.' "
+                    f"Explain why each blocked course is blocked (which prerequisites are missing)."
+                )
+
+            # ── Mode 1b: top_n by closes count ───────────────────────────────
+            else:
+                top_courses = eligible_courses[:top_n]
+                remaining = eligible_courses[top_n:]
+
+                top_note = ", ".join(_closes_label(c) for c in top_courses)
+                remaining_note = (
+                    "; ".join(_closes_label(c) for c in remaining) if remaining else "none"
+                )
+
+                output_data = {
+                    "student_year": current_year_str,
+                    "current_semester": current_sem_str,
+                    "program": program_name,
+                    "recommended_core_courses": top_courses,
+                    "other_eligible_not_recommended": remaining,
+                    "not_eligible_courses": not_eligible_list,
+                    "not_current_term_courses": [c["course_name"] for c in other_term_mandatory],
+                }
+                output = _to_str(output_data)
+                output += (
+                    f"\n\n[ADVISOR NOTE] Present to the student: "
+                    f"These are the top {top_n} recommended mandatory (core) courses for your current term "
+                    f"({current_term_label}). They are recommended because you are eligible for them "
+                    f"AND they unlock the most future courses in coming years and semesters: {top_note}. "
+                    f"When courses tied on future unlocks, more technical courses were preferred over general-track ones. "
+                    f"Then say: 'I do not recommend the remaining eligible courses as strongly: "
+                    f"{remaining_note} — each of them unlocks fewer future courses than the ones I recommended.' "
+                    f"Then inform: 'These mandatory courses are not in your current term ({other_sem_str} Semester) — "
+                    f"you will take them next: {other_term_note}.' "
+                    f"Finally say: 'You cannot enroll in these courses yet: {not_elig_note}.'"
+                )
+
+            return output
+
+        # ── MODE 2 ───────────────────────────────────────────────────────────
+        else:
+            advisor_note_parts = []
+            normalized = [_normalize_course(n) for n in course_names]
+
+            # ── Step 0: filter out courses not in student's program ───────────
+            in_program_names: List[str] = []
+            not_in_program_names: List[str] = []
+            course_info_cache: Dict[str, dict] = {}
+
+            for name in normalized:
+                info = _get_info(name)
+                course_info_cache[name] = info
+                in_prog = any(
+                    (off.get("program") or "").lower() == program_name.lower()
+                    for off in info.get("program_offerings", [])
+                )
+                if in_prog:
+                    in_program_names.append(name)
+                else:
+                    not_in_program_names.append(name)
+
+            if not_in_program_names:
+                not_prog_str = ", ".join(n.title() for n in not_in_program_names)
+                advisor_note_parts.append(
+                    f"These courses are not in your program ({program_name.title()}): {not_prog_str}"
+                )
+
+            # ── Step 1: separate current-year vs other-year (in-program only) ─
+            course_term_map: Dict[str, dict] = {}
+            for name in in_program_names:
+                info = course_info_cache[name]
+                year_found = None
+                sem_found = None
+                for off in info.get("program_offerings", []):
+                    if (off.get("program") or "").lower() == program_name.lower():
+                        year_found = off.get("year")
+                        sem_found = off.get("semester")
+                        break
+                course_term_map[name] = {
+                    "year": year_found,
+                    "semester": sem_found,
+                    "info": info,
+                }
+
+            current_term_courses: List[str] = []
+            not_current_term_courses: List[str] = []
+
+            current_sem_str = normalize_semester(current_term) if current_term else None
+
+            for name, data in course_term_map.items():
+                year_match = data["year"] == current_year_str
+                sem_match = (current_sem_str is None) or (data["semester"] == current_sem_str)
+                if year_match and sem_match:
+                    current_term_courses.append(name)
+                else:
+                    not_current_term_courses.append(name)
+
+            if not_current_term_courses:
+                year_labels = []
+                for n in not_current_term_courses:
+                    yr = course_term_map[n]["year"] or "unknown year"
+                    sem = course_term_map[n]["semester"]
+                    label = f"{n.title()} ({yr}{', Semester: ' + sem if sem else ''})"
+                    year_labels.append(label)
+                advisor_note_parts.append(
+                    f"These courses are not in your current term ({current_term_label}): "
+                    + "; ".join(year_labels)
+                )
+
+            # ── Step 2: check eligibility for current-term courses ────────────
+            eligible_current: List[str] = []
+            not_eligible_current: List[dict] = []
+
+            for name in current_term_courses:
+                er = _elig(name)
+                if er["eligible"]:
+                    eligible_current.append(name)
+                else:
+                    not_eligible_current.append({
+                        "course_name": name,
+                        "missing_prerequisites": _missing_str(er),
+                    })
+
+            if not_eligible_current:
+                parts = []
+                for ne in not_eligible_current:
+                    m = ", ".join(ne["missing_prerequisites"]) if ne["missing_prerequisites"] else "unmet requirements"
+                    parts.append(f"{ne['course_name'].title()} (missing: {m})")
+                advisor_note_parts.append(
+                    "You are not eligible to enroll in these current-term courses: "
+                    + "; ".join(parts)
+                )
+
+            # Build base output data
+            output_data: dict = {
+                "student_year": current_year_str,
+                "program": program_name,
+                "not_in_program_courses": not_in_program_names,
+                "not_current_term_courses": [
+                    {
+                        "course_name": n,
+                        "year": course_term_map[n]["year"],
+                        "semester": course_term_map[n]["semester"],
+                    }
+                    for n in not_current_term_courses
+                ],
+                "not_eligible_courses": not_eligible_current,
+            }
+
+            if not eligible_current:
+                output_data["eligible_current_term_courses"] = []
+                output = _to_str(output_data)
+                full_note = " | ".join(advisor_note_parts) if advisor_note_parts else ""
+                output += (
+                    f"\n\n[ADVISOR NOTE] {full_note} "
+                    f"None of the provided courses are both in your current term and eligible for enrollment."
+                )
+                return output
+
+            # ── Step 3: get closes counts, sort, build recommendation ─────────
+            eligible_with_data = []
+            for name in eligible_current:
+                info = course_term_map[name]["info"]
+                eligible_with_data.append({
+                    "course_name": name,
+                    "course_code": info.get("course_code", ""),
+                    "credit_hours": info.get("credit_hours"),
+                    "description": info.get("description") or "",
+                    "motivation": info.get("motivation") or "",
+                    "semester": course_term_map[name]["semester"] or "",
+                    "closes_courses_count": _get_closes_count(name),
+                })
+
+            eligible_with_data.sort(key=_sort_key, reverse=True)
+
+            best = eligible_with_data[0]
+            rest = eligible_with_data[1:]
+
+            best_label = (
+                f"{best['course_name'].title()} "
+                f"(unlocks {best['closes_courses_count']} future course"
+                f"{'s' if best['closes_courses_count'] != 1 else ''})"
+            )
+            rest_labels = ", ".join(
+                f"{r['course_name'].title()} "
+                f"(unlocks {r['closes_courses_count']} future course"
+                f"{'s' if r['closes_courses_count'] != 1 else ''})"
+                for r in rest
+            )
+
+            tiebreaker_note = (
+                " When courses tied on future unlocks, more technical courses were preferred over general-track ones."
+            )
+            advisor_note_parts.append(
+                f"I recommend {best_label} because it unlocks the most future courses "
+                f"among your eligible current-term options.{tiebreaker_note}"
+                + (
+                    f" Not recommended as strongly: {rest_labels} — "
+                    f"each unlocks fewer future courses than the one I recommended."
+                    if rest else ""
+                )
+            )
+
+            output_data["eligible_current_term_courses_sorted_by_impact"] = eligible_with_data
+            output = _to_str(output_data)
+            output += "\n\n[ADVISOR NOTE] " + " | ".join(advisor_note_parts)
+            return output
+
+    except Exception as exc:
+        return f"Error in recommend_core: {exc}"
+
+
+@tool
+def recommend_core(top_n: Optional[int] = None) -> str:
+    """
+    Recommends mandatory (core) courses for the current student based on
+    eligibility and how many future courses each one unlocks.
+
+    Scans ALL mandatory courses in the student's current academic year,
+    checks eligibility for each, and returns eligible ones with descriptions.
+    If top_n is set and smaller than the eligible count, sorts by how many
+    future courses each eligible course unlocks and returns only the top_n
+    highest-impact picks.
+
+    Use this when the student asks:
+    - "What core courses should I take this term?"
+    - "Which mandatory courses can I register for now?"
+    - "Recommend the most important core courses for me"
+    - "What's the best core course to take next?"
+    """
+    sid = _get_student_id()
+    return _recommend_core(sid, top_n=top_n)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1016,7 +1416,7 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
 
     output = _to_str(results)
 
-    # Elective recommendation — filtered to the student's own program.
+    # Classify compared courses by type.
     all_electives = [
         name for name, entry in results.items()
         if isinstance(entry.get("info"), list)
@@ -1026,7 +1426,17 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
             for off in row.get("program_offerings", [])
         )
     ]
-    if len(all_electives) >= 2:
+    all_cores = [
+        name for name, entry in results.items()
+        if isinstance(entry.get("info"), list)
+        and any(
+            off.get("course_type") == "no"
+            for row in entry["info"]
+            for off in row.get("program_offerings", [])
+        )
+    ]
+
+    if len(all_electives) >= 2 or len(all_cores) >= 2:
         sid = _get_student_id()
         prog = program_name
         if not prog:
@@ -1035,78 +1445,176 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
                 prog = get_student_context(sid).get("program_name")
             except Exception:
                 prog = None
+
         if prog:
             prog_lower = prog.lower().strip()
-            in_prog = [
-                name for name in all_electives
-                if any(
-                    off.get("course_type") == "yes"
-                    and (off.get("program") or "").lower().strip() == prog_lower
-                    for row in results[name]["info"]
-                    for off in row.get("program_offerings", [])
-                )
-            ]
-            out_of_prog = [n for n in all_electives if n not in in_prog]
 
-            if len(in_prog) >= 2:
-                try:
-                    from recommendation_service import recommend_electives
-                    rec = recommend_electives(sid, prog, course_names=in_prog, skip_course_info=True)
-                    output += "\n\n" + rec
-                except Exception:
-                    pass
-                if out_of_prog:
-                    out_t = ", ".join(n.title() for n in out_of_prog)
-                    in_t  = ", ".join(n.title() for n in in_prog)
-                    output += (
-                        f"\n\n[ADVISOR NOTE] {out_t} "
-                        f"{'is' if len(out_of_prog) == 1 else 'are'} not in the student's program "
-                        f"({prog.title()}); do not recommend {'it' if len(out_of_prog) == 1 else 'them'}. "
-                        f"The elective recommendation above covers only: {in_t}."
+            # ── Elective recommendation ───────────────────────────────────────
+            if len(all_electives) >= 2:
+                in_prog_elective = [
+                    name for name in all_electives
+                    if any(
+                        off.get("course_type") == "yes"
+                        and (off.get("program") or "").lower().strip() == prog_lower
+                        for row in results[name]["info"]
+                        for off in row.get("program_offerings", [])
                     )
-            elif len(in_prog) == 1:
-                in_t  = in_prog[0].title()
-                out_t = ", ".join(n.title() for n in out_of_prog)
-                elig_suffix = ""
-                try:
-                    from recommendation_service import _eligibility_for
-                    elig = _eligibility_for(sid, in_prog[0])
-                    if elig.get("eligible") is True:
-                        elig_suffix = (
-                            f" The student has completed all prerequisites for {in_t} "
-                            f"and can enroll in it."
+                ]
+                out_of_prog_elective = [n for n in all_electives if n not in in_prog_elective]
+
+                if len(in_prog_elective) >= 2:
+                    rec = ""
+                    try:
+                        from recommendation_service import recommend_electives
+                        rec = recommend_electives(sid, prog, course_names=in_prog_elective, skip_course_info=True)
+                        output += "\n\n" + rec
+                    except Exception:
+                        pass
+                    if out_of_prog_elective:
+                        out_t = ", ".join(n.title() for n in out_of_prog_elective)
+                        in_t  = ", ".join(n.title() for n in in_prog_elective)
+                        covers_suffix = (
+                            f" The elective recommendation above covers only: {in_t}."
+                            if rec and "No preference data" not in rec
+                            else ""
                         )
-                    elif elig.get("eligible") is False:
-                        missing = [p.get("name", "?") for p in elig.get("missing_prerequisites", [])]
-                        credit_req = elig.get("credit_requirement")
-                        credit_met = elig.get("credit_requirement_met", True)
-                        earned = elig.get("earned_credits", "?")
-                        reasons = []
-                        if missing:
-                            reasons.append(f"has not completed the required prerequisites: {', '.join(missing)}")
-                        if not credit_met:
-                            reasons.append(f"needs {credit_req} credit hours but only has {earned}")
-                        reasons_str = " and ".join(reasons) if reasons else "prerequisites are not met"
-                        elig_suffix = (
-                            f" However, the student cannot enroll in {in_t} yet "
-                            f"because the student {reasons_str}."
+                        output += (
+                            f"\n\n[ADVISOR NOTE] {out_t} "
+                            f"{'is' if len(out_of_prog_elective) == 1 else 'are'} not offered as an elective in the student's program "
+                            f"({prog.title()}); do not recommend {'it' if len(out_of_prog_elective) == 1 else 'them'}."
+                            f"{covers_suffix}"
                         )
-                except Exception:
-                    pass
+                elif len(in_prog_elective) == 1:
+                    in_t  = in_prog_elective[0].title()
+                    out_t = ", ".join(n.title() for n in out_of_prog_elective)
+                    elig_suffix = ""
+                    try:
+                        from recommendation_service import _eligibility_for
+                        elig = _eligibility_for(sid, in_prog_elective[0])
+                        if elig.get("eligible") is True:
+                            elig_suffix = (
+                                f" The student has completed all prerequisites for {in_t} "
+                                f"and can enroll in it."
+                            )
+                        elif elig.get("eligible") is False:
+                            missing = [p.get("name", "?") for p in elig.get("missing_prerequisites", [])]
+                            credit_req = elig.get("credit_requirement")
+                            credit_met = elig.get("credit_requirement_met", True)
+                            earned = elig.get("earned_credits", "?")
+                            reasons = []
+                            if missing:
+                                reasons.append(f"has not completed the required prerequisites: {', '.join(missing)}")
+                            if not credit_met:
+                                reasons.append(f"needs {credit_req} credit hours but only has {earned}")
+                            reasons_str = " and ".join(reasons) if reasons else "prerequisites are not met"
+                            elig_suffix = (
+                                f" However, the student cannot enroll in {in_t} yet "
+                                f"because the student {reasons_str}."
+                            )
+                    except Exception:
+                        pass
+                    output += (
+                        f"\n\n[ADVISOR NOTE] Only {in_t} is an elective in the student's program "
+                        f"({prog.title()}). "
+                        f"{out_t} {'is' if len(out_of_prog_elective) == 1 else 'are'} not offered as an elective in their program. "
+                        f"Inform the student that {in_t} is the only elective from these courses that belongs to their program. "
+                        f"{elig_suffix}".rstrip()
+                    )
+                else:  # 0 electives in student's program
+                    all_t = ", ".join(n.title() for n in all_electives)
+                    output += (
+                        f"\n\n[ADVISOR NOTE] None of the compared courses ({all_t}) "
+                        f"are offered as electives in the student's program ({prog.title()}). "
+                        f"Do not recommend any of them; inform the student these courses "
+                        f"are not available as electives in their program."
+                    )
+
+            # ── Core recommendation ───────────────────────────────────────────
+            if len(all_cores) >= 2:
+                in_prog_core = [
+                    name for name in all_cores
+                    if any(
+                        off.get("course_type") == "no"
+                        and (off.get("program") or "").lower().strip() == prog_lower
+                        for row in results[name]["info"]
+                        for off in row.get("program_offerings", [])
+                    )
+                ]
+                out_of_prog_core = [n for n in all_cores if n not in in_prog_core]
+
+                if len(in_prog_core) >= 2:
+                    rec = ""
+                    try:
+                        rec = _recommend_core(sid, course_names=in_prog_core)
+                        output += "\n\n" + rec
+                    except Exception:
+                        pass
+                    if out_of_prog_core:
+                        out_t = ", ".join(n.title() for n in out_of_prog_core)
+                        in_t  = ", ".join(n.title() for n in in_prog_core)
+                        covers_suffix = (
+                            f" The core recommendation above covers only: {in_t}."
+                            if "eligible_current_term_courses_sorted_by_impact" in rec
+                            else ""
+                        )
+                        output += (
+                            f"\n\n[ADVISOR NOTE] {out_t} "
+                            f"{'is' if len(out_of_prog_core) == 1 else 'are'} not offered as a core course in the student's program "
+                            f"({prog.title()}); do not recommend {'it' if len(out_of_prog_core) == 1 else 'them'}."
+                            f"{covers_suffix}"
+                        )
+                elif len(in_prog_core) == 1:
+                    in_t  = in_prog_core[0].title()
+                    out_t = ", ".join(n.title() for n in out_of_prog_core)
+                    elig_suffix = ""
+                    try:
+                        from recommendation_service import _eligibility_for
+                        elig = _eligibility_for(sid, in_prog_core[0])
+                        if elig.get("eligible") is True:
+                            elig_suffix = (
+                                f" The student has completed all prerequisites for {in_t} "
+                                f"and can enroll in it."
+                            )
+                        elif elig.get("eligible") is False:
+                            missing = [p.get("name", "?") for p in elig.get("missing_prerequisites", [])]
+                            credit_req = elig.get("credit_requirement")
+                            credit_met = elig.get("credit_requirement_met", True)
+                            earned = elig.get("earned_credits", "?")
+                            reasons = []
+                            if missing:
+                                reasons.append(f"has not completed the required prerequisites: {', '.join(missing)}")
+                            if not credit_met:
+                                reasons.append(f"needs {credit_req} credit hours but only has {earned}")
+                            reasons_str = " and ".join(reasons) if reasons else "prerequisites are not met"
+                            elig_suffix = (
+                                f" However, the student cannot enroll in {in_t} yet "
+                                f"because the student {reasons_str}."
+                            )
+                    except Exception:
+                        pass
+                    output += (
+                        f"\n\n[ADVISOR NOTE] Only {in_t} is a core course in the student's program "
+                        f"({prog.title()}). "
+                        f"{out_t} {'is' if len(out_of_prog_core) == 1 else 'are'} not offered as a core course in their program. "
+                        f"Inform the student that {in_t} is the only core course from these compared courses that belongs to their program. "
+                        f"{elig_suffix}".rstrip()
+                    )
+                else:  # 0 core courses in student's program
+                    all_t = ", ".join(n.title() for n in all_cores)
+                    output += (
+                        f"\n\n[ADVISOR NOTE] None of the compared courses ({all_t}) "
+                        f"are offered as core courses in the student's program ({prog.title()}). "
+                        f"Do not recommend any of them; inform the student these courses "
+                        f"are not available as core courses in their program."
+                    )
+
+            if len(all_electives) >= 2 and len(all_cores) >= 2:
                 output += (
-                    f"\n\n[ADVISOR NOTE] Only {in_t} is an elective in the student's program "
-                    f"({prog.title()}). "
-                    f"{out_t} {'is' if len(out_of_prog) == 1 else 'are'} not in their program. "
-                    f"Inform the student that {in_t} is their only selectable option from these electives. "
-                    f"{elig_suffix}".rstrip()
-                )
-            else:  # 0 electives in student's program
-                all_t = ", ".join(n.title() for n in all_electives)
-                output += (
-                    f"\n\n[ADVISOR NOTE] None of the compared electives ({all_t}) "
-                    f"belong to the student's program ({prog.title()}). "
-                    f"Do not recommend any of them; inform the student these electives "
-                    f"are not available in their program."
+                    f"\n\n[ADVISOR NOTE] The output above contains two independent recommendations. "
+                    f"Present them to the student as two clearly separated sections: "
+                    f"(1) Elective recommendation — based on preference fit. "
+                    f"(2) Core recommendation — based on eligibility and how many future courses each unlocks. "
+                    f"Do not merge them into a single list."
                 )
 
     return output
@@ -1148,6 +1656,7 @@ ALL_TOOLS = [
     # Recommendation tools
     get_program_recommendation,
     get_elective_recommendation,
+    recommend_core,
     # Preference storage
     store_preference,
 ]

@@ -1076,6 +1076,10 @@ class QueryPreprocessor:
             clean = self._rewrite_query(resolved, dict_replacements)
             rewrite_method = "LLM fallback"
 
+        clean = re.sub(r'\bcourse\s+course\b', 'course', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\bprogram\s+program\b', 'program', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\bprogram\s+track\b', 'program', clean, flags=re.IGNORECASE)
+
         box_lines = [f"Original : {query}", f"Clean    : {clean}", f"Method   : {rewrite_method}"]
         if failed and is_verbose():
             box_lines.append(f"LLM reason : regex missed → {', '.join(failed)}")
@@ -1349,6 +1353,10 @@ class QueryPreprocessor:
                 rewrite_method = "LLM fallback"
         else:
             clean = pending.original_query
+
+        clean = re.sub(r'\bcourse\s+course\b', 'course', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\bprogram\s+program\b', 'program', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\bprogram\s+track\b', 'program', clean, flags=re.IGNORECASE)
 
         box_lines = [f"Original : {pending.original_query}", f"Clean    : {clean}", f"Method   : {rewrite_method}"]
         if rewrite_method == "LLM fallback" and is_verbose():
@@ -1724,7 +1732,46 @@ Examples:
         scored.sort(key=lambda x: x["confidence"], reverse=True)
 
         if not scored:
-            return {"status": "not_found"}
+            # Retry 1: strip trailing 's' (handles plurals like "nlps" → "nlp")
+            stripped = term_lower.rstrip("s")
+            if stripped and stripped != term_lower:
+                if stripped in COURSE_ALIASES:
+                    return {"status": "resolved", "canonical": COURSE_ALIASES[stripped], "method": "alias (depluralized)"}
+                if stripped in MULTI_COURSE_ALIASES:
+                    return {"status": "multi_course", "canonical_list": MULTI_COURSE_ALIASES[stripped], "method": "multi_alias (depluralized)"}
+                retry = []
+                for c in courses:
+                    s = _score_course(stripped, c["name"], c["code"])
+                    if s >= self.MATCH_THRESHOLD:
+                        retry.append({"name": c["name"], "code": c["code"], "confidence": round(s, 3)})
+                retry.sort(key=lambda x: x["confidence"], reverse=True)
+                if retry:
+                    scored = retry
+
+            # Retry 2: strip trailing digit(s) ("se2" → base="se" + num="2")
+            if not scored:
+                num_m = re.search(r'^(.*\D)(\d+)$', term_lower)
+                if num_m:
+                    base = num_m.group(1).strip()
+                    num  = num_m.group(2)
+                    canon_base = None
+                    if base in COURSE_ALIASES:
+                        canon_base = COURSE_ALIASES[base]
+                    elif base in MULTI_COURSE_ALIASES:
+                        pass  # multi-course + number is ambiguous — skip
+                    else:
+                        base_scored = []
+                        for c in courses:
+                            s = _score_course(base, c["name"], c["code"])
+                            if s >= self.MATCH_THRESHOLD:
+                                base_scored.append((c["name"], s))
+                        if base_scored:
+                            canon_base = max(base_scored, key=lambda x: x[1])[0]
+                    if canon_base:
+                        return {"status": "resolved", "canonical": f"{canon_base} {num}", "method": f"alias+number (base='{base}')"}
+
+            if not scored:
+                return {"status": "not_found"}
 
         best = scored[0]
 
@@ -2568,6 +2615,10 @@ Examples:
                 rewrite_method = "LLM fallback"
         else:
             clean = pending.dereferenced
+
+        clean = re.sub(r'\bcourse\s+course\b', 'course', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\bprogram\s+program\b', 'program', clean, flags=re.IGNORECASE)
+        clean = re.sub(r'\bprogram\s+track\b', 'program', clean, flags=re.IGNORECASE)
 
         box_lines = [f"Original : {pending.original_query}", f"Clean    : {clean}", f"Method   : {rewrite_method}"]
         if rewrite_method == "LLM fallback" and is_verbose():
