@@ -1,0 +1,359 @@
+PLANNING SYSTEM — FULL DESCRIPTION
+===================================
+File: planning.py  |  Entry point: planning(student_id, supabase_client)
+Called by: start_course_planning tool in tools.py
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+planning() is a fully automated function — no print() or input() calls.
+It returns a structured dict. The start_course_planning tool formats that
+dict into a plain string, which the answer LLM then synthesises into a
+natural response like any other tool result.
+
+Return dict:
+  {
+    'student_id':        str,
+    'year':              int,
+    'semester':          str,           # 'First' or 'Second'
+    'track':             str,
+    'available_credits': int,           # credit ceiling based on GPA
+    'planned_credits':   int,           # sum of all planned course credits
+    'planned_courses':   List[dict],    # each: {course_name, credit_hours, course_type, course_code}
+    'advisor_notes':     List[str],     # human-readable log of planning decisions
+  }
+
+Returns None if the student record is missing or has no program_name.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. STUDENT DATA (Step 1)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+get_student_context(student_id) is called — one Supabase query fetching:
+
+  completed:  Set[str]  — course names from courses_degrees[].name (lowercased)
+                          ONLY courses where grade is NOT in {F, F+, F-}
+                          (failing grades mean the course is not completed)
+  track:      str       — canonical Neo4j program name
+                          (e.g. "artificial intelligence & machine learning")
+  earned:     int       — total_hours_earned from DB (authoritative, not recomputed)
+  gpa:        float     — student GPA
+  uni_year:   int       — current university year (1–4)
+  semester:   str       — 'First' or 'Second' (from current_term field)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CREDIT LIMIT (Step 2)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  GPA >= 3.0  →  21 credits
+  GPA >= 2.0  →  18 credits
+  GPA <  2.0  →  15 credits
+
+avail_credits starts at this value and is decremented as each stage adds
+courses to the plan. Planning terminates when avail_credits == 0 or
+overflow occurs.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. SHARED ELECTIVE POOL (Step 3)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+A single elective_pool list is built once and shared across all stages:
+
+  all_electives = get_all_electives_by_program(track)   ← Neo4j query
+  elective_pool = [
+      e for e in all_electives
+      if e['course_name'] not in completed              ← not already done
+      and _check_prereqs(e, track, completed, earned)   ← prereqs met
+  ]
+
+When a stage picks electives, they are REMOVED from elective_pool so they
+cannot be picked again by a later stage. If an elective is removed by
+overflow resolution, it is RETURNED to elective_pool via return_to_pool().
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. PRE-COMPUTED ELECTIVE SLOT COUNTS (Step 4)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+get_elective_slots(track, year, semester) returns the total number of
+elective slots defined in the curriculum for that term. But some of those
+slots may already be filled by completed courses.
+
+To account for this, remaining_slots is pre-computed ONCE before any stage
+runs:
+
+  Step A — Build ordered list of all terms that have slots:
+    _slot_terms = [(y, s) for y in 1..4 for s in [First, Second]
+                   if get_elective_slots(track, y, s) > 0]
+
+  Step B — Initialise remaining_slots with total capacity:
+    remaining_slots = {(y, s): get_elective_slots(track, y, s)
+                       for (y, s) in _slot_terms}
+
+  Step C — Walk every completed course. If it is an elective, subtract 1
+  from the first slot in _slot_terms that still has capacity:
+    for course in completed:
+        if course in all_elective_names:
+            for (y, s) in _slot_terms:
+                if remaining_slots[(y, s)] > 0:
+                    remaining_slots[(y, s)] -= 1
+                    break
+
+This gives the number of UNFILLED elective slots per term. Stages read
+remaining_slots.get((y, s), 0) instead of calling get_elective_slots()
+directly — this ensures already-completed electives are never re-planned.
+
+Example:
+  AIM track has 2 slots in Year4/First and 3 slots in Year4/Second.
+  Student completed 1 elective → remaining_slots[(4,'First')] = 1
+  Stage 2 (Year4/First) will ask for 1 elective, not 2.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. ELECTIVE SELECTION — pick_electives(n)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Called by each stage to pick n electives from the shared pool.
+
+  1. If n <= 0 or pool is empty → return []
+  2. to_pick = min(n, len(elective_pool))
+  3. Calls recommend_electives(student_id, track, top_n=to_pick,
+       eligible_electives=list(elective_pool))
+     This is Mode 3 of the recommendation service:
+       - Receives the pre-filtered pool directly (no redundant Neo4j query)
+       - Scores each elective via cosine similarity between the student's
+         merged preference vector and the elective's category profile
+       - Returns top-n as List[dict], sorted by score descending
+       - If student has no preference data → returns first n from pool as-is
+  4. Chosen electives are removed from elective_pool
+  5. Each is tagged: course_type='elective', is_elective_pick=True
+
+Preference vector merge weights used inside recommend_electives:
+  degree_preference  0.45  (from transcript grades)
+  user_preference    0.35  (student signup)
+  ai_preference      0.20  (agent-inferred during chat)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. PREREQUISITE CHECK — _check_prereqs(course, track, completed, earned)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Calls get_course_dependencies(course, track, dependents=False) → Neo4j.
+For each prerequisite:
+  - If it has a 'Required_Credit_Hours' key → check earned >= that value
+  - Otherwise → check the prerequisite course name is in completed set
+Returns True only if ALL prerequisites pass.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. STAGE EXECUTION — process_stage(mandatory, elective_slots, priority_sets, label)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every stage calls process_stage() which:
+  1. Picks electives: elective_picks = pick_electives(elective_slots)
+  2. Combines: candidates = mandatory + elective_picks
+  3. Computes total credits of candidates
+  4. If total == 0 → nothing to add, return False (continue to next stage)
+
+  Case A — total <= avail_credits:
+    Adds all candidates to suggest_courses
+    Decrements avail_credits by total
+    If avail_credits == 0 → returns True (planning complete)
+    Otherwise → returns False (continue to next stage)
+
+  Case B — total > avail_credits (OVERFLOW):
+    Calls _resolve_overflow(candidates, avail_credits, track,
+                            advisor_notes, priority_term_sets)
+    Adds resolved (trimmed) list to suggest_courses
+    Calls return_to_pool() for any removed elective picks
+    Returns True (always terminate after overflow)
+
+process_stage returns True  → planning stops, build and return result
+process_stage returns False → next stage executes
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. OVERFLOW RESOLUTION — _resolve_overflow(courses, avail, track, notes, priority_sets)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Removes courses from the candidate list until sum(credit_hours) <= avail.
+Returns (remaining, removed).
+
+Elective picks always have effective_dependents = 0 → always removed first.
+
+Removal algorithm has two phases:
+
+  Phase 1 — Priority layers:
+    For each set of term names in priority_term_sets:
+      Candidates for removal = courses whose dependents do NOT intersect
+      that term's course names (i.e. removing them won't block next-term courses)
+      Sort by ascending effective_dependents count
+      Remove smallest first until credits fit or candidates exhausted
+
+  Phase 2 — Final pass (if still over limit):
+    All remaining courses, sorted by ascending effective_dependents
+    Remove smallest first until credits fit
+
+Priority term sets per stage:
+  Stage 1 (backlog):  [cur_term_names, next_term_names]
+  Stage 2 (current):  [next_term_names]
+  Stage 3 (future):   []   (no priority sets → goes straight to final pass)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. STAGE 1 — PREVIOUS TERMS BACKLOG
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Collects all missed courses from previous years, same semester type.
+
+Loop: for y in 1..uni_year, for s in [First, Second]:
+  Stop inner loop when (y == uni_year AND s == semester)  ← don't go past current
+  Skip if s != semester                                   ← same semester type only
+
+  prev_mandatory += eligible mandatory courses for (y, s, track)
+  prev_elective_slots += remaining_slots.get((y, s), 0)
+
+"Eligible mandatory" means: in Neo4j curriculum for that term, NOT in
+completed, NOT already planned, and prereqs are met.
+
+If prev_mandatory or prev_elective_slots > 0:
+  priority_sets = [cur_term_names, next_term_names]
+  process_stage(prev_mandatory, prev_elective_slots, priority_sets, "Previous terms backlog")
+
+If process_stage returns True → return result immediately.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. STAGE 2 — CURRENT TERM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Courses from the student's actual current term (uni_year, semester).
+
+  cur_mandatory      = eligible mandatory courses for (uni_year, semester, track)
+  cur_elective_slots = remaining_slots.get((uni_year, semester), 0)
+
+If cur_mandatory or cur_elective_slots > 0:
+  next_y, next_s = _next_term(uni_year, semester)
+  priority_sets = [next_term_names]
+  process_stage(cur_mandatory, cur_elective_slots, priority_sets,
+                "Year {uni_year} {semester} Semester")
+
+If process_stage returns True → return result immediately.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. STAGE 3 — FUTURE YEARS (same semester type)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+If credits remain after Stage 2, pull courses from future years (same
+semester type) to fill the remaining capacity.
+
+Loop: for future_y in (uni_year+1)..4:
+  fut_mandatory      = eligible mandatory courses for (future_y, semester, track)
+  fut_elective_slots = remaining_slots.get((future_y, semester), 0)
+
+  If nothing → skip this year
+
+  priority_sets = []   (no priority protection — fill aggressively)
+  process_stage(fut_mandatory, fut_elective_slots, priority_sets,
+                "Year {future_y} {semester} Semester (advanced)")
+
+  If process_stage returns True → return result immediately.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13. STAGE 4 — LEFTOVER FILL (1–2 spare credits)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Only runs if 0 < avail_credits <= 2 after all previous stages.
+Tries to use leftover credits that are too small for a full stage.
+
+Uses _stage4_candidates(avail, year, sem, track, completed, planned, earned):
+  Calls filter_courses() with year_level + semester planning-internal params
+  (not exposed in the agent tool — only planning.py uses these directly)
+  Filters: credit_hours <= avail, mandatory only, not completed, not planned,
+           prereqs met.
+
+Loop: for future_y in (uni_year+1)..4:
+  candidates = _stage4_candidates(avail_credits, future_y, ...)
+
+  If avail_credits == 2:
+    Priority 1: find a 2-credit course → add it, done
+    Priority 2: find two 1-credit courses → add both, done
+    Priority 3: find one 1-credit course → add it, done
+
+  If avail_credits == 1:
+    Find one 1-credit course → add it, done
+
+  Break as soon as any course is found.
+
+Stage 4 does NOT call process_stage() — it directly appends to suggest_courses.
+No overflow can occur here because credit_hours <= avail is enforced by the query.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14. RESULT BUILDING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_build_result() is called at the end of Stage 4 (or on early exit from
+Stages 1–3 via process_stage returning True):
+
+  planned_credits = sum of credit_hours of all suggest_courses
+  return {
+    student_id, year (uni_year), semester, track,
+    available_credits (original limit, not decremented value),
+    planned_credits, planned_courses (suggest_courses), advisor_notes
+  }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+15. COMPLETE FLOW SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  planning(student_id, supabase_client)
+    │
+    ├─ get_student_context()        → completed, track, earned, gpa, year, sem
+    ├─ credit limit from GPA        → avail_credits
+    ├─ get_all_electives_by_program → build elective_pool (not completed, prereqs met)
+    ├─ pre-compute remaining_slots  → subtract completed electives from slot totals
+    │
+    ├─ STAGE 1: backlog (same-sem previous years)
+    │    ├─ collect eligible mandatory + unfilled elective slots
+    │    ├─ process_stage([cur_names, next_names])
+    │    └─ if True → _build_result() → RETURN
+    │
+    ├─ STAGE 2: current term
+    │    ├─ collect eligible mandatory + unfilled elective slots
+    │    ├─ process_stage([next_names])
+    │    └─ if True → _build_result() → RETURN
+    │
+    ├─ STAGE 3: future years (same semester, year+1 → 4)
+    │    ├─ for each future year: collect eligible mandatory + elective slots
+    │    ├─ process_stage([])
+    │    └─ if True → _build_result() → RETURN
+    │
+    ├─ STAGE 4: leftover fill (only if 0 < avail <= 2)
+    │    └─ find 1–2 credit mandatory course from closest future year
+    │
+    └─ _build_result() → RETURN
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+16. KEY INVARIANTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- A course appears in the plan at most once (planned_names() set checked
+  before adding any course).
+- An elective appears in the plan at most once (removed from elective_pool
+  when picked; pool never grows except via return_to_pool for removed picks).
+- remaining_slots is read-only during execution; only elective_pool changes.
+- Failing grades (F, F+, F-) are excluded from completed → those courses
+  are eligible again if prereqs are met.
+- total_hours_earned is read from DB directly, never recomputed.
+- Stage 4 never causes overflow (filter enforces credit_hours <= avail).
+- Planning always terminates (finite course set, credit decrement is strict).

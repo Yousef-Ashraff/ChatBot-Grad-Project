@@ -2,7 +2,7 @@
 planning.py — Student Course Planning Function
 ===============================================
 Fully automated course planner. No print() or input() calls.
-Returns a dict with planned_courses, advisor_notes, and summary fields.
+Returns a dict with planned_courses, advisor_notes, course_details, and summary fields.
 
 Stages:
   1. Previous terms (same semester type) — backlog of missed mandatory courses
@@ -256,13 +256,14 @@ def _stage4_candidates(
 
 
 def _build_result(
-    student_id:    str,
-    year:          int,
-    semester:      str,
-    track:         str,
+    student_id:     str,
+    year:           int,
+    semester:       str,
+    track:          str,
     original_avail: int,
     suggest_courses: List[dict],
     advisor_notes:  List[str],
+    course_details: Dict[str, dict],
 ) -> dict:
     planned_credits = sum(c['credit_hours'] for c in suggest_courses)
     return {
@@ -274,6 +275,7 @@ def _build_result(
         'planned_credits':  planned_credits,
         'planned_courses':  suggest_courses,
         'advisor_notes':    advisor_notes,
+        'course_details':   course_details,
     }
 
 
@@ -291,12 +293,18 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
                          compatibility with planning_service).
 
     Returns:
-        dict with planned_courses, advisor_notes, and summary fields,
+        dict with planned_courses, advisor_notes, course_details, and summary fields,
         or None if the student record is missing.
     """
-    from neo4j_course_functions import get_all_electives_by_program
+    from neo4j_course_functions import get_all_electives_by_program, get_course_info
     from eligibility import get_student_context
-    from recommendation_service import recommend_electives
+    from recommendation_service import (
+        recommend_electives,
+        merge_preferences,
+        _top_matching_categories,
+        ELECTIVE_CATALOGUES,
+        _NEO4J_PROGRAM,
+    )
 
     advisor_notes:   List[str]  = []
     suggest_courses: List[dict] = []
@@ -328,6 +336,11 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
         f"Track: {track} | GPA: {gpa} → {avail_credits}-credit limit"
     )
 
+    # ── Student preference vector (for elective reasoning) ────────────────────
+    _student_vec, _ = merge_preferences(student_id)
+    _cat_key        = _NEO4J_PROGRAM.get(track.lower(), track.lower())
+    _catalogue      = ELECTIVE_CATALOGUES.get(_cat_key, ELECTIVE_CATALOGUES.get(track.lower(), {}))
+
     # ── Shared elective pool (shrinks as stages consume electives) ────────────
     all_electives = get_all_electives_by_program(track)
     elective_pool: List[dict] = [
@@ -337,7 +350,6 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
     ]
 
     # ── Pre-compute remaining elective slots (total minus already completed) ──
-    # Build ordered list of all terms that have slots (Year 1→4, First→Second).
     _slot_terms = [
         (y, s)
         for y in range(1, 5)
@@ -347,7 +359,6 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
     remaining_slots: Dict[Tuple[int, str], int] = {
         (y, s): get_elective_slots(track, y, s) for (y, s) in _slot_terms
     }
-    # Assign each completed elective to the first slot with remaining capacity.
     all_elective_names: Set[str] = {e['course_name'] for e in all_electives}
     for _cname in completed:
         if _cname in all_elective_names:
@@ -378,16 +389,32 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
         chosen = recommend_electives(
             student_id, track, top_n=to_pick, eligible_electives=list(elective_pool)
         )
+        result = []
         for c in chosen:
             elective_pool[:] = [e for e in elective_pool if e['course_name'] != c['course_name']]
-            advisor_notes.append(f"Selected elective '{c['course_name']}' based on preferences")
-        return [{**c, 'course_type': 'elective', 'is_elective_pick': True} for c in chosen]
+            # Compute top matching preference categories for this elective
+            name     = c['course_name'].lower()
+            profile  = _catalogue.get(name, {}).get('profile', {})
+            if profile and _student_vec:
+                top_cats = _top_matching_categories(_student_vec, profile, n=2)
+                cat_str  = " & ".join(k.replace('_', ' ') for k in top_cats) if top_cats else "your academic interests"
+            else:
+                cat_str = "your academic interests"
+            result.append({
+                **c,
+                'course_type':       'elective',
+                'is_elective_pick':  True,
+                '_stage':            'elective',
+                '_preference_cats':  cat_str,
+            })
+        return result
 
     def return_to_pool(removed: List[dict]) -> None:
         """Put removed elective picks back in the pool for later stages."""
         for c in removed:
             if c.get('is_elective_pick'):
-                base = {k: v for k, v in c.items() if k not in ('is_elective_pick',)}
+                base = {k: v for k, v in c.items()
+                        if k not in ('is_elective_pick', '_stage', '_preference_cats')}
                 elective_pool.append(base)
 
     def process_stage(
@@ -395,6 +422,7 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
         elective_slots:     int,
         priority_term_sets: List[Set[str]],
         label:              str,
+        stage_type:         str = '',
     ) -> bool:
         """
         Add eligible courses for one planning stage.
@@ -412,8 +440,14 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
         if total == 0:
             return False
 
+        def _tag(courses: List[dict]) -> List[dict]:
+            for c in courses:
+                if '_stage' not in c:
+                    c['_stage'] = stage_type
+            return courses
+
         if total <= avail_credits:
-            suggest_courses.extend(candidates)
+            suggest_courses.extend(_tag(candidates))
             avail_credits -= total
             note = f"{label}: added {len(mandatory)} mandatory course(s)"
             if elective_picks:
@@ -432,9 +466,131 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
                 candidates, avail_credits, track, advisor_notes, priority_term_sets
             )
             return_to_pool(removed)
-            suggest_courses.extend(resolved)
+            suggest_courses.extend(_tag(resolved))
             avail_credits -= sum(c['credit_hours'] for c in resolved)
             return True  # always terminate on overflow
+
+    # ── Post-stage enrichment ─────────────────────────────────────────────────
+
+    def _finalize() -> Dict[str, dict]:
+        """
+        Batch-fetch course info from Neo4j and append per-course advisor notes.
+        Each note explains WHY this student should take this course (personal,
+        motivational), WHAT they will learn, and HOW it connects to their future.
+        Returns course_details dict: {course_name: {description, motivation, code}}.
+        """
+        # Maps preference categories → career / study areas for elective notes
+        _CAT_CAREER: Dict[str, str] = {
+            'ai_ml':                  'AI and machine learning engineering',
+            'programming':            'software development and application engineering',
+            'visual_computing':       'computer vision, game development, and graphics',
+            'networking_systems':     'IoT, embedded systems, and network engineering',
+            'data_analysis':          'data analytics and business intelligence',
+            'data_management':        'database engineering and data architecture',
+            'software_engineering':   'software architecture and professional practice',
+            'math':                   'algorithm design and technical research',
+            'probability_statistics': 'data science, research, and statistical modeling',
+            'language_text':          'natural language processing and conversational AI',
+            'theory':                 'academic research and advanced algorithm design',
+            'optimization':           'operations research and performance engineering',
+        }
+
+        course_details: Dict[str, dict] = {}
+        per_course_notes: List[str] = []
+
+        for c in suggest_courses:
+            name  = c['course_name']
+            stage = c.get('_stage', '')
+            code  = c.get('course_code', '')
+            cr    = c.get('credit_hours', '?')
+
+            # Fetch description + motivation from Neo4j
+            try:
+                info_list = get_course_info(name, track)
+                info      = info_list[0] if info_list else {}
+            except Exception:
+                info = {}
+
+            desc = (info.get('description') or '').strip()
+            mot  = (info.get('motivation')  or '').strip()
+
+            course_details[name] = {'description': desc, 'motivation': mot, 'code': code}
+
+            title    = name.title()
+            code_tag = f" [{code}]" if code else ""
+            what     = mot if mot else desc   # prefer the motivation (why-focused) over raw description
+
+            if stage == 'backlog':
+                from_y = c.get('_from_year', '?')
+                from_s = c.get('_from_sem', '?')
+                note = (
+                    f"📚 {title}{code_tag} ({cr} cr) — BACKLOG from Year {from_y}, {from_s} Semester. "
+                    f"You have not yet completed this mandatory course. Skipping mandatory courses "
+                    f"can lower your GPA and block future courses that depend on it as a prerequisite. "
+                    f"Completing it now improves your academic standing and clears the path for "
+                    f"advanced courses in your curriculum."
+                )
+                if desc:
+                    note += f" What you will study: {desc}"
+
+            elif stage == 'current':
+                note = (
+                    f"📖 {title}{code_tag} ({cr} cr) — CURRENT TERM mandatory (Year {uni_year}, "
+                    f"{semester} Semester). This course is part of your official curriculum for "
+                    f"this semester. Completing it on schedule keeps your graduation plan on track "
+                    f"and ensures you do not accumulate backlog in future terms."
+                )
+                if what:
+                    note += f" What you will gain: {what}"
+
+            elif stage == 'future':
+                from_y = c.get('_from_year', '?')
+                note = (
+                    f"🔮 {title}{code_tag} ({cr} cr) — ADVANCED from Year {from_y}. "
+                    f"You still have available credit space this term, so this future course is "
+                    f"pulled forward to make the most of your allowance. Taking it now lightens "
+                    f"your workload in upcoming semesters and keeps you ahead of schedule."
+                )
+                if what:
+                    note += f" What you will gain: {what}"
+
+            elif stage == 'elective':
+                cats     = c.get('_preference_cats', '')
+                cat_list = [ct.strip() for ct in cats.split('&')] if cats else []
+                career   = ' and '.join(
+                    _CAT_CAREER.get(ct.replace(' ', '_'), ct) for ct in cat_list
+                ) if cat_list else 'your academic interests'
+                note = (
+                    f"⭐ {title}{code_tag} ({cr} cr) — ELECTIVE chosen specifically for you "
+                    f"based on your strengths in {cats if cats else 'your interests'}. "
+                    f"Your profile shows a strong affinity for these areas, and this course "
+                    f"builds directly on that foundation."
+                )
+                if what:
+                    note += f" In this course you will learn: {what}"
+                note += (
+                    f" These skills will prepare you for careers in {career} "
+                    f"and strengthen your profile for jobs and graduate study in this field."
+                )
+
+            elif stage == 'stage4':
+                note = (
+                    f"✨ {title}{code_tag} ({cr} cr) — CREDIT FILLER: you had {cr} credit(s) "
+                    f"remaining in your allowance, so this course is added to make full use of "
+                    f"your available load."
+                )
+                if what:
+                    note += f" {what}"
+
+            else:
+                note = f"• {title}{code_tag} ({cr} cr)"
+                if what:
+                    note += f" — {what}"
+
+            per_course_notes.append(note)
+
+        advisor_notes.extend(per_course_notes)
+        return course_details
 
     # ── Stage 1: Previous terms (same semester type) ──────────────────────────
     prev_mandatory:      List[dict] = []
@@ -446,27 +602,34 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
                 break
             if s != semester:
                 continue
-            prev_mandatory.extend(
-                _get_term_mandatory(y, s, track, completed, planned_names(), earned)
-            )
+            term_courses = _get_term_mandatory(y, s, track, completed, planned_names(), earned)
+            for c in term_courses:
+                c['_from_year'] = y
+                c['_from_sem']  = s
+            prev_mandatory.extend(term_courses)
             prev_elective_slots += remaining_slots.get((y, s), 0)
 
     if prev_mandatory or prev_elective_slots > 0:
-        cur_names          = _get_term_all_names(uni_year, semester, track)
-        next_y, next_s     = _next_term(uni_year, semester)
-        next_names         = _get_term_all_names(next_y, next_s, track)
+        cur_names      = _get_term_all_names(uni_year, semester, track)
+        next_y, next_s = _next_term(uni_year, semester)
+        next_names     = _get_term_all_names(next_y, next_s, track)
         if process_stage(
             prev_mandatory, prev_elective_slots,
             [cur_names, next_names],
             "Previous terms backlog",
+            stage_type='backlog',
         ):
+            cd = _finalize()
             return _build_result(student_id, uni_year, semester, track,
-                                  original_avail, suggest_courses, advisor_notes)
+                                  original_avail, suggest_courses, advisor_notes, cd)
 
     # ── Stage 2: Current term ─────────────────────────────────────────────────
-    cur_mandatory      = _get_term_mandatory(
+    cur_mandatory = _get_term_mandatory(
         uni_year, semester, track, completed, planned_names(), earned
     )
+    for c in cur_mandatory:
+        c['_from_year'] = uni_year
+        c['_from_sem']  = semester
     cur_elective_slots = remaining_slots.get((uni_year, semester), 0)
 
     if cur_mandatory or cur_elective_slots > 0:
@@ -476,15 +639,20 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
             cur_mandatory, cur_elective_slots,
             [next_names],
             f"Year {uni_year} {semester} Semester",
+            stage_type='current',
         ):
+            cd = _finalize()
             return _build_result(student_id, uni_year, semester, track,
-                                  original_avail, suggest_courses, advisor_notes)
+                                  original_avail, suggest_courses, advisor_notes, cd)
 
     # ── Stage 3: Future years (same semester), uni_year+1 → 4 ────────────────
     for future_y in range(uni_year + 1, 5):
-        fut_mandatory      = _get_term_mandatory(
+        fut_mandatory = _get_term_mandatory(
             future_y, semester, track, completed, planned_names(), earned
         )
+        for c in fut_mandatory:
+            c['_from_year'] = future_y
+            c['_from_sem']  = semester
         fut_elective_slots = remaining_slots.get((future_y, semester), 0)
 
         if not fut_mandatory and fut_elective_slots == 0:
@@ -494,9 +662,11 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
             fut_mandatory, fut_elective_slots,
             [],
             f"Year {future_y} {semester} Semester (advanced)",
+            stage_type='future',
         ):
+            cd = _finalize()
             return _build_result(student_id, uni_year, semester, track,
-                                  original_avail, suggest_courses, advisor_notes)
+                                  original_avail, suggest_courses, advisor_notes, cd)
 
     # ── Stage 4: Fill leftover 1-2 credits from closest future year ───────────
     if 0 < avail_credits <= 2:
@@ -508,38 +678,44 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
             if not candidates:
                 continue
 
+            added = None
             if avail_credits == 2:
                 two = [c for c in candidates if c.get('credit_hours') == 2]
                 if two:
-                    suggest_courses.append(two[0])
+                    added = [two[0]]
                     advisor_notes.append(
                         f"Filled 2 remaining credits with '{two[0]['course_name']}' (Year {future_y})"
                     )
-                    break
-                one = [c for c in candidates if c.get('credit_hours') == 1]
-                if len(one) >= 2:
-                    suggest_courses.extend(one[:2])
-                    advisor_notes.append(
-                        f"Filled 2 remaining credits with 2 one-credit courses (Year {future_y})"
-                    )
-                    break
-                if one:
-                    suggest_courses.append(one[0])
-                    advisor_notes.append(
-                        f"Filled 1 of 2 remaining credits with '{one[0]['course_name']}' (Year {future_y})"
-                    )
-                    break
+                else:
+                    one = [c for c in candidates if c.get('credit_hours') == 1]
+                    if len(one) >= 2:
+                        added = one[:2]
+                        advisor_notes.append(
+                            f"Filled 2 remaining credits with 2 one-credit courses (Year {future_y})"
+                        )
+                    elif one:
+                        added = [one[0]]
+                        advisor_notes.append(
+                            f"Filled 1 of 2 remaining credits with '{one[0]['course_name']}' (Year {future_y})"
+                        )
 
             elif avail_credits == 1:
                 one = [c for c in candidates if c.get('credit_hours') == 1]
                 if one:
-                    suggest_courses.append(one[0])
+                    added = [one[0]]
                     advisor_notes.append(
                         f"Filled 1 remaining credit with '{one[0]['course_name']}' (Year {future_y})"
                     )
-                    break
 
+            if added:
+                for c in added:
+                    c['_stage'] = 'stage4'
+                    c['_from_year'] = future_y
+                suggest_courses.extend(added)
+                break
+
+    cd = _finalize()
     return _build_result(
         student_id, uni_year, semester, track,
-        original_avail, suggest_courses, advisor_notes,
+        original_avail, suggest_courses, advisor_notes, cd,
     )
