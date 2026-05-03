@@ -45,8 +45,9 @@ project/
 ├── neo4j_track_functions.py   # Program/track-level KG functions (credit distribution, program info)
 ├── eligibility.py             # Prerequisite + credit-hour eligibility checker
 ├── rag_service.py             # RAG pipeline (Pinecone + HF + Groq)
-├── planning.py                # Interactive course planning function
-├── planning_service.py        # Thread bridge wrapping planning() for chatbot
+├── planning.py                # Fully automated course planner (no I/O, returns dict)
+├── planning_service.py        # Thin re-export of planning() for import compatibility
+├── recommendation_service.py  # Elective/program recommendation via preference scoring
 ├── chatbot_connector.py       # Supabase client (history + student data)
 ├── student_functions.py       # Student profile query helper
 ├── llm_client.py              # Groq LLM client with 5-key fallback
@@ -67,26 +68,24 @@ project/
 [api_server.py]          ← FastAPI HTTP server (uvicorn)
         │
         ▼
-[chatbot_api.py]         ← Main orchestration layer (routing, sessions, patching)
+[chatbot_api.py]         ← Main orchestration layer (routing, sessions)
         │
-   ┌────┴───────────────────────────┐
-   │                                │
-   ▼                                ▼
-[preprocessor.py]          [planning_service.py]
-(query cleaning)           (multi-turn planning sessions)
-   │
-   ▼
+        ▼
+[preprocessor.py]        ← Query cleaning (5-step pipeline)
+        │
+        ▼
 [agent.py]               ← LangGraph ReAct agent with Judging Loop
-   │
-   ▼
+        │
+        ▼
 [tools.py]               ← 27 LangChain tools
-   │
-   ├─► [neo4j_course_functions.py]  ← Knowledge Graph (Neo4j Aura)
-   ├─► [eligibility.py]            ← Prerequisite + credit-hour checks (Supabase)
-   ├─► [rag_service.py]            ← RAG pipeline (Pinecone + HuggingFace + Groq)
-   ├─► [student_functions.py]      ← Student profile queries (Supabase)
-   ├─► [planning_service.py]       ← Interactive multi-turn course planner
-   └─► [preference_service.py]     ← Student preference storage (Supabase)
+        │
+        ├─► [neo4j_course_functions.py]  ← Knowledge Graph (Neo4j Aura)
+        ├─► [eligibility.py]            ← Prerequisite + credit-hour checks (Supabase)
+        ├─► [rag_service.py]            ← RAG pipeline (Pinecone + HuggingFace + Groq)
+        ├─► [student_functions.py]      ← Student profile queries (Supabase)
+        ├─► [planning.py]               ← Fully automated course planner
+        ├─► [recommendation_service.py] ← Elective/program recommendation
+        └─► [preference_service.py]     ← Student preference storage (Supabase)
 ```
 
 ### Request Flow (End-to-End)
@@ -101,8 +100,7 @@ chatbot_api.chat(student_id, message)
     │
     ├─ _route_message():
     │      Priority 1: Pending ambiguity session? → _resolve_ambiguity_reply()
-    │      Priority 2: Active planning session?   → _advance_planning()
-    │      Priority 3: Normal query               → _preprocess_and_run()
+    │      Priority 2: Normal query               → _preprocess_and_run()
     │
     │   [Normal path: _preprocess_and_run()]
     │      │
@@ -124,7 +122,6 @@ _analyze_and_split(clean_query)   ← LLM decomposes multi-requirement queries
            for each sub-query:
              BNUAdvisorAgent.run_and_get_context() → accumulated_context list
            combine all contexts → single llm_call_text() synthesis
-           (if start_course_planning triggered → surface planning output directly)
     │
     ▼
 Final answer string
@@ -182,8 +179,8 @@ START → agent → dedup → tools → collect → judge
 - **dedup** — injects fake `[SKIPPED]` ToolMessage for duplicate calls.
 - **tools** — `ToolNode(ALL_TOOLS)`, executes tool calls.
 - **collect** — appends ToolMessage content to `accumulated_context` (or `silent_context` for tools in `_SILENT_TOOLS = {"store_preference"}`), increments round counter.
-- **judge** — LLM evaluates if context fully answers `original_query`. If `start_course_planning` was called → always `satisfied=true`. Handles PURE PREFERENCE STATEMENT rule: if query is only a sentiment/interest statement and `store_preference` ran → `satisfied=true` immediately. After the LLM verdict, runs the `_multi_course_deps_missing` Python post-check (see below).
-- **answer** — generates final answer from `accumulated_context`. If planning tool was called → relays planning output directly.
+- **judge** — LLM evaluates if context fully answers `original_query`. Handles PURE PREFERENCE STATEMENT rule: if query is only a sentiment/interest statement and `store_preference` ran → `satisfied=true` immediately. Recognises `start_course_planning` result (`STUDENT COURSE PLAN` header) as a complete answer to any planning query. After the LLM verdict, runs the `_multi_course_deps_missing` Python post-check (see below).
+- **answer** — generates final answer from `accumulated_context` via LLM synthesis. All tool results including planning go through the LLM — no special-casing or direct relay.
 - **reformulate** — generates new `current_query` with a different angle (7 fixed angles in order). Resets `tool_calls_this_round` to 0.
 - **clarify** — polite last-resort clarification request after all reformulations exhausted.
 
@@ -364,21 +361,70 @@ Scores are clamped to [0.0, 1.0]. Updated via `update_ai_preference(student_id, 
 
 ## Course Planning (`planning.py` + `planning_service.py`)
 
-`planning()` is an interactive function using `print()`/`input()` (originally from a notebook). `PlanningOrchestrator` wraps it for chatbot use via a thread bridge:
+`planning()` is a fully automated function — no `print()` or `input()` calls. Called directly by the `start_course_planning` tool; returns a structured dict which the answer LLM synthesises into a natural response like any other tool result.
 
-- `planning()` runs in a **daemon thread**
-- `_ThreadRouter` replaces `sys.stdout` — captures thread output into per-thread StringIO buffers
-- `_smart_input` replaces `builtins.input` — flushes output to `_out_q`, blocks on `_in_q` for student reply
-- `chatbot_api` calls `advance(state, reply)` per student message turn
-- Timeout: 90 seconds per planning event
+**Return dict:**
+```python
+{
+  'student_id':        str,
+  'year':              int,
+  'semester':          str,       # 'First' or 'Second'
+  'track':             str,
+  'available_credits': int,       # credit limit based on GPA (15 / 18 / 21)
+  'planned_credits':   int,
+  'planned_courses':   List[dict],
+  'advisor_notes':     List[str], # human-readable decisions for the LLM
+}
+```
 
-**Session lifecycle:**
-1. `start_course_planning` tool called → `_start_and_cache_planning(student_id)` (monkey-patched in `chatbot_api.py`)
-2. `PlanningOrchestrator.start()` → first prompt + `PlanningState`
-3. State stored in `_planning_sessions[student_id]`
-4. Each subsequent student message → `PlanningOrchestrator.advance(state, reply)`
-5. On `PlanStep.COMPLETE` → delete from `_planning_sessions`
-6. On `clear_history()` → also clears `_planning_sessions[student_id]`
+**Credit limit by GPA:** GPA ≥ 3.0 → 21 cr | GPA ≥ 2.0 → 18 cr | else → 15 cr
+
+**Planning stages:**
+
+| Stage | What it adds | Overflow priority sets |
+|---|---|---|
+| **1 — Backlog** | Missed mandatory + elective slots from previous same-semester terms | `[cur_term_names, next_term_names]` |
+| **2 — Current term** | Mandatory + elective slots for `(uni_year, semester)` | `[next_term_names]` |
+| **3 — Future years** | `uni_year+1` → Year 4, same semester, mandatory + elective slots | `[]` |
+| **4 — Leftover fill** | 1–2 spare credits: mandatory course from closest future year (same semester) | — |
+
+**Overflow resolution (`_resolve_overflow`):** for each priority set, removes courses whose dependents don't intersect that term's course names (ascending `len(dependents)`, electives score 0 → removed first). Then a final pass over all remaining courses. Removed elective picks are returned to the shared pool. Overflow always terminates planning.
+
+**Shared elective pool:** built once from `get_all_electives_by_program(track)`, filtered to eligible (not completed + prereqs met). Shrinks as stages consume electives via `pick_electives(n)` → `recommend_electives(..., eligible_electives=pool)` (Mode 3). Removed elective picks are returned to the pool via `return_to_pool()`.
+
+**Pre-computed remaining elective slots:** before any stage runs, `remaining_slots: Dict[Tuple[int,str], int]` is built by:
+1. Collecting all terms with slots in year/semester order
+2. Iterating completed courses — each completed elective decrements the first slot with remaining capacity
+This ensures stages never try to fill already-completed elective slots.
+
+**Stage 4 detail:** uses `filter_courses()` directly from `neo4j_course_functions` with `year_level` and `semester` params (planning-internal, not exposed to the agent tool). Also checks prereqs. Priority: 1 course of 2 cr > 2 courses of 1 cr > 1 course of 1 cr > nothing.
+
+**`_next_term(year, sem)`:** Term 1 → same year Term 2; Term 2 → next year Term 1.
+
+**`planning_service.py`** is now a thin re-export (`from planning import planning`) kept only for import-compatibility.
+
+## Recommendation Service (`recommendation_service.py`)
+
+Scores electives and programs against a merged student preference vector.
+
+**Preference sources and weights:**
+- `degree_preference` — 0.45 (from transcript grades)
+- `user_preference` — 0.35 (student signup)
+- `ai_preference` — 0.20 (agent inference during chat)
+
+**`recommend_electives(student_id, track, top_n, eligible_electives=None)`**
+
+Three modes based on the `eligible_electives` parameter:
+
+| Mode | Trigger | Output |
+|---|---|---|
+| **Mode 1** | `eligible_electives=None`, called by agent for general recommendation | Formatted string ranked by cosine similarity |
+| **Mode 2** | `eligible_electives=None`, head-to-head comparison | Formatted string |
+| **Mode 3** | `eligible_electives=List[dict]` (pre-filtered pool passed by planning) | `List[dict]` top-n electives sorted by cosine similarity — for planning-internal use only |
+
+**Mode 3 detail:** planning passes its `elective_pool` directly, bypassing the eligibility check inside the service. The service scores each pool elective against the merged student vector and returns the top-n as structured dicts. This avoids a redundant Neo4j query since the pool is already built and filtered.
+
+**Cosine similarity** between student preference vector and elective's category profile determines ranking.
 
 ## Multi-Requirement Query Splitting (`chatbot_api.py`)
 
@@ -395,9 +441,8 @@ Before every agent run, `_analyze_and_split(clean_query)` is called to detect wh
 
 **`_split_and_run(student_id, clean_query, sub_queries, history, verbose)`**
 - For each sub-query: calls `BNUAdvisorAgent.run_and_get_context()` to collect tool results without generating a per-sub-query answer.
-- Combines all `accumulated_context` lists.
-- **Planning special case:** if `start_course_planning` was triggered in any sub-query (`STUDENT COURSE PLANNING SYSTEM` in context), the planning output is returned directly (so the interactive session continues). Any non-planning context is synthesised and prepended.
-- Otherwise: single `llm_call_text()` synthesis from all combined context.
+- Combines all `accumulated_context` lists into one final `llm_call_text()` synthesis.
+- Planning output (from `start_course_planning`) is treated identically to any other tool context — no special casing.
 
 **`BNUAdvisorAgent.run_and_get_context(query, history, verbose)`** (in `agent.py`)
 - Runs the full judging loop graph (agent → tools → judge) for one sub-query.
@@ -409,14 +454,12 @@ Before every agent run, `_analyze_and_split(clean_query)` is called to detect wh
 ## Session Management (in-memory, `chatbot_api.py`)
 
 ```python
-_planning_sessions:   Dict[str, PlanningState]    # active multi-turn planning
 _ambiguity_sessions:  Dict[str, PendingAmbiguity] # waiting for disambiguation reply
 ```
 
 Routing priority in `_route_message()`:
 1. `_ambiguity_sessions[student_id]` → `_resolve_ambiguity_reply()`
-2. `_planning_sessions[student_id]` → `_advance_planning()`
-3. Neither → `_preprocess_and_run()`
+2. Neither → `_preprocess_and_run()`
 
 `_resolve_ambiguity_reply()` now checks `result.status == "ambiguous"` before proceeding — if `resolve_ambiguity()` found another chained ambiguous course, it stores the new `PendingAmbiguity` and returns the next clarification question instead of running the agent.
 
@@ -475,7 +518,9 @@ Core KG query layer. All functions accept lowercase course/program names. Code r
 | `get_course_dependencies(course_name, program_name)` | optional | 2 if given → `str`; 3 if None → `str` or `list` per prereq |
 | `get_course_closes(course_name, program_name)` | optional, defaults to all 3 | smart: single code if all programs agree, `list` if codes differ |
 | `get_all_electives_by_program(program_name)` | required | 1 | `str` via `COALESCE` |
-| `filter_courses(filters, course_types, return_fields, program_name)` | optional, defaults to all 3 | 2 | `str` via `COALESCE` |
+| `filter_courses(filters, course_types, return_fields, program_name, year_level, semester)` | optional, defaults to all 3 | 2 | `str` via `COALESCE` |
+
+**`filter_courses` planning-internal params:** `year_level` (e.g. `'Third Year'`) and `semester` (`'First'`/`'Second'`) filter by `b.year_level` and `b.semester` on the `BELONGS_TO` relationship. These params are NOT exposed in the agent's `filter_courses` tool — only `planning.py` uses them directly via `from neo4j_course_functions import filter_courses`.
 
 **`get_course_closes()` smart code derivation:** The query embeds `COALESCE(c.code, bc.code)` per program inside `program_details`. Python then collects all per-program codes; if all are identical (or only one program) → returns a plain string (Case 2); if they differ (the 6 affected courses queried across multiple programs) → returns `[{program, code}, …]` (Case 3 behaviour).
 
@@ -561,7 +606,6 @@ Manages the `ai_preference` column in the `student_preferences` Supabase table.
 ## Key Global State Patterns (not thread-safe across concurrent students)
 
 - `tools._ACTIVE_STUDENT_ID` — set before each `agent.run()` call
-- `chatbot_api._planning_sessions` — active planning sessions by student_id
 - `chatbot_api._ambiguity_sessions` — pending course disambiguation by student_id
 - `eligibility._supabase` — lazy singleton Supabase client
 - `preference_service._client` — lazy singleton Supabase client
@@ -615,18 +659,20 @@ DEBUG_LEVEL=
 2. **Dual LLM model strategy** — cheap/fast model for utility tasks; powerful model only for agent tool selection and final answer synthesis.
 3. **Judging loop over simple ReAct** — judge node ensures the agent keeps trying until context is genuinely sufficient, not just until one tool was called.
 4. **Preprocessing before agent** — agent never deals with abbreviations, pronouns, or ambiguous names; preprocessor resolves everything first.
-5. **Planning tool monkey-patching** — `chatbot_api.py` patches `start_course_planning` at import time to capture `PlanningState`, without touching `tools.py` or `agent.py`.
-6. **Thread bridge for interactive planning** — `planning.py` kept unchanged with its `print`/`input` calls; thread bridge transparently captures and routes all I/O.
-7. **Deduplication node** — prevents the agent from calling the same tool with the same args twice.
-8. **Ambiguity handled at preprocessor level** — ambiguous course names stop the pipeline before the agent runs; student picks, then pipeline continues with the resolved name.
-9. **Chained ambiguity** — when a query mentions N ambiguous courses, the preprocessor asks about them one at a time. Remaining courses are stored in `PendingAmbiguity.pending_courses` and processed after each disambiguation reply; the pipeline supports full multi-step chaining.
-10. **Multi-requirement query splitting** — instead of relying on a single agent run to handle every topic in a complex query, an LLM-based splitter decomposes the query into atomic sub-queries. Each sub-query runs its own agent pipeline to collect tool context; all contexts are then combined for one final synthesis. This guarantees every independent topic receives a dedicated lookup.
-11. **Planning in split queries** — when `start_course_planning` fires as a sub-query of a split, its output is surfaced directly (not summarised) so the interactive session continues correctly. Any co-located non-planning answer is prepended.
-12. **Chat history is a sliding window** — only last 3 user + 3 assistant messages stored in Supabase and passed to agent.
-13. **Authoritative credit count from DB** — `total_hours_earned` read directly from Supabase, never recomputed from `courses_degrees`.
-14. **Silent context for side-effects** — `store_preference` results go to `silent_context` (not `accumulated_context`) so the judge can see the side-effect was performed, but the preference update text is not included in the answer prompt. This keeps preference storage invisible to the student-facing response.
-15. **Preference inference from conversation** — the agent system prompt includes rules for detecting preference signals ("I love X", "I'm good at Y", "I hate Z") and routing them to `store_preference` before (or instead of) any factual tool calls. Pure preference statements (no factual question) are fully satisfied after `store_preference` alone — the judge marks them satisfied immediately.
-16. **Agent rules for preference vs. course completion** — the agent distinguishes "I got ML" (course completion → call `get_course_dependencies`) from "I love NLP" (preference → call `store_preference`). A `COURSE COMPLETION STATEMENT` triggers dependency lookup; a `PREFERENCE DETECTION` trigger only applies when the student expresses genuine interest/skill, not course completion.
-17. **Comparison tools kept atomic** — `compare_programs` and `compare_courses` gather full data for all items in a single call. The query splitter treats any comparison/recommend clause as a single atomic sub-query; it never breaks out individual compared items as separate sub-queries.
-18. **Python post-check for multi-course dependency coverage** — the LLM judge can be fooled into marking `satisfied=true` when a course name appears in the *body* of another course's dependency result (e.g. in a `dep_prereq` list). `_multi_course_deps_missing()` runs after the LLM verdict and deterministically verifies every quoted course in the query has its own `get_course_dependencies` header in context. If not, it overrides the verdict to `satisfied=false`. This prevents the judge from skipping uncovered courses while remaining direction-agnostic (works for prereq, dependents, or both queries). The debug box labels the missing source as `[LLM]` or `[Python override]` for traceability.
-19. **Course code split across node vs. relationship** — six courses (`machine learning`, `natural language processing`, `image processing`, `deep learning`, `computer vision`, `data mining`) have program-specific codes that differ per program. Their `code` property was removed from the Course node and migrated to the `BELONGS_TO` relationship (`r.code`). All Cypher queries follow a 3-case rule: (1/2) program context available → `COALESCE(c.code, r.code)` returning a plain string; (3) no program context → `CASE WHEN c.code IS NOT NULL` returning a `[{program, code}]` list, unwrapped by `_resolve_code()`. The `_query_courses_by_code_prefix()` filter in `neo4j_track_functions.py` uses `(c.code STARTS WITH $prefix OR r.code STARTS WITH $prefix)` so these courses are still found by prefix. The fuzzy code matchers (`course_name_mapper.py`, `preprocessor.py`) use `OPTIONAL MATCH + collect(r.code)[0]` to get any one code for matching, which is sufficient for string-identity matching.
+5. **Deduplication node** — prevents the agent from calling the same tool with the same args twice.
+6. **Ambiguity handled at preprocessor level** — ambiguous course names stop the pipeline before the agent runs; student picks, then pipeline continues with the resolved name.
+7. **Chained ambiguity** — when a query mentions N ambiguous courses, the preprocessor asks about them one at a time. Remaining courses are stored in `PendingAmbiguity.pending_courses` and processed after each disambiguation reply; the pipeline supports full multi-step chaining.
+8. **Multi-requirement query splitting** — instead of relying on a single agent run to handle every topic in a complex query, an LLM-based splitter decomposes the query into atomic sub-queries. Each sub-query runs its own agent pipeline to collect tool context; all contexts are then combined for one final synthesis. This guarantees every independent topic receives a dedicated lookup.
+9. **Planning is fully automated** — `planning()` has no `print()`/`input()` calls. It runs synchronously, returns a structured dict, and the `start_course_planning` tool formats it as a string. The answer LLM synthesises a natural response from it like any other tool result — no thread bridge, no monkey-patching, no interactive session management.
+10. **Unified answer path for planning** — planning output goes through the same LLM answer node as all other tools. The judge recognises `STUDENT COURSE PLAN` as a complete answer to planning queries (zero entities to check). No special-casing in `_split_and_run` or the answer node.
+11. **Chat history is a sliding window** — only last 3 user + 3 assistant messages stored in Supabase and passed to agent.
+12. **Authoritative credit count from DB** — `total_hours_earned` read directly from Supabase, never recomputed from `courses_degrees`.
+13. **Silent context for side-effects** — `store_preference` results go to `silent_context` (not `accumulated_context`) so the judge can see the side-effect was performed, but the preference update text is not included in the answer prompt. This keeps preference storage invisible to the student-facing response.
+14. **Preference inference from conversation** — the agent system prompt includes rules for detecting preference signals ("I love X", "I'm good at Y", "I hate Z") and routing them to `store_preference` before (or instead of) any factual tool calls. Pure preference statements (no factual question) are fully satisfied after `store_preference` alone — the judge marks them satisfied immediately.
+15. **Agent rules for preference vs. course completion** — the agent distinguishes "I got ML" (course completion → call `get_course_dependencies`) from "I love NLP" (preference → call `store_preference`). A `COURSE COMPLETION STATEMENT` triggers dependency lookup; a `PREFERENCE DETECTION` trigger only applies when the student expresses genuine interest/skill, not course completion.
+16. **Comparison tools kept atomic** — `compare_programs` and `compare_courses` gather full data for all items in a single call. The query splitter treats any comparison/recommend clause as a single atomic sub-query; it never breaks out individual compared items as separate sub-queries.
+17. **Python post-check for multi-course dependency coverage** — the LLM judge can be fooled into marking `satisfied=true` when a course name appears in the *body* of another course's dependency result (e.g. in a `dep_prereq` list). `_multi_course_deps_missing()` runs after the LLM verdict and deterministically verifies every quoted course in the query has its own `get_course_dependencies` header in context. If not, it overrides the verdict to `satisfied=false`. This prevents the judge from skipping uncovered courses while remaining direction-agnostic (works for prereq, dependents, or both queries). The debug box labels the missing source as `[LLM]` or `[Python override]` for traceability.
+18. **Course code split across node vs. relationship** — six courses (`machine learning`, `natural language processing`, `image processing`, `deep learning`, `computer vision`, `data mining`) have program-specific codes that differ per program. Their `code` property was removed from the Course node and migrated to the `BELONGS_TO` relationship (`r.code`). All Cypher queries follow a 3-case rule: (1/2) program context available → `COALESCE(c.code, r.code)` returning a plain string; (3) no program context → `CASE WHEN c.code IS NOT NULL` returning a `[{program, code}]` list, unwrapped by `_resolve_code()`. The `_query_courses_by_code_prefix()` filter in `neo4j_track_functions.py` uses `(c.code STARTS WITH $prefix OR r.code STARTS WITH $prefix)` so these courses are still found by prefix. The fuzzy code matchers (`course_name_mapper.py`, `preprocessor.py`) use `OPTIONAL MATCH + collect(r.code)[0]` to get any one code for matching, which is sufficient for string-identity matching.
+19. **Planning elective recommendation via Mode 3** — `recommend_electives` has a planning-internal Mode 3 triggered by passing `eligible_electives=pool`. This receives the pre-filtered elective pool directly (skipping redundant eligibility checks) and returns a ranked `List[dict]` rather than a formatted string. The shared pool shrinks across stages so each elective is picked at most once across the entire plan.
+20. **Pre-computed elective slot counts** — before any planning stage runs, `remaining_slots` is computed once: total slots per term minus completed electives assigned sequentially. Stages read `remaining_slots.get((year, sem), 0)` instead of calling `get_elective_slots()` directly, ensuring already-filled slots are never re-planned.
+21. **Planning Stage 4 uses extended `filter_courses`** — `filter_courses()` in `neo4j_course_functions` accepts optional `year_level` and `semester` params that filter on `BELONGS_TO` relationship properties. These are not exposed in the agent's `filter_courses` tool; only `planning.py` imports the function directly and uses them. This avoids a separate helper function while keeping the agent's API unchanged.

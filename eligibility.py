@@ -133,10 +133,12 @@ def get_student_context(student_id: str) -> dict:
 
     courses_degrees = row.get("courses_degrees") or []
 
+    _FAILING = {"f", "f+", "f-"}
     completed_courses = [
         _norm(course["name"].lower())
         for course in courses_degrees
         if isinstance(course, dict) and course.get("name")
+        and (course.get("grade") or "").strip().lower() not in _FAILING
     ]
 
     track_code   = (row.get("track") or "").strip().upper()

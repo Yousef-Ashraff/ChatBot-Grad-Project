@@ -244,6 +244,15 @@ _ANSWER_SYSTEM = (
     "   inline: 'Technical Report Writing (BCS112)' exists only in AIM and SAD; "
     "   'Fundamentals of Data Science' exists only in Data Science. "
     "   Do NOT say these BCS courses are 'specific to AIM' in the section header.\n\n"
+    "COURSE PLAN RULE:\n"
+    "When the context contains a STUDENT COURSE PLAN result:\n"
+    "- Present the recommended courses in a clean numbered table (course name, code, type, credits).\n"
+    "- Show the planned vs available credits (e.g. '16 / 21 cr').\n"
+    "- The plan is already fully optimized — the planner filled every eligible slot it could find.\n"
+    "  If planned credits < available credits, do NOT suggest filling the gap or imply more courses "
+    "  can be added. The difference simply means no more eligible courses were available for this term.\n"
+    "- Include the advisor notes only if they add meaningful context (e.g. backlog courses, overflow removed).\n"
+    "- Keep the response concise — a table + 1-2 sentence summary is enough.\n\n"
     "RESPONSE DEPTH RULE:\n"
     "Answer every part of the query fully using the data you already have.\n"
     "- If the query has multiple parts, address each one completely and separately.\n"
@@ -629,58 +638,6 @@ def _make_judge_node():
         tools_used     = state.get("tool_calls_this_round", 0)
         called_tools   = state.get("called_tools", [])
 
-        # ── Special case: planning tool is interactive ────────────────────────
-        # Check THREE independent sources for planning output — whichever is
-        # available guarantees we detect it regardless of state timing issues.
-
-        # Source 1: called_tools signatures (populated by dedup + collect nodes)
-        planning_sig = any("start_course_planning" in sig for sig in called_tools)
-
-        # Source 2: accumulated_context list
-        planning_ctx = " ".join(accum_ctx)
-
-        # Source 3: ToolMessages in state["messages"] — scan ALL, not just reversed to AIMessage
-        # The previous version broke early at AIMessage, missing the tool msg sometimes
-        tool_msg_content = ""
-        all_tool_contents = []
-        for m in state.get("messages", []):
-            if isinstance(m, ToolMessage):
-                c = getattr(m, "content", "") or ""
-                all_tool_contents.append(c)
-                if getattr(m, "name", "") == "start_course_planning":
-                    tool_msg_content = c
-
-        # Combine ALL sources
-        full_planning_ctx = " ".join([planning_ctx, tool_msg_content] + all_tool_contents)
-
-        planning_was_called = (
-            planning_sig
-            or "STUDENT COURSE PLANNING SYSTEM" in full_planning_ctx
-            or "Planning for: Year" in full_planning_ctx
-            or "STUDENT COURSE PLANNING" in full_planning_ctx
-        )
-
-        logger.warning(
-            "[Judge] planning_sig=%s tool_msg_len=%d ctx_len=%d was_called=%s",
-            planning_sig, len(tool_msg_content), len(planning_ctx), planning_was_called
-        )
-
-        if planning_was_called:
-            planning_failed = (
-                "Planning error:" in full_planning_ctx
-                or "❌ Error: Student ID" in full_planning_ctx
-                or "Error invoking tool" in full_planning_ctx
-                or "Could not start course planning" in full_planning_ctx
-            )
-            logger.warning("[Judge] planning_failed=%s", planning_failed)
-            return {
-                "satisfied":             True,
-                "judge_missing":         "",
-                "judge_missing_source":  "llm",
-                "judge_deps_check_info": "skipped — planning tool detected",
-                "judge_tools_this_round": tools_used,
-            }
-
         main_ctx = "\n\n---\n\n".join(accum_ctx) if accum_ctx else "(no data collected yet)"
         if silent_ctx:
             side_block = "\n".join(silent_ctx)
@@ -770,6 +727,12 @@ def _make_judge_node():
             f'• Best/recommended program ("which program fits me", "AIM or SAD for me"):\n'
             f'  → satisfied by a get_program_recommendation result.\n'
             f'    The result already contains all programs ranked with match percentages — done.\n'
+            f'• Course plan ("make a plan", "what should I take", "plan my semester",\n'
+            f'  "what courses should I register", "remaining requirements", "study plan"):\n'
+            f'  → satisfied by a start_course_planning result that begins with "STUDENT COURSE PLAN".\n'
+            f'    The result is a fully automated personalised plan with recommended courses and\n'
+            f'    advisor notes — this IS the complete answer. Do NOT mark as missing.\n'
+            f'    Do NOT request another tool call. List zero entities for planning queries.\n'
             f'\n'
             f'--- STEP 1: DERIVE ENTITIES FROM THE QUERY — ignore the collected data entirely ---\n'
             f'Read the student query above and answer: "What is this student explicitly asking\n'
@@ -958,29 +921,6 @@ def _make_answer_node(llm):
         original_query = state.get("original_query", "")
         accum_ctx      = state.get("accumulated_context", [])
         called_tools   = state.get("called_tools", [])
-
-        # ── Planning tool: relay its output directly — no LLM synthesis needed
-        # Check all three sources just like the judge node does
-        tool_msg_planning = ""
-        for m in reversed(state.get("messages", [])):
-            if isinstance(m, ToolMessage):
-                if getattr(m, "name", "") == "start_course_planning":
-                    tool_msg_planning = getattr(m, "content", "") or ""
-                    break
-            elif isinstance(m, AIMessage):
-                break
-
-        ctx_str = " ".join(accum_ctx) + " " + tool_msg_planning
-        planning_was_called = (
-            any("start_course_planning" in sig for sig in called_tools)
-            or "STUDENT COURSE PLANNING SYSTEM" in ctx_str
-            or "Planning for: Year" in ctx_str
-        )
-        if planning_was_called:
-            # Return the planning output — prefer ToolMessage content if richer
-            planning_output = tool_msg_planning or "\n".join(accum_ctx)
-            from langchain_core.messages import AIMessage as _AI
-            return {"messages": [_AI(content=planning_output)]}
 
         context = (
             "\n\n---\n\n".join(accum_ctx)

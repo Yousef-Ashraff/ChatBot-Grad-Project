@@ -34,7 +34,7 @@ def get_student_details(student_id = os.getenv("STUDENT_ID")):
             "gpa":               student_data.get("gpa", 0.0),
             "total_hours_earned": student_data.get("total_hours_earned", 0),
             "courses_degrees":   courses_degrees,
-            "completed_courses": [c["name"] for c in courses_degrees if isinstance(c, dict) and "name" in c],
+            "completed_courses": [c["name"] for c in courses_degrees if isinstance(c, dict) and "name" in c and (c.get("grade") or "").strip().lower() not in {"f", "f+", "f-"}],
             "semester_gpas":     student_data.get("semester_gpas") or {},
             # ── LinkedIn ──────────────────────────────────────────────────
             "linkedin":          student_data.get("linkedin", ""),
