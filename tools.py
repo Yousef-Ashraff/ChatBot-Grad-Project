@@ -475,30 +475,55 @@ def answer_academic_question(question: str) -> str:
 @tool
 def start_course_planning() -> str:
     """
-    The entry point for a personalised, multi-turn interactive course planning
-    session that builds a study plan tailored to the student's record and goals.
+    Build a personalised, fully automated course plan for the student based on
+    their academic record, track, GPA, and course preferences.
 
-    Belongs to requests for a planned path: semester recommendations,
-    identifying remaining graduation requirements, personalised scheduling.
-
-    Calling this tool ends the current tool-selection loop — the student then
-    enters a dedicated planner conversation. Do not call any other tool in the
-    same round as this one. Not for one-off prerequisite checks
-    (get_course_dependencies) or single-course eligibility
-    (check_course_eligibility). No parameters; uses the student record
-    automatically.
+    Use for requests about semester plans, study schedules, remaining graduation
+    requirements, or personalised course sequencing. Not for one-off prerequisite
+    checks (get_course_dependencies) or single-course eligibility
+    (check_course_eligibility). No parameters; uses the student record automatically.
     """
-    # NOTE: chatbot_api.py patches this function at startup to also capture
-    # the PlanningState for multi-turn continuation.
     sid = _get_student_id()
     try:
-        from planning_service import PlanningOrchestrator
+        from planning import planning
         from chatbot_connector import ChatbotConnector
         supabase_client = ChatbotConnector().client
-        message, _ = PlanningOrchestrator.start(sid, supabase_client)
-        return message or "Course planning session started."
+        result = planning(sid, supabase_client)
+        if not result:
+            return "Could not generate a course plan — student record may be incomplete."
+
+        lines = [
+            "STUDENT COURSE PLAN",
+            f"Year {result['year']} | {result['semester']} Semester | {result['track'].title()}",
+            f"Planned Credits: {result['planned_credits']} / {result['available_credits']} available",
+        ]
+
+        notes = result.get('advisor_notes', [])
+        if notes:
+            lines.append("")
+            lines.append("Planning notes:")
+            for note in notes:
+                lines.append(f"  • {note}")
+
+        courses = result.get('planned_courses', [])
+        if courses:
+            lines.append("")
+            lines.append("Recommended courses:")
+            for i, course in enumerate(courses, 1):
+                name  = course.get('course_name', 'Unknown')
+                cr    = course.get('credit_hours', '?')
+                ctype = course.get('course_type', 'course')
+                code  = course.get('course_code', '')
+                tag   = f" [{code}]" if code else ""
+                lines.append(f"  {i}. {name}{tag} — {cr} cr ({ctype})")
+        else:
+            lines.append("")
+            lines.append("No courses could be planned for this term.")
+
+        return "\n".join(lines)
+
     except Exception as exc:
-        return f"Could not start course planning: {exc}"
+        return f"Could not generate a course plan: {exc}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

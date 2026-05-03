@@ -935,7 +935,7 @@ def check_course_eligibility(course_name, prerequisites=None, completed_courses=
     return result
 
 
-def filter_courses(filters=None, course_types=None, return_fields=None, program_name=None, course_list=None):
+def filter_courses(filters=None, course_types=None, return_fields=None, program_name=None, course_list=None, year_level=None, semester=None):
     """
     Filter courses based on min_hours_to_enroll and credit_hours.
 
@@ -961,6 +961,14 @@ def filter_courses(filters=None, course_types=None, return_fields=None, program_
                       If None, uses all programs.
 
         course_list: Optional list of course names (strings) to limit the search to.
+
+        year_level: Optional year string to filter by (e.g. 'Third Year').
+                    Matches b.year_level on the BELONGS_TO relationship.
+                    Not exposed via the agent tool — for internal planning use only.
+
+        semester: Optional semester string to filter by ('First' or 'Second').
+                  Matches b.semester on the BELONGS_TO relationship.
+                  Not exposed via the agent tool — for internal planning use only.
 
     Returns:
         List of course dictionaries matching the filter criteria.
@@ -1006,6 +1014,16 @@ def filter_courses(filters=None, course_types=None, return_fields=None, program_
         course_list_lower = [name.lower() for name in course_list]
         query_parts.append("AND toLower(c.name) IN $course_list")
         params['course_list'] = course_list_lower
+
+    # Optional: filter by year level (planning-internal only, not exposed in agent tool)
+    if year_level is not None:
+        query_parts.append("AND b.year_level = $year_level")
+        params['year_level'] = year_level
+
+    # Optional: filter by semester (planning-internal only, not exposed in agent tool)
+    if semester is not None:
+        query_parts.append("AND b.semester = $semester")
+        params['semester'] = semester
 
     # Optional: filter by course type
     if len(normalized_types) == 1:

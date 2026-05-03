@@ -520,7 +520,8 @@ def recommend_electives(
     top_n: int = 5,
     course_names: Optional[List[str]] = None,
     skip_course_info: bool = False,
-) -> str:
+    eligible_electives: Optional[List[dict]] = None,
+) -> "str | List[dict]":
     """
     Two modes:
 
@@ -543,6 +544,23 @@ def recommend_electives(
     catalogue  = ELECTIVE_CATALOGUES.get(canonical, {})
 
     student_vec, sources = merge_preferences(student_id)
+
+    # ── Mode 3: planning auto-select ─────────────────────────────────────────
+    if eligible_electives is not None:
+        if not student_vec:
+            return eligible_electives[:top_n]
+        cat_key = _NEO4J_PROGRAM.get(canonical, canonical)
+        mode3_catalogue = ELECTIVE_CATALOGUES.get(cat_key, ELECTIVE_CATALOGUES.get(canonical, {}))
+        scored = []
+        for elective in eligible_electives:
+            name = elective['course_name'].lower()
+            data = mode3_catalogue.get(name, {})
+            profile = data.get('profile', {})
+            score = _cosine(student_vec, profile) if profile else 0.0
+            scored.append((elective, score))
+        scored.sort(key=lambda x: -x[1])
+        return [e for e, _ in scored[:top_n]]
+
     if not student_vec:
         return (
             "No preference data found yet. "

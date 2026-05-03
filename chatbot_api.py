@@ -14,26 +14,10 @@ Public functions
 How chat() works
 ────────────────
   1. Load the student's recent chat history from Supabase.
-  2. Check if there is an active multi-turn course planning session:
-       YES  → forward the student's reply to PlanningOrchestrator.advance()
-       NO   → run the BNUAdvisorAgent (LangGraph ReAct loop)
-  3. If the agent calls the start_course_planning tool, the PlanningState
-     is captured via a patched version of the tool (see bottom of this file)
-     and cached in _planning_sessions[student_id].
-  4. Save both the user message and the agent's response to Supabase.
-
-Planning session lifecycle
-──────────────────────────
-  start_course_planning tool called
-        │
-        ▼  chatbot_api captures PlanningState
-  _planning_sessions[student_id] = state
-        │
-        ▼  next student message
-  PlanningOrchestrator.advance(state, reply)
-        │
-        ▼  when state.current_step == PlanStep.COMPLETE
-  del _planning_sessions[student_id]
+  2. Route message:
+       a. Pending ambiguity session? → resolve disambiguation reply
+       b. Normal query              → preprocess → BNUAdvisorAgent
+  3. Save both the user message and the agent's response to Supabase.
 """
 
 from __future__ import annotations
@@ -51,13 +35,6 @@ from dotenv import load_dotenv
 from eligibility import TRACK_MAP as _TRACK_MAP
 
 load_dotenv()
-
-# ── In-memory planning session cache ─────────────────────────────────────────
-# Maps student_id → active PlanningState object.
-# PlanningState is produced by PlanningOrchestrator.start() and consumed
-# turn-by-turn by PlanningOrchestrator.advance().
-# Cleared on clear_history() or when planning completes.
-_planning_sessions: Dict[str, Any] = {}
 
 # ── In-memory ambiguity session cache ────────────────────────────────────────
 # Maps student_id → PendingAmbiguity object.
@@ -170,15 +147,14 @@ def get_student_info(student_id: str) -> Dict[str, Any]:
 
 def clear_history(student_id: str) -> Dict[str, Any]:
     """
-    Clear the student's chat history and cancel any active planning session.
+    Clear the student's chat history and any pending disambiguation session.
     Call this on logout or when the student starts a fresh conversation.
     """
     try:
         from chatbot_connector import ChatbotConnector
         ChatbotConnector().clear_chat_history(student_id)
 
-        # Cancel any in-progress planning or ambiguity session
-        _planning_sessions.pop(student_id, None)
+        # Cancel any pending ambiguity session
         _ambiguity_sessions.pop(student_id, None)
 
         return {"ok": True, "student_id": student_id}
@@ -220,8 +196,7 @@ def _route_message(
 
     Priority order:
     1. Pending ambiguity  → student is answering a disambiguation question
-    2. Active planning    → student is in a multi-turn planning session
-    3. Normal query       → preprocess → agent
+    2. Normal query       → preprocess → agent
     """
 
     # ── 1. Resolve pending ambiguity ──────────────────────────────────────
@@ -229,12 +204,7 @@ def _route_message(
     if pending_ambiguity is not None:
         return _resolve_ambiguity_reply(student_id, message, pending_ambiguity)
 
-    # ── 2. Active planning session ────────────────────────────────────────
-    active_state = _planning_sessions.get(student_id)
-    if active_state is not None:
-        return _advance_planning(student_id, message, active_state)
-
-    # ── 3. Preprocess → agent ─────────────────────────────────────────────
+    # ── 2. Preprocess → agent ─────────────────────────────────────────────
     return _preprocess_and_run(student_id, message, history)
 
 
@@ -541,35 +511,6 @@ def _split_and_run(
         agent = BNUAdvisorAgent(student_id=student_id)
         return agent.run(query=clean_query, history=history, verbose=verbose)
 
-    # ── Planning special case ─────────────────────────────────────────────
-    # If start_course_planning was called in any sub-query, the planning
-    # session is now cached in _planning_sessions[student_id].  We must
-    # surface the planning output directly so the student sees the
-    # interactive prompt and the session continues normally on the next turn.
-    _PLANNING_SIG = "STUDENT COURSE PLANNING SYSTEM"
-    planning_ctxs    = [c for c in all_contexts if _PLANNING_SIG in c]
-    non_planning_ctxs = [c for c in all_contexts if _PLANNING_SIG not in c]
-
-    if planning_ctxs:
-        planning_output = planning_ctxs[0]
-        if non_planning_ctxs:
-            # Synthesise the non-planning parts first, then append the
-            # planning prompt so the student gets both pieces of info.
-            if verbose:
-                _box("✅  ANSWER NODE  →  generating final response", [], force=True)
-            other_answer = _get_answer_llm().invoke([
-                SystemMessage(content=_ANSWER_SYSTEM),
-                HumanMessage(content=(
-                    f"Student question: {clean_query}\n\n"
-                    f"Information from the BNU database:\n"
-                    + "\n\n---\n\n".join(non_planning_ctxs)
-                    + "\n\nAnswer only the non-planning part of the question."
-                )),
-            ]).content
-            return f"{other_answer}\n\n---\n\n{planning_output}"
-        # Only planning context — return it directly
-        return planning_output
-
     if verbose:
         _box("✅  ANSWER NODE  →  generating final response", [], force=True)
 
@@ -583,102 +524,6 @@ def _split_and_run(
             "Answer the question clearly and concisely based on the information above."
         )),
     ]).content
-
-
-def _advance_planning(student_id: str, reply: str, state: Any) -> str:
-    """
-    Drive the next turn of an active planning session.
-
-    Args:
-        student_id: The student's ID.
-        reply:      The student's latest answer to the planner's prompt.
-        state:      PlanningState cached from the previous turn.
-
-    Returns:
-        The planner's next message, or a completion notice when done.
-    """
-    try:
-        from planning_service import PlanningOrchestrator, PlanStep
-
-        next_message, new_state = PlanningOrchestrator.advance(state, reply)
-
-        if new_state is None or new_state.current_step == PlanStep.COMPLETE:
-            # Planning is done — remove the cached session
-            _planning_sessions.pop(student_id, None)
-            return (
-                next_message
-                or "✅ Your course plan is complete! Feel free to ask me anything else."
-            )
-
-        # Update cached state for the next turn
-        _planning_sessions[student_id] = new_state
-        return next_message or "Please continue with the planning session."
-
-    except Exception as exc:
-        # If the planner breaks, clean up and report the error gracefully
-        _planning_sessions.pop(student_id, None)
-        return (
-            f"The planning session encountered an issue ({exc}). "
-            "Please try starting a new planning session."
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Planning tool patch
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# The LangGraph agent calls tools.start_course_planning, which by default
-# discards the PlanningState object.  We patch it here at startup to instead
-# route through _start_and_cache_planning(), which captures the state and
-# stores it in _planning_sessions so subsequent messages can call advance().
-#
-# This keeps tools.py and agent.py free of any chatbot_api imports while
-# still wiring up the multi-turn planning lifecycle correctly.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _start_and_cache_planning() -> str:
-    """
-    Start a PlanningOrchestrator session, cache the state, return first message.
-    This replaces the default start_course_planning tool implementation.
-    Student ID is read from tools._ACTIVE_STUDENT_ID (same as all other tools).
-    """
-    try:
-        from planning_service import PlanningOrchestrator, PlanStep
-        from chatbot_connector import ChatbotConnector
-        import tools as _tools
-
-        student_id               = _tools._get_student_id()
-        supabase_client          = ChatbotConnector().client
-        first_message, state     = PlanningOrchestrator.start(student_id, supabase_client)
-
-        # Cache state only if planning is not already complete
-        if state is not None and state.current_step != PlanStep.COMPLETE:
-            _planning_sessions[student_id] = state
-
-        return first_message or "Course planning session started."
-
-    except Exception as exc:
-        return f"Could not start course planning: {exc}"
-
-
-def _patch_planning_tool() -> None:
-    """
-    Monkey-patch the start_course_planning tool in tools.py to use
-    _start_and_cache_planning() so the PlanningState is captured.
-    """
-    try:
-        import tools as _tools
-        for t in _tools.ALL_TOOLS:
-            if t.name == "start_course_planning":
-                # Replace the underlying function while preserving tool metadata
-                t.func = _start_and_cache_planning
-                break
-    except Exception:
-        pass  # Non-critical — falls back to the original (stateless) impl.
-
-
-# Apply the patch immediately when this module is imported
-_patch_planning_tool()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
