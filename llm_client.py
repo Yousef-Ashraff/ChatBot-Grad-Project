@@ -49,7 +49,9 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # GROQ_MODEL_XXX: used for judge, reformulate, preprocessor, entity extraction, etc.
 # GROQ_MODEL_AGENT: used by the agent LLM (set in agent.py via GROQ_MODEL_AGENT env var)
+# GROQ_MODEL_TRANSLATE: used by language_service.py for Arabic/Franco translation
 GROQ_MODEL = os.getenv("GROQ_MODEL_XXX", "meta-llama/llama-4-scout-17b-16e-instruct")
+GROQ_MODEL_TRANSLATE = os.getenv("GROQ_MODEL_TRANSLATE", "llama-3.3-70b-versatile")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5 independent key slots
@@ -77,12 +79,12 @@ def _is_rate_limit(exc: Exception) -> bool:
 # Low-level Groq callers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_groq(api_key: str, messages: List[Dict], temperature: float, max_tokens: int) -> str:
+def _call_groq(api_key: str, messages: List[Dict], temperature: float, max_tokens: int, model: str = None) -> str:
     """Blocking full-response call."""
     from groq import Groq
     client = Groq(api_key=api_key)
     resp = client.chat.completions.create(
-        model=GROQ_MODEL,
+        model=model or GROQ_MODEL,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
@@ -121,10 +123,12 @@ def llm_call(
     temperature: float = 0.3,
     max_tokens: int = 600,
     retry_delay: float = 0.5,
+    model: str = None,
 ) -> str:
     """
     Blocking chat request — cycles through key slots on rate-limit errors.
     Raises RuntimeError if every configured key slot fails.
+    Pass model= to override the default GROQ_MODEL (e.g. for translation).
     """
     attempted: List[str] = []
     last_error: Optional[Exception] = None
@@ -138,7 +142,7 @@ def llm_call(
         attempted.append(slot_name)
 
         try:
-            result = _call_groq(api_key, messages, temperature, max_tokens)
+            result = _call_groq(api_key, messages, temperature, max_tokens, model=model or GROQ_MODEL)
             if len(attempted) > 1:
                 logger.info("LLM succeeded on fallback key slot '%s'", slot_name)
             return result

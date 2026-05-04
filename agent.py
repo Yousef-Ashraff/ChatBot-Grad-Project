@@ -1867,14 +1867,28 @@ if __name__ == "__main__":
             print("\nGoodbye! 👋")
             break
 
+        original_lang = "english"
         try:
+            # ── Language detection + input translation ────────────────────
+            from language_service import (
+                detect_and_translate_input,
+                translate_to_arabic,
+                translate_history_to_english,
+            )
+            original_lang, english_input = detect_and_translate_input(user_input)
+            english_history = (
+                translate_history_to_english(session_history)
+                if original_lang != "english"
+                else session_history
+            )
+
             # ── Route to active planning session first ────────────────────
             if (
                 _planning_available
                 and student_id in _chatbot_api._planning_sessions
             ):
                 state = _chatbot_api._planning_sessions[student_id]
-                response, state = PlanningOrchestrator.advance(state, user_input)
+                response, state = PlanningOrchestrator.advance(state, english_input)
                 if state.current_step == PlanStep.COMPLETE:
                     del _chatbot_api._planning_sessions[student_id]
             else:
@@ -1883,17 +1897,17 @@ if __name__ == "__main__":
 
                 # ── Resolve pending ambiguity ─────────────────────────────
                 if pending_ambiguity is not None:
-                    result          = pre.resolve_ambiguity(pending_ambiguity, user_input)
+                    result          = pre.resolve_ambiguity(pending_ambiguity, english_input)
                     pending_ambiguity = None
                 else:
-                    result = pre.process(user_input, session_history)
+                    result = pre.process(english_input, english_history)
 
                 # ── Route based on preprocessor outcome ──────────────────
                 if result.status == "ambiguous":
                     pending_ambiguity = result.pending
                     response          = result.clarification
                 else:
-                    clean_query = result.clean_query or user_input
+                    clean_query = result.clean_query or english_input
                     if args.verbose:
                         print()   # blank line before agent boxes
 
@@ -1907,7 +1921,7 @@ if __name__ == "__main__":
                                 student_id  = student_id,
                                 clean_query = clean_query,
                                 sub_queries = sub_queries,
-                                history     = session_history,
+                                history     = english_history,
                                 verbose     = args.verbose,
                             )
                             split_done = True
@@ -1915,9 +1929,13 @@ if __name__ == "__main__":
                     if not split_done:
                         response = agent.run(
                             query   = clean_query,
-                            history = session_history,
+                            history = english_history,
                             verbose = args.verbose,
                         )
+
+            # ── Translate response back to student's language ─────────────
+            if original_lang != "english":
+                response = translate_to_arabic(response)
 
         except Exception as exc:
             pending_ambiguity = None   # clear stale state on error
@@ -1932,6 +1950,7 @@ if __name__ == "__main__":
         print()
 
         # Keep last 6 messages (3 user + 3 assistant) — mirrors Supabase
-        session_history.append({"role": "user",      "content": user_input})
-        session_history.append({"role": "assistant",  "content": response})
+        response_lang = "arabic" if original_lang != "english" else "english"
+        session_history.append({"role": "user",      "content": user_input,  "lang": original_lang})
+        session_history.append({"role": "assistant",  "content": response,    "lang": response_lang})
         session_history = session_history[-6:]

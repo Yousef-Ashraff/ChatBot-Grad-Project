@@ -73,25 +73,48 @@ def chat(student_id: str, message: str) -> Dict[str, Any]:
 
     try:
         from chatbot_connector import ChatbotConnector
+        from language_service import (
+            detect_and_translate_input,
+            translate_to_arabic,
+            translate_history_to_english,
+        )
         connector = ChatbotConnector()
 
         # ── 1. Load chat history for context continuity ───────────────────
-        # Supabase stores the last 3 user + 3 assistant messages.
-        # We pass them to the agent so it can continue naturally mid-session.
         chat_data = connector.get_chat_history(student_id)
         history   = chat_data.get("chat_history", []) if chat_data else []
 
-        # ── 2. Route message ──────────────────────────────────────────────
-        response = _route_message(student_id, message, history)
+        # ── 2. Detect language + translate input to English ───────────────
+        original_lang, english_message = detect_and_translate_input(message)
 
-        # ── 3. Persist to Supabase ────────────────────────────────────────
-        connector.add_message(student_id, "user",      message)
-        connector.add_message(student_id, "assistant", response)
+        # ── 3. Translate history window to English if needed ──────────────
+        english_history = (
+            translate_history_to_english(history)
+            if original_lang != "english"
+            else history
+        )
+
+        # ── 4. Route through pipeline (always English) ────────────────────
+        response = _route_message(student_id, english_message, english_history)
+
+        # ── 5. Translate response back to student's language if needed ─────
+        if original_lang != "english":
+            final_response = translate_to_arabic(response)
+            response_lang  = "arabic"
+        else:
+            final_response = response
+            response_lang  = "english"
+
+        # ── 6. Persist to Supabase ────────────────────────────────────────
+        # Store the original (untranslated) user message so the mobile app
+        # displays what the student actually typed.
+        connector.add_message(student_id, "user",      message,        lang=original_lang)
+        connector.add_message(student_id, "assistant", final_response, lang=response_lang)
 
         return {
             "ok":         True,
             "student_id": student_id,
-            "response":   response,
+            "response":   final_response,
         }
 
     except Exception as exc:

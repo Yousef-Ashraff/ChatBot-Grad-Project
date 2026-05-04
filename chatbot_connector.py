@@ -112,19 +112,25 @@ class ChatbotConnector:
             return student.get("academic_details")
         return None
     
-    def add_message(self, student_id: str, role: str, content: str):
+    def add_message(self, student_id: str, role: str, content: str, lang: str = "english"):
         """
         Add a message to student's chat history.
         Maintains only the last 3 user messages and 3 assistant messages.
-        
+
+        lang: detected language of this message — stored so history translation
+              can skip re-detection on future turns.
+              user messages      : 'english' | 'arabic' | 'franco-arabic'
+              assistant messages : 'english' | 'arabic'
+
         For Google Sheets logging: Stores user message, then logs both together
         when assistant message arrives (one row per conversation turn).
-        
+
         Args:
             student_id: The unique student ID
             role: Either 'user' or 'assistant'
             content: The message content
-            
+            lang: Language label for this message (default 'english')
+
         Returns:
             bool: True if successful, False otherwise
         """
@@ -143,7 +149,8 @@ class ChatbotConnector:
             new_message = {
                 "role": role,
                 "content": content,
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+                "lang": lang,
             }
             
             # Add new message
