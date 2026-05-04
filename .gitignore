@@ -27,3 +27,10 @@ Deleted_files/
 # Misc
 demo.txt
 demo2
+
+
+
+*.txt
+conversation_history*
+prompt*
+plan*

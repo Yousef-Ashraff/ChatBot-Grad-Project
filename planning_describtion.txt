@@ -11,7 +11,7 @@ Called by: start_course_planning tool in tools.py
 planning() is a fully automated function — no print() or input() calls.
 It returns a structured dict. The start_course_planning tool formats that
 dict into a plain string, which the answer LLM then synthesises into a
-natural response like any other tool result.
+natural, advisor-style response like any other tool result.
 
 Return dict:
   {
@@ -21,8 +21,11 @@ Return dict:
     'track':             str,
     'available_credits': int,           # credit ceiling based on GPA
     'planned_credits':   int,           # sum of all planned course credits
-    'planned_courses':   List[dict],    # each: {course_name, credit_hours, course_type, course_code}
-    'advisor_notes':     List[str],     # human-readable log of planning decisions
+    'planned_courses':   List[dict],    # each: {course_name, credit_hours,
+                                        #        course_type, course_code, _stage,
+                                        #        _from_year, _from_sem, ...}
+    'advisor_notes':     List[str],     # stage summaries + per-course motivational notes
+    'course_details':    Dict[str,dict] # {course_name: {description, motivation, code}}
   }
 
 Returns None if the student record is missing or has no program_name.
@@ -36,7 +39,8 @@ get_student_context(student_id) is called — one Supabase query fetching:
 
   completed:  Set[str]  — course names from courses_degrees[].name (lowercased)
                           ONLY courses where grade is NOT in {F, F+, F-}
-                          (failing grades mean the course is not completed)
+                          Failing grades mean the course is NOT completed —
+                          it remains eligible to plan again if prereqs are met.
   track:      str       — canonical Neo4j program name
                           (e.g. "artificial intelligence & machine learning")
   earned:     int       — total_hours_earned from DB (authoritative, not recomputed)
@@ -59,7 +63,26 @@ overflow occurs.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-4. SHARED ELECTIVE POOL (Step 3)
+4. STUDENT PREFERENCE VECTOR (Step 3)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+merge_preferences(student_id) is called ONCE at the top of planning().
+Returns (_student_vec, sources) — the merged preference vector across:
+  degree_preference  0.45  (from transcript grades)
+  user_preference    0.35  (student signup)
+  ai_preference      0.20  (agent-inferred during chat)
+
+Also resolved once:
+  _cat_key    — canonical key for looking up the elective catalogue
+  _catalogue  — ELECTIVE_CATALOGUES[_cat_key] — the track's elective profile map
+
+These are used by pick_electives() to compute per-elective category alignment
+and career connection notes. The extra Supabase call is acceptable since
+recommend_electives() also calls merge_preferences() internally.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SHARED ELECTIVE POOL (Step 4)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 A single elective_pool list is built once and shared across all stages:
@@ -77,7 +100,7 @@ overflow resolution, it is RETURNED to elective_pool via return_to_pool().
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-5. PRE-COMPUTED ELECTIVE SLOT COUNTS (Step 4)
+6. PRE-COMPUTED ELECTIVE SLOT COUNTS (Step 5)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 get_elective_slots(track, year, semester) returns the total number of
@@ -115,7 +138,7 @@ Example:
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-6. ELECTIVE SELECTION — pick_electives(n)
+7. ELECTIVE SELECTION — pick_electives(n)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Called by each stage to pick n electives from the shared pool.
@@ -130,8 +153,15 @@ Called by each stage to pick n electives from the shared pool.
          merged preference vector and the elective's category profile
        - Returns top-n as List[dict], sorted by score descending
        - If student has no preference data → returns first n from pool as-is
-  4. Chosen electives are removed from elective_pool
-  5. Each is tagged: course_type='elective', is_elective_pick=True
+  4. For each chosen elective:
+       - Remove it from elective_pool (can't be picked again)
+       - Look up its profile in _catalogue
+       - Compute top-2 matching preference categories via _top_matching_categories()
+       - Store the category string as '_preference_cats' on the course dict
+         (e.g. "programming & visual computing")
+       - Tag the course dict with '_stage': 'elective' and 'is_elective_pick': True
+  5. Returns the tagged elective dicts — NO advisor_notes written here.
+     The per-elective motivational note is written later by _finalize().
 
 Preference vector merge weights used inside recommend_electives:
   degree_preference  0.45  (from transcript grades)
@@ -140,7 +170,7 @@ Preference vector merge weights used inside recommend_electives:
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-7. PREREQUISITE CHECK — _check_prereqs(course, track, completed, earned)
+8. PREREQUISITE CHECK — _check_prereqs(course, track, completed, earned)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Calls get_course_dependencies(course, track, dependents=False) → Neo4j.
@@ -151,7 +181,25 @@ Returns True only if ALL prerequisites pass.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-8. STAGE EXECUTION — process_stage(mandatory, elective_slots, priority_sets, label)
+9. COURSE TAGGING (applied during stage execution)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Every course dict added to suggest_courses is tagged with metadata so
+_finalize() can later generate the correct motivational note:
+
+  _stage:      'backlog' | 'current' | 'future' | 'elective' | 'stage4'
+  _from_year:  int  — which curriculum year the course belongs to
+  _from_sem:   str  — 'First' or 'Second'
+
+Tagging happens in two places:
+  - Mandatory courses: tagged in the Stage loops BEFORE calling process_stage()
+  - Elective courses:  tagged inside pick_electives() when building the result list
+  - process_stage():   applies _stage to any course not already tagged
+  - Stage 4:           courses tagged inline before appending to suggest_courses
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. STAGE EXECUTION — process_stage(mandatory, elective_slots, priority_sets, label, stage_type)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Every stage calls process_stage() which:
@@ -159,10 +207,12 @@ Every stage calls process_stage() which:
   2. Combines: candidates = mandatory + elective_picks
   3. Computes total credits of candidates
   4. If total == 0 → nothing to add, return False (continue to next stage)
+  5. Tags any untagged course in candidates with stage_type
 
   Case A — total <= avail_credits:
     Adds all candidates to suggest_courses
     Decrements avail_credits by total
+    Appends a stage summary note to advisor_notes (e.g. "Stage: added 3 mandatory + 2 elective")
     If avail_credits == 0 → returns True (planning complete)
     Otherwise → returns False (continue to next stage)
 
@@ -173,12 +223,12 @@ Every stage calls process_stage() which:
     Calls return_to_pool() for any removed elective picks
     Returns True (always terminate after overflow)
 
-process_stage returns True  → planning stops, build and return result
+process_stage returns True  → planning stops, _finalize() then _build_result()
 process_stage returns False → next stage executes
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-9. OVERFLOW RESOLUTION — _resolve_overflow(courses, avail, track, notes, priority_sets)
+11. OVERFLOW RESOLUTION — _resolve_overflow(courses, avail, track, notes, priority_sets)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Removes courses from the candidate list until sum(credit_hours) <= avail.
@@ -206,72 +256,74 @@ Priority term sets per stage:
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-10. STAGE 1 — PREVIOUS TERMS BACKLOG
+12. STAGE 1 — PREVIOUS TERMS BACKLOG
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Collects all missed courses from previous years, same semester type.
 
 Loop: for y in 1..uni_year, for s in [First, Second]:
-  Stop inner loop when (y == uni_year AND s == semester)  ← don't go past current
-  Skip if s != semester                                   ← same semester type only
+  Stop inner loop when (y == uni_year AND s == semester)
+  Skip if s != semester  (same semester type only)
 
-  prev_mandatory += eligible mandatory courses for (y, s, track)
+  term_courses = _get_term_mandatory(y, s, track, ...)
+  Tag each course: _from_year=y, _from_sem=s   ← BEFORE process_stage
+  prev_mandatory += term_courses
   prev_elective_slots += remaining_slots.get((y, s), 0)
-
-"Eligible mandatory" means: in Neo4j curriculum for that term, NOT in
-completed, NOT already planned, and prereqs are met.
 
 If prev_mandatory or prev_elective_slots > 0:
   priority_sets = [cur_term_names, next_term_names]
-  process_stage(prev_mandatory, prev_elective_slots, priority_sets, "Previous terms backlog")
+  process_stage(prev_mandatory, prev_elective_slots, priority_sets,
+                "Previous terms backlog", stage_type='backlog')
 
-If process_stage returns True → return result immediately.
+If process_stage returns True → _finalize() → _build_result() → RETURN.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-11. STAGE 2 — CURRENT TERM
+13. STAGE 2 — CURRENT TERM
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Courses from the student's actual current term (uni_year, semester).
 
-  cur_mandatory      = eligible mandatory courses for (uni_year, semester, track)
+  cur_mandatory = _get_term_mandatory(uni_year, semester, track, ...)
+  Tag each course: _from_year=uni_year, _from_sem=semester
   cur_elective_slots = remaining_slots.get((uni_year, semester), 0)
 
 If cur_mandatory or cur_elective_slots > 0:
   next_y, next_s = _next_term(uni_year, semester)
   priority_sets = [next_term_names]
   process_stage(cur_mandatory, cur_elective_slots, priority_sets,
-                "Year {uni_year} {semester} Semester")
+                "Year {uni_year} {semester} Semester", stage_type='current')
 
-If process_stage returns True → return result immediately.
+If process_stage returns True → _finalize() → _build_result() → RETURN.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-12. STAGE 3 — FUTURE YEARS (same semester type)
+14. STAGE 3 — FUTURE YEARS (same semester type)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 If credits remain after Stage 2, pull courses from future years (same
 semester type) to fill the remaining capacity.
 
 Loop: for future_y in (uni_year+1)..4:
-  fut_mandatory      = eligible mandatory courses for (future_y, semester, track)
+  fut_mandatory = _get_term_mandatory(future_y, semester, track, ...)
+  Tag each course: _from_year=future_y, _from_sem=semester
   fut_elective_slots = remaining_slots.get((future_y, semester), 0)
 
   If nothing → skip this year
 
   priority_sets = []   (no priority protection — fill aggressively)
   process_stage(fut_mandatory, fut_elective_slots, priority_sets,
-                "Year {future_y} {semester} Semester (advanced)")
+                "Year {future_y} {semester} Semester (advanced)",
+                stage_type='future')
 
-  If process_stage returns True → return result immediately.
+  If process_stage returns True → _finalize() → _build_result() → RETURN.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-13. STAGE 4 — LEFTOVER FILL (1–2 spare credits)
+15. STAGE 4 — LEFTOVER FILL (1–2 spare credits)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Only runs if 0 < avail_credits <= 2 after all previous stages.
-Tries to use leftover credits that are too small for a full stage.
 
 Uses _stage4_candidates(avail, year, sem, track, completed, planned, earned):
   Calls filter_courses() with year_level + semester planning-internal params
@@ -290,61 +342,184 @@ Loop: for future_y in (uni_year+1)..4:
   If avail_credits == 1:
     Find one 1-credit course → add it, done
 
-  Break as soon as any course is found.
+  Each added course is tagged: _stage='stage4', _from_year=future_y
 
 Stage 4 does NOT call process_stage() — it directly appends to suggest_courses.
 No overflow can occur here because credit_hours <= avail is enforced by the query.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-14. RESULT BUILDING
+16. POST-STAGE ENRICHMENT — _finalize()
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_build_result() is called at the end of Stage 4 (or on early exit from
-Stages 1–3 via process_stage returning True):
+Called once at every exit point (before each _build_result() call).
+Iterates over suggest_courses, fetches course info from Neo4j, and appends
+a per-course motivational advisor note to advisor_notes.
+
+For each planned course:
+
+  A. Fetch course info:
+       get_course_info(course_name, track) → description + motivation
+
+  B. Store in course_details dict:
+       course_details[name] = {description, motivation, code}
+     (returned in the planning result dict)
+
+  C. Generate motivational note based on _stage tag:
+
+     📚 BACKLOG (_stage='backlog'):
+       "You have not yet completed this mandatory course from Year X, Sem Y.
+        Skipping mandatory courses can lower your GPA and block future courses
+        that depend on it. Completing it now improves your academic standing
+        and clears the path for advanced courses."
+        + "What you will study: [description]"
+
+     📖 CURRENT (_stage='current'):
+       "This course is part of your official curriculum for Year X, Sem Y.
+        Completing it on schedule keeps your graduation plan on track and
+        ensures you do not accumulate backlog in future terms."
+        + "What you will gain: [motivation or description]"
+
+     🔮 FUTURE (_stage='future'):
+       "You still have available credit space, so this Year X course is
+        pulled forward. Taking it now lightens your workload in upcoming
+        semesters and keeps you ahead of schedule."
+        + "What you will gain: [motivation or description]"
+
+     ⭐ ELECTIVE (_stage='elective'):
+       "Chosen specifically for you based on your strengths in [_preference_cats].
+        Your profile shows a strong affinity for these areas."
+        + "In this course you will learn: [motivation or description]"
+        + "These skills will prepare you for careers in [_CAT_CAREER lookup]
+           and strengthen your profile for jobs and graduate study."
+
+     ✨ STAGE4 (_stage='stage4'):
+       "You had X credit(s) remaining, so this course is added to make
+        full use of your available load."
+        + "[motivation or description]"
+
+  D. All per-course notes are appended to advisor_notes AFTER the
+     stage summary notes, so the output order is:
+       1. Planning header note
+       2. Stage summary notes ("Stage: added N mandatory + M electives")
+       3. Per-course motivational notes (one per planned course)
+
+_CAT_CAREER mapping (used in elective notes):
+  'ai_ml'                → 'AI and machine learning engineering'
+  'programming'          → 'software development and application engineering'
+  'visual_computing'     → 'computer vision, game development, and graphics'
+  'networking_systems'   → 'IoT, embedded systems, and network engineering'
+  'data_analysis'        → 'data analytics and business intelligence'
+  'data_management'      → 'database engineering and data architecture'
+  'software_engineering' → 'software architecture and professional practice'
+  'math'                 → 'algorithm design and technical research'
+  'probability_statistics'→ 'data science, research, and statistical modeling'
+  'language_text'        → 'natural language processing and conversational AI'
+  'theory'               → 'academic research and advanced algorithm design'
+  'optimization'         → 'operations research and performance engineering'
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+17. RESULT BUILDING — _build_result()
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Called after _finalize() at every exit point:
 
   planned_credits = sum of credit_hours of all suggest_courses
   return {
     student_id, year (uni_year), semester, track,
     available_credits (original limit, not decremented value),
-    planned_credits, planned_courses (suggest_courses), advisor_notes
+    planned_credits, planned_courses (suggest_courses),
+    advisor_notes, course_details
   }
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-15. COMPLETE FLOW SUMMARY
+18. TOOL FORMATTER (tools.py — start_course_planning)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Formats the planning dict into a plain string passed to the answer LLM:
+
+  STUDENT COURSE PLAN
+  Year X | Semester | Track
+  Planned Credits: N / M available
+
+  Planning notes:
+    • [stage summary 1]
+    • [stage summary 2]
+    • 📚 [backlog course note — WHY + what you'll study]
+    • 📖 [current course note — WHY + what you'll gain]
+    • ⭐ [elective note — WHY chosen + what you'll learn + career connection]
+    • ...
+
+  Recommended courses:
+    1. course name [CODE] — N cr (mandatory)
+    2. course name [CODE] — N cr (elective)
+    ...
+
+NOTE: descriptions are NOT repeated in the course list — they appear only
+once in the advisor notes section above. This prevents duplication in the
+LLM context.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+19. LLM ANSWER PROMPT (agent.py — COURSE PLAN RULE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The answer LLM is instructed to write a warm, advisor-style response with:
+
+  1. OPENING LINE   — one sentence: track, semester, credits summary
+  2. COURSE TABLE   — numbered table: #, Course (code), Type, Credits
+  3. PERSONAL REASONING — for EVERY course, a 2-4 sentence paragraph covering:
+       WHY this course is in YOUR plan right now  (from the emoji-prefixed note)
+       WHAT you will learn                         (from description/motivation)
+       HOW it helps you going forward              (career/graduation/schedule)
+     Rules per prefix:
+       📚 — stress GPA impact, graduation requirement, blocking risk
+       📖 — confirm scheduled curriculum, importance for track
+       🔮 — explain spare credits, lightens future semesters
+       ⭐ — mention matching categories, describe skills, connect to career areas
+       ✨ — explain leftover credits, briefly describe the course
+  4. CLOSING LINE   — encouraging; if planned < available do NOT suggest more
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+20. COMPLETE FLOW SUMMARY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   planning(student_id, supabase_client)
     │
-    ├─ get_student_context()        → completed, track, earned, gpa, year, sem
+    ├─ get_student_context()        → completed (no F grades), track, earned, gpa, year, sem
     ├─ credit limit from GPA        → avail_credits
+    ├─ merge_preferences()          → _student_vec, _cat_key, _catalogue
     ├─ get_all_electives_by_program → build elective_pool (not completed, prereqs met)
     ├─ pre-compute remaining_slots  → subtract completed electives from slot totals
     │
     ├─ STAGE 1: backlog (same-sem previous years)
-    │    ├─ collect eligible mandatory + unfilled elective slots
-    │    ├─ process_stage([cur_names, next_names])
-    │    └─ if True → _build_result() → RETURN
+    │    ├─ collect eligible mandatory (tagged _from_year/_from_sem) + unfilled slots
+    │    ├─ process_stage([cur_names, next_names], stage_type='backlog')
+    │    └─ if True → _finalize() → _build_result() → RETURN
     │
     ├─ STAGE 2: current term
-    │    ├─ collect eligible mandatory + unfilled elective slots
-    │    ├─ process_stage([next_names])
-    │    └─ if True → _build_result() → RETURN
+    │    ├─ collect eligible mandatory (tagged) + unfilled elective slots
+    │    ├─ process_stage([next_names], stage_type='current')
+    │    └─ if True → _finalize() → _build_result() → RETURN
     │
     ├─ STAGE 3: future years (same semester, year+1 → 4)
-    │    ├─ for each future year: collect eligible mandatory + elective slots
-    │    ├─ process_stage([])
-    │    └─ if True → _build_result() → RETURN
+    │    ├─ for each future year: collect eligible mandatory (tagged) + slots
+    │    ├─ process_stage([], stage_type='future')
+    │    └─ if True → _finalize() → _build_result() → RETURN
     │
     ├─ STAGE 4: leftover fill (only if 0 < avail <= 2)
-    │    └─ find 1–2 credit mandatory course from closest future year
+    │    └─ find 1–2 credit mandatory course, tag _stage='stage4'
     │
+    ├─ _finalize()   → batch-fetch Neo4j course info → per-course advisor notes
+    │                  → course_details dict
     └─ _build_result() → RETURN
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-16. KEY INVARIANTS
+21. KEY INVARIANTS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 - A course appears in the plan at most once (planned_names() set checked
@@ -356,4 +531,8 @@ Stages 1–3 via process_stage returning True):
   are eligible again if prereqs are met.
 - total_hours_earned is read from DB directly, never recomputed.
 - Stage 4 never causes overflow (filter enforces credit_hours <= avail).
+- _finalize() is always called exactly once before _build_result().
+- course_details and per-course advisor notes are never written before
+  _finalize() — so no partial notes if planning exits early from Stage 1/2/3.
+- Descriptions appear in advisor notes only (not repeated in the course list).
 - Planning always terminates (finite course set, credit decrement is strict).
