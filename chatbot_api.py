@@ -271,6 +271,23 @@ def _preprocess_and_run(
     # "ready" or "passthrough" — we have a clean query
     clean_query = result.clean_query or message
 
+    # ── Lecture mode — bypass the agent entirely ───────────────────────────
+    # When a lecture PDF is attached, answer directly with llm_call_text.
+    # The agent is NOT used: its system prompt + tool schemas alone cost
+    # ~6 000 tokens, which overflows the 8 000 TPM cap when lecture text
+    # is added on top.  A direct LLM call uses only the lecture + question.
+    try:
+        import lecture_service
+        lecture = lecture_service.get_lecture_context(student_id)
+        if lecture:
+            print(f"\n📖 LECTURE MODE active for {student_id!r} — '{lecture['name']}' "
+                  f"({len(lecture['text'])} chars) — bypassing agent")
+            return _answer_from_lecture(clean_query, lecture, history)
+    except Exception as exc:
+        logger.warning("[chatbot_api] lecture bypass error: %s", exc)
+        print(f"⚠️  lecture bypass error: {exc}")
+        # Fall through to normal agent if something goes wrong
+
     sub_queries = _analyze_and_split(clean_query)
     if len(sub_queries) > 1:
         return _split_and_run(student_id, clean_query, sub_queries, history)
@@ -312,6 +329,73 @@ def _resolve_ambiguity_reply(
     from agent import BNUAdvisorAgent
     agent = BNUAdvisorAgent(student_id=student_id)
     return agent.run(query=clean_query, history=pending.history)
+
+
+def _answer_from_lecture(question: str, lecture: dict, history: list) -> str:
+    """
+    Answer a student question using ONLY the attached lecture PDF content.
+    Bypasses the LangGraph agent entirely — uses a direct llm_call_text()
+    so we never send tool schemas or agent system prompts alongside the
+    lecture text (which would exceed the 8 000-token TPM limit).
+
+    Args:
+        question: The student's (preprocessed) question.
+        lecture:  Dict with keys "text" (str) and "name" (str).
+        history:  Recent conversation turns for multi-turn context.
+
+    Returns:
+        The LLM's answer as a plain string.
+    """
+    from llm_client import llm_call_text, GROQ_MODEL_XXX
+
+    lecture_name = lecture["name"]
+    lecture_text = lecture["text"]
+
+    # Fit within ~5 000 chars of lecture text to leave room for the question,
+    # history, and the system prompt while staying well under 8 000 tokens.
+    MAX_LECTURE_CHARS = 5_000
+    if len(lecture_text) > MAX_LECTURE_CHARS:
+        lecture_text = lecture_text[:MAX_LECTURE_CHARS] + "\n… [truncated]"
+
+    # Build a compact history block (last 3 turns max)
+    history_block = ""
+    if history:
+        turns = []
+        for turn in history[-6:]:
+            role = "Student" if turn.get("role") == "user" else "Advisor"
+            turns.append(f"{role}: {turn.get('content', '')[:200]}")
+        if turns:
+            history_block = "\n\nPrevious conversation:\n" + "\n".join(turns)
+
+    system = (
+        "You are the BNU Academic Advisor helping a student understand their lecture material. "
+        "Answer ONLY based on the lecture content provided — do not use outside knowledge. "
+        "If the lecture does not contain enough information to answer, say so clearly. "
+        "Be concise and use bullet points or bold text where helpful. "
+        "Never mention tools, databases, or system internals."
+    )
+
+    user = (
+        f"Lecture: {lecture_name}\n\n"
+        f"--- LECTURE CONTENT ---\n{lecture_text}\n--- END OF LECTURE ---"
+        f"{history_block}\n\n"
+        f"Student question: {question}"
+    )
+
+    try:
+        return llm_call_text(
+            system=system,
+            user=user,
+            temperature=0.3,
+            max_tokens=1000,
+            model=GROQ_MODEL_XXX,   # utility model — lower token cost, no tool schema overhead
+        )
+    except Exception as exc:
+        logger.error("[_answer_from_lecture] LLM call failed: %s", exc)
+        return (
+            "I had trouble reading the lecture content. "
+            "Please try again or rephrase your question."
+        )
 
 
 def _analyze_and_split(clean_query: str) -> List[str]:

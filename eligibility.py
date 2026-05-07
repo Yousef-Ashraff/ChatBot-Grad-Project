@@ -53,6 +53,78 @@ def _norm(name: str) -> str:
     return name.replace(" and ", " & ")
 
 
+# ── Fuzzy completed-course membership ────────────────────────────────────────
+
+_SIMILARITY_THRESHOLD = 0.88  # 88% — catches OCR drift without false positives
+
+
+def _similarity(a: str, b: str) -> float:
+    """
+    Token-based Jaccard similarity between two course name strings.
+    Falls back to SequenceMatcher for short names (<=3 tokens) where
+    character-level OCR drift matters more than word overlap.
+    """
+    import re
+    from difflib import SequenceMatcher
+
+    tok_a = set(re.split(r"[\s\W]+", a.strip()))
+    tok_b = set(re.split(r"[\s\W]+", b.strip()))
+    tok_a.discard("")
+    tok_b.discard("")
+
+    if not tok_a or not tok_b:
+        return 0.0
+
+    # Short names: character-level matcher handles "history" vs "histery" etc.
+    if len(tok_a) <= 3 or len(tok_b) <= 3:
+        return SequenceMatcher(None, a, b).ratio()
+
+    # Longer names: token Jaccard
+    intersection = len(tok_a & tok_b)
+    union = len(tok_a | tok_b)
+    return intersection / union if union else 0.0
+
+
+class FuzzyCompletedSet:
+    """
+    Drop-in replacement for a plain set[str] of completed course names.
+
+    ``name in fuzzy_set`` returns True when *name* exactly matches OR
+    when any member scores >= _SIMILARITY_THRESHOLD against *name*.
+
+    This handles OCR variants like:
+      - "data structures" vs "data structure"
+      - "graduation project 1" vs "grad project 1"
+      - "history of science & technology" vs "history of science and technology"
+
+    Usage:
+        completed = FuzzyCompletedSet(ctx["completed_courses"])
+        if "data structures" in completed:   # True even for OCR variants
+            ...
+    """
+
+    def __init__(self, names: list) -> None:
+        self._names = [_norm(n.lower()) for n in names]
+        self._exact = set(self._names)
+
+    def __contains__(self, item) -> bool:
+        if not isinstance(item, str):
+            return False
+        key = _norm(item.lower())
+        if key in self._exact:
+            return True
+        return any(_similarity(key, n) >= _SIMILARITY_THRESHOLD for n in self._names)
+
+    def __iter__(self):
+        return iter(self._names)
+
+    def __len__(self):
+        return len(self._names)
+
+    def __repr__(self):
+        return f"FuzzyCompletedSet({self._names!r})"
+
+
 # ── Supabase client (lazy singleton) ─────────────────────────────────────────
 
 _supabase = None
@@ -121,7 +193,7 @@ def get_student_context(student_id: str) -> dict:
 
     if not row:
         return {
-            "completed_courses":  [],
+            "completed_courses":  FuzzyCompletedSet([]),
             "program_name":       None,
             "total_hours_earned": 0,
             "university_year":    None,
@@ -134,12 +206,13 @@ def get_student_context(student_id: str) -> dict:
     courses_degrees = row.get("courses_degrees") or []
 
     _FAILING = {"f", "f+", "f-"}
-    completed_courses = [
-        _norm(course["name"].lower())
+    raw_completed = [
+        course["name"]
         for course in courses_degrees
         if isinstance(course, dict) and course.get("name")
         and (course.get("grade") or "").strip().lower() not in _FAILING
     ]
+    completed_courses = FuzzyCompletedSet(raw_completed)
 
     track_code   = (row.get("track") or "").strip().upper()
     program_name = TRACK_MAP.get(track_code)

@@ -71,7 +71,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GROQ_MODEL_AGENT         = os.getenv("GROQ_MODEL_AGENT", "openai/gpt-oss-120b")
-MAX_TOOL_CALLS_PER_ROUND = 3   # max tool call rounds per query/reformulation
+GROQ_MODEL_ANSWER        = os.getenv("GROQ_MODEL_AGENT", "openai/gpt-oss-120b")
+MAX_TOOL_CALLS_PER_ROUND = 3
 MAX_REFORMULATIONS       = 3   # max reformulations before giving up
 
 
@@ -181,6 +182,7 @@ _ANSWER_SYSTEM = (
     "Match answer length to the question: short for simple queries, detailed "
     "for complex ones. "
     "Use **bold** for key terms, bullet points for lists. "
+    "NEVER use markdown tables — always use bullet lists instead. "
     "Do NOT cite article numbers, source names, or tool names. "
     "If the context is insufficient, say so and suggest the student contact "
     "the registrar's office.\n"
@@ -250,9 +252,10 @@ _ANSWER_SYSTEM = (
     "Structure it as follows:\n\n"
     "1. OPENING LINE — one sentence summarising the plan "
     "(track, semester, planned vs available credits).\n\n"
-    "2. COURSE TABLE — numbered table: #, Course (code), Type, Credits. "
-    "Mark electives with '★ Elective'.\n\n"
-    "3. PERSONAL REASONING — after the table, for EVERY course write 2-4 sentences that speak "
+    "2. COURSE LIST — a plain bullet list (no tables). For each course write:\n"
+    "   • **Course Name (CODE)** — Type — N cr\n"
+    "   Mark electives with '★ Elective'.\n\n"
+    "3. PERSONAL REASONING — after the list, for EVERY course write 2-4 sentences that speak "
     "directly to the student. Use the advisor notes (📚 📖 🔮 ⭐ ✨ prefixed lines) as your source. "
     "Each paragraph must cover THREE things: WHY this course is in YOUR plan right now, "
     "WHAT you will learn, and HOW it helps you going forward. Rules per category:\n"
@@ -272,7 +275,8 @@ _ANSWER_SYSTEM = (
     "fully optimized. Say something like: 'This is the best plan possible given your current "
     "eligibility — stay focused and you will be right on track.'\n\n"
     "TONE: warm, direct, and personal. Say 'you' and 'your'. Never mention tools, databases, "
-    "planning stages, system internals, or emoji prefixes in the response.\n\n"
+    "planning stages, system internals, or emoji prefixes in the response.\n"
+    "FORMATTING: never use markdown tables anywhere in your response — use bullet lists only.\n\n"
     "RESPONSE DEPTH RULE:\n"
     "Answer every part of the query fully using the data you already have.\n"
     "- If the query has multiple parts, address each one completely and separately.\n"
@@ -348,35 +352,24 @@ _LLM_INSTANCE:        Optional[ChatGroq] = None
 _LLM_ANSWER_INSTANCE: Optional[ChatGroq] = None
 
 
-def _make_llm(max_tokens: int) -> ChatGroq:
-    """Build a ChatGroq instance with key fallback at a given max_tokens budget."""
-    key_env_vars = [
-        "GROQ_API_KEY", "GROQ_API_KEY2", "GROQ_API_KEY3",
-        "GROQ_API_KEY4", "GROQ_API_KEY5",
-    ]
-    active_keys = [
-        os.getenv(v, "").strip()
-        for v in key_env_vars
-        if os.getenv(v, "").strip()
-    ]
-    if not active_keys:
-        raise ValueError(
-            "No Groq API keys found. "
-            "Set GROQ_API_KEY (and optionally GROQ_API_KEY2…5) in .env"
+def _make_llm(max_tokens: int, model: str = None) -> ChatGroq:
+    """Build a ChatGroq instance using the configured Groq API key and model."""
+    from llm_client import _GROQ_KEYS, _current_key_idx
+    if not _GROQ_KEYS:
+        raise RuntimeError(
+            "No Groq API keys configured. Add GROQ_API_KEY to your .env file."
         )
-    instances = [
-        ChatGroq(api_key=k, model=GROQ_MODEL_AGENT, temperature=0.1, max_tokens=max_tokens)
-        for k in active_keys
-    ]
-    primary = instances[0]
-    return primary.with_fallbacks(instances[1:]) if len(instances) > 1 else primary
+    return ChatGroq(
+        api_key=_GROQ_KEYS[_current_key_idx],
+        model=model or GROQ_MODEL_AGENT,
+        temperature=0.1,
+        max_tokens=max_tokens,
+    )
 
 
 def _get_llm() -> ChatGroq:
     """
-    Agent / tool-selection LLM — kept at 1500 max output tokens so the total
-    request (input + max_tokens) stays within Groq's per-request limit for
-    openai/gpt-oss-120b (8 000 TPM on the free tier).
+    Agent / tool-selection LLM — 1500 max output tokens.
     """
     global _LLM_INSTANCE
     if _LLM_INSTANCE is None:
@@ -386,7 +379,7 @@ def _get_llm() -> ChatGroq:
 
 def _get_answer_llm() -> ChatGroq:
     """
-    Answer / clarify LLM — uses 4096 max output tokens so detailed responses
+    Answer / clarify LLM — 4096 max output tokens so detailed responses
     (e.g. full program comparisons) are never truncated mid-list.
     Only used by the answer and clarify nodes, whose input context is smaller
     than the agent node's (no tool schemas attached).
@@ -1832,7 +1825,7 @@ if __name__ == "__main__":
     print("  🎓  BNU Academic Advisor  (LangGraph  ·  Judging Loop)")
     print("=" * 60)
     print(f"  Student ID  : {student_id}")
-    print(f"  Model (agent) : {GROQ_MODEL_AGENT}")
+    print(f"  Groq Model    : {GROQ_MODEL_AGENT}")
     print(f"  Max tools   : {MAX_TOOL_CALLS_PER_ROUND} / round, "
           f"{MAX_REFORMULATIONS} reformulations max")
     print(f"  Debug mode  : {'ON — full judging loop shown' if args.verbose else 'OFF (use --verbose)'}")

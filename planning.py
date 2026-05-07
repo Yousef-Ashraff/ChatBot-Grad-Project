@@ -106,11 +106,11 @@ def _get_term_mandatory(
                 for course in programs[track]:
                     if course.get('course_type') != 'mandatory':
                         continue
-                    name = course['course_name']
+                    name = course['course_name'].lower()
                     if name in completed or name in planned:
                         continue
                     if _check_prereqs(name, track, completed, earned):
-                        result.append(course)
+                        result.append({**course, 'course_name': name})
     return result
 
 
@@ -124,7 +124,7 @@ def _get_term_all_names(year: int, sem: str, track: str) -> Set[str]:
             for _, programs in semesters.items():
                 if track in programs:
                     for course in programs[track]:
-                        names.add(course['course_name'])
+                        names.add(course['course_name'].lower())
     return names
 
 
@@ -343,6 +343,9 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
 
     # ── Shared elective pool (shrinks as stages consume electives) ────────────
     all_electives = get_all_electives_by_program(track)
+    # Normalise names to lowercase so they match the completed set (which is also lowercase)
+    for e in all_electives:
+        e['course_name'] = e['course_name'].lower()
     elective_pool: List[dict] = [
         e for e in all_electives
         if e['course_name'] not in completed
