@@ -58,6 +58,7 @@ from langchain_core.messages import (
     AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage,
 )
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -70,8 +71,8 @@ from llm_client import llm_call_json, llm_call_text
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-GROQ_MODEL_AGENT         = os.getenv("GROQ_MODEL_AGENT", "openai/gpt-oss-120b")
-GROQ_MODEL_ANSWER        = os.getenv("GROQ_MODEL_AGENT", "openai/gpt-oss-120b")
+MODEL_AGENT         = os.getenv("MODEL_AGENT", "openai/gpt-oss-120b")
+GROQ_MODEL_ANSWER        = os.getenv("MODEL_AGENT", "openai/gpt-oss-120b")
 MAX_TOOL_CALLS_PER_ROUND = 3
 MAX_REFORMULATIONS       = 3   # max reformulations before giving up
 
@@ -129,6 +130,17 @@ _AGENT_SYSTEM = (
     "machine learning' course (fully quoted) would be. "
     "Never pass an unquoted term as a course_name or program_name parameter.\n"
     "\nRULES:\n"
+    "0. get_student_info FIELD SELECTION — always pass only the fields the query needs:\n"
+    "   'what is my GPA'                 → fields=['gpa']\n"
+    "   'what year am I in'              → fields=['university_year']\n"
+    "   'what is my track/program'       → fields=['track']\n"
+    "   'how many credits do I have'     → fields=['total_hours_earned']\n"
+    "   'what courses have I completed'  → fields=['completed_courses']\n"
+    "   'show me my grades'              → fields=['courses_degrees']\n"
+    "   'what is my GPA history'         → fields=['gpa','semester_gpas']\n"
+    "   'tell me about my profile/info'  → fields=None (full profile)\n"
+    "   NEVER omit fields= for a narrow question — passing all data for a "
+    "single-field query floods the context and wastes the judge's capacity.\n"
     "1. Call exactly one tool — never write a prose answer.\n"
     "2. Never call the same tool with the same parameters as a previous call.\n"
     "3. Choose the tool whose description BEST matches the query intent.\n"
@@ -161,15 +173,28 @@ _AGENT_SYSTEM = (
     "  When direction is genuinely uncertain, always use both=True rather than guessing.\n"
     "  No surface keyword (close, open, unlock, need, require) reliably signals direction.\n"
     "  Always resolve from meaning: what would a correct answer to this query look like?\n"
-    "8. PREFERENCE DETECTION — call store_preference whenever the student expresses "
+    "8. GPA QUERIES — three patterns, each maps to a different tool:\n"
+    "   a. CURRENT GPA ('what is my GPA?', 'show me my GPA') → get_student_info.\n"
+    "   b. PROJECTED GPA ('if I get 85 in X and 90 in Y, what will my GPA be?') → "
+    "calculate_projected_gpa. Pass new_courses as a list of {name, percentage} objects. "
+    "Course names must be the exact canonical names from the query.\n"
+    "   c. TARGET GPA ('I want my GPA to be X', 'how do I reach GPA X', "
+    "'I want to increase my GPA', 'what do I need to improve my GPA') → "
+    "calculate_target_gpa with target_gpa=X. "
+    "If the student says they do NOT want many courses or want the minimum number of courses, "
+    "pass optimization='minimize_grade'. Otherwise use the default 'maximize_credits'.\n"
+    "   NEVER call both calculate_projected_gpa and calculate_target_gpa in the same run — "
+    "they serve different intents. Use get_student_info only for the plain 'what is my GPA' "
+    "intent, not for projection or target scenarios.\n"
+    "9. PREFERENCE DETECTION — call store_preference whenever the student expresses "
     "interest, love, skill, weakness, background, or emotion about any subject "
     "(e.g. 'I love NLP', 'I'm good at math', 'I hate theory', 'coding is easy for me'). "
     "Exclude course completion statements (rule 7).\n"
-    "   8a. PURE PREFERENCE (no factual question): if the message is ONLY a sentiment "
+    "   9a. PURE PREFERENCE (no factual question): if the message is ONLY a sentiment "
     "statement with no factual question embedded, call store_preference and DO NOT call "
     "any other tool. The judge will mark the query satisfied after store_preference alone. "
     "Do not fetch course info, prerequisites, or any other data.\n"
-    "   8b. PREFERENCE + FACTUAL QUESTION: if the message expresses a preference AND asks "
+    "   9b. PREFERENCE + FACTUAL QUESTION: if the message expresses a preference AND asks "
     "a factual question (e.g. 'I love NLP, what are its prerequisites?'), call "
     "store_preference FIRST. After it completes you will be called again — then call the "
     "appropriate factual tool to answer the question.\n"
@@ -348,26 +373,36 @@ _ANSWER_SYSTEM = (
 # LLM factory
 # ─────────────────────────────────────────────────────────────────────────────
 
-_LLM_INSTANCE:        Optional[ChatGroq] = None
-_LLM_ANSWER_INSTANCE: Optional[ChatGroq] = None
+_LLM_INSTANCE:        Optional[object] = None
+_LLM_ANSWER_INSTANCE: Optional[object] = None
 
 
-def _make_llm(max_tokens: int, model: str = None) -> ChatGroq:
-    """Build a ChatGroq instance using the configured Groq API key and model."""
+def _make_llm(max_tokens: int, model: str = None):
+    """Build a ChatOpenAI (OpenRouter) or ChatGroq instance depending on the model."""
+    chosen = model or MODEL_AGENT
+    if chosen == MODEL_AGENT:
+        from llm_client import _OPENROUTER_KEY, _OPENROUTER_BASE_URL
+        if not _OPENROUTER_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY not configured. Add it to your .env file.")
+        return ChatOpenAI(
+            api_key=_OPENROUTER_KEY,
+            base_url=_OPENROUTER_BASE_URL,
+            model=chosen,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
     from llm_client import _GROQ_KEYS, _current_key_idx
     if not _GROQ_KEYS:
-        raise RuntimeError(
-            "No Groq API keys configured. Add GROQ_API_KEY to your .env file."
-        )
+        raise RuntimeError("No Groq API keys configured. Add GROQ_API_KEY to your .env file.")
     return ChatGroq(
         api_key=_GROQ_KEYS[_current_key_idx],
-        model=model or GROQ_MODEL_AGENT,
+        model=chosen,
         temperature=0.1,
         max_tokens=max_tokens,
     )
 
 
-def _get_llm() -> ChatGroq:
+def _get_llm():
     """
     Agent / tool-selection LLM — 1500 max output tokens.
     """
@@ -377,7 +412,7 @@ def _get_llm() -> ChatGroq:
     return _LLM_INSTANCE
 
 
-def _get_answer_llm() -> ChatGroq:
+def _get_answer_llm():
     """
     Answer / clarify LLM — 4096 max output tokens so detailed responses
     (e.g. full program comparisons) are never truncated mid-list.
@@ -1825,7 +1860,7 @@ if __name__ == "__main__":
     print("  🎓  BNU Academic Advisor  (LangGraph  ·  Judging Loop)")
     print("=" * 60)
     print(f"  Student ID  : {student_id}")
-    print(f"  Groq Model    : {GROQ_MODEL_AGENT}")
+    print(f"  Agent Model   : {MODEL_AGENT}  (OpenRouter)")
     print(f"  Max tools   : {MAX_TOOL_CALLS_PER_ROUND} / round, "
           f"{MAX_REFORMULATIONS} reformulations max")
     print(f"  Debug mode  : {'ON — full judging loop shown' if args.verbose else 'OFF (use --verbose)'}")

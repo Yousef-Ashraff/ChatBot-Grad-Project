@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.136.1",
     "google>=3.0.0",
     "groq>=0.4.1",
+    "openai>=1.0.0",
     "gspread>=6.2.1",
     "huggingface-hub>=1.4.1",
     "langchain>=1.2.8",

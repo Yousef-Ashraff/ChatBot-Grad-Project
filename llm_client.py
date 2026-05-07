@@ -1,18 +1,22 @@
 """
-llm_client.py — Centralized Groq LLM Client with 5-Key Fallback & Streaming
-=============================================================================
+llm_client.py — Centralized LLM Client with Groq + OpenRouter routing
+=======================================================================
 
 All LLM calls in the project import from here.
-Uses the Groq SDK directly — fast, cloud-hosted, no local dependencies.
+
+Routing:
+  MODEL_AGENT  (openai/gpt-oss-120b) → OpenRouter (OPENROUTER_API_KEY)
+  GROQ_MODEL_XXX    (utility tasks)        → Groq (GROQ_API_KEY with 5-key fallback)
 
 .env setup:
-    GROQ_API_KEY=        # required
+    GROQ_API_KEY=        # required (utility model)
     GROQ_API_KEY2=       # optional rate-limit fallback
     GROQ_API_KEY3=
     GROQ_API_KEY4=
     GROQ_API_KEY5=
+    OPENROUTER_API_KEY=  # required (agent model)
 
-    GROQ_MODEL_AGENT=openai/gpt-oss-120b
+    MODEL_AGENT=openai/gpt-oss-120b
     GROQ_MODEL_XXX=meta-llama/llama-4-scout-17b-16e-instruct
 
 Usage:
@@ -26,6 +30,7 @@ import os
 import time
 from typing import Dict, Generator, List, Optional
 
+import openai
 from dotenv import load_dotenv
 from groq import Groq, RateLimitError
 
@@ -53,9 +58,9 @@ if not _GROQ_KEYS:
     )
 
 # Two-model strategy:
-#   GROQ_MODEL_AGENT → agent tool-selection + final answer synthesis
-#   GROQ_MODEL_XXX   → all utility tasks (judge, reformulate, preprocess, RAG, translate)
-GROQ_MODEL_AGENT     = os.getenv("GROQ_MODEL_AGENT", "openai/gpt-oss-120b")
+#   MODEL_AGENT → agent tool-selection + final answer synthesis (OpenRouter)
+#   GROQ_MODEL_XXX   → all utility tasks (judge, reformulate, preprocess, RAG, translate) (Groq)
+MODEL_AGENT     = os.getenv("MODEL_AGENT", "openai/gpt-oss-120b")
 GROQ_MODEL_XXX       = os.getenv("GROQ_MODEL_XXX",   "meta-llama/llama-4-scout-17b-16e-instruct")
 
 # Aliases for modules that import these names directly
@@ -64,19 +69,31 @@ GROQ_MODEL_TRANSLATE = GROQ_MODEL_XXX
 OLLAMA_MODEL         = GROQ_MODEL_XXX       # legacy alias
 OLLAMA_MODEL_TRANSLATE = GROQ_MODEL_XXX     # legacy alias
 
+_OPENROUTER_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+if not _OPENROUTER_KEY:
+    logger.warning(
+        "No OPENROUTER_API_KEY found. Agent model calls will fail. Add it to .env"
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Key rotation
+# Key rotation (Groq)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _current_key_idx: int = 0
 
 
-def _get_client() -> Groq:
+def _get_groq_client() -> Groq:
     if not _GROQ_KEYS:
         raise RuntimeError(
             "No Groq API keys configured. Add GROQ_API_KEY to your .env file."
         )
     return Groq(api_key=_GROQ_KEYS[_current_key_idx])
+
+
+# Keep the old name as an alias so nothing outside this file breaks
+_get_client = _get_groq_client
 
 
 def _rotate_key() -> bool:
@@ -90,14 +107,56 @@ def _rotate_key() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Low-level callers
+# Low-level callers — OpenRouter (agent model)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _call_openrouter(messages: List[Dict], temperature: float, max_tokens: int, model: str) -> str:
+    if not _OPENROUTER_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not configured. Add it to your .env file.")
+    try:
+        client = openai.OpenAI(api_key=_OPENROUTER_KEY, base_url=_OPENROUTER_BASE_URL)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        raise RuntimeError(f"OpenRouter call failed: {exc}") from exc
+
+
+def _call_openrouter_stream(
+    messages: List[Dict], temperature: float, max_tokens: int, model: str
+) -> Generator[str, None, None]:
+    if not _OPENROUTER_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not configured. Add it to your .env file.")
+    try:
+        client = openai.OpenAI(api_key=_OPENROUTER_KEY, base_url=_OPENROUTER_BASE_URL)
+        stream = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        for chunk in stream:
+            content = chunk.choices[0].delta.content
+            if content:
+                yield content
+    except Exception as exc:
+        raise RuntimeError(f"OpenRouter stream failed: {exc}") from exc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-level callers — Groq (utility model)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _call_groq(messages: List[Dict], temperature: float, max_tokens: int, model: str) -> str:
     last_exc = None
     for _ in range(len(_GROQ_KEYS) + 1):
         try:
-            client = _get_client()
+            client = _get_groq_client()
             resp = client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -121,7 +180,7 @@ def _call_groq_stream(
     last_exc = None
     for _ in range(len(_GROQ_KEYS) + 1):
         try:
-            client = _get_client()
+            client = _get_groq_client()
             stream = client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -145,6 +204,25 @@ def _call_groq_stream(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Router — sends agent model to OpenRouter, utility model to Groq
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _route_call(messages: List[Dict], temperature: float, max_tokens: int, model: str) -> str:
+    if model == MODEL_AGENT:
+        return _call_openrouter(messages, temperature, max_tokens, model)
+    return _call_groq(messages, temperature, max_tokens, model)
+
+
+def _route_stream(
+    messages: List[Dict], temperature: float, max_tokens: int, model: str
+) -> Generator[str, None, None]:
+    if model == MODEL_AGENT:
+        yield from _call_openrouter_stream(messages, temperature, max_tokens, model)
+    else:
+        yield from _call_groq_stream(messages, temperature, max_tokens, model)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public blocking API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -155,14 +233,14 @@ def llm_call(
     retry_delay: float = 0.5,
     model: str = None,
 ) -> str:
-    """Blocking chat. Pass model= to override default (e.g. GROQ_MODEL_AGENT)."""
+    """Blocking chat. Pass model= to override default (e.g. MODEL_AGENT)."""
     chosen_model = model or GROQ_MODEL_XXX
     try:
-        return _call_groq(messages, temperature, max_tokens, chosen_model)
+        return _route_call(messages, temperature, max_tokens, chosen_model)
     except RuntimeError:
         raise
     except Exception as exc:
-        raise RuntimeError(f"Groq call failed: {exc}") from exc
+        raise RuntimeError(f"LLM call failed: {exc}") from exc
 
 
 def llm_call_json(
@@ -217,11 +295,11 @@ def llm_call_stream(
     """Sync generator — yields text chunks."""
     chosen_model = model or GROQ_MODEL_XXX
     try:
-        yield from _call_groq_stream(messages, temperature, max_tokens, chosen_model)
+        yield from _route_stream(messages, temperature, max_tokens, chosen_model)
     except RuntimeError:
         raise
     except Exception as exc:
-        raise RuntimeError(f"Groq stream failed: {exc}") from exc
+        raise RuntimeError(f"LLM stream failed: {exc}") from exc
 
 
 def llm_call_stream_text(
@@ -248,10 +326,11 @@ def llm_call_stream_text(
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=== Groq Client Status ===")
-    print(f"  Keys loaded  : {len(_GROQ_KEYS)} (GROQ_API_KEY through GROQ_API_KEY5)")
-    print(f"  Agent model  : {GROQ_MODEL_AGENT}")
-    print(f"  Utility model: {GROQ_MODEL_XXX}")
+    print("=== LLM Client Status ===")
+    print(f"  Groq keys    : {len(_GROQ_KEYS)} (GROQ_API_KEY through GROQ_API_KEY5)")
+    print(f"  OpenRouter   : {'configured' if _OPENROUTER_KEY else 'MISSING'}")
+    print(f"  Agent model  : {MODEL_AGENT}  → OpenRouter")
+    print(f"  Utility model: {GROQ_MODEL_XXX}  → Groq")
 
     if not _GROQ_KEYS:
         print("\n❌  No API keys found — add GROQ_API_KEY to your .env file.")

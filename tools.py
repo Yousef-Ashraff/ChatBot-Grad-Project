@@ -107,22 +107,41 @@ def _to_str(result) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @tool
-def get_student_info() -> str:
+def get_student_info(fields: Optional[List[str]] = None) -> str:
     """
     The sole source for the current student's personal academic record.
 
-    Covers everything that belongs to this student specifically: identity,
-    program, year, GPA, total earned credits, completed courses with grades,
-    and semester-by-semester GPA history.
+    Always pass ONLY the fields relevant to the query — never request
+    everything when a subset suffices.
 
-    Does not answer questions about courses, curriculum, or policies — those
-    live in Neo4j and the bylaws. Accepts no parameters; student ID is
-    injected automatically.
+    Available fields:
+      "gpa"                — current cumulative GPA (single number)
+      "track"              — enrolled program / track name
+      "university_year"    — current year level (1–4)
+      "total_hours_earned" — total credit hours completed
+      "full_name"          — student's full name
+      "courses_degrees"    — full course history with grades and percentages
+      "completed_courses"  — list of completed course names only (no grades)
+      "semester_gpas"      — GPA broken down by semester
+
+    When fields is None or empty, all fields are returned (avoid for simple
+    queries — it floods the context with irrelevant data).
+
+    Examples:
+      "What is my GPA?"                  → fields=["gpa"]
+      "What year am I in?"               → fields=["university_year"]
+      "What courses have I completed?"   → fields=["completed_courses"]
+      "Show me my grades"                → fields=["courses_degrees"]
+      "What's my GPA history?"           → fields=["semester_gpas", "gpa"]
+      "Tell me about my profile"         → fields=None  (full profile)
     """
     sid = _get_student_id()
     try:
         from student_functions import get_student_details
-        return _to_str(get_student_details(sid))
+        data = get_student_details(sid)
+        if data and fields:
+            data = {k: v for k, v in data.items() if k in fields}
+        return _to_str(data)
     except Exception as exc:
         return f"Error fetching student info: {exc}"
 
@@ -386,6 +405,7 @@ def filter_courses(
     course_types: Optional[List[str]] = None,
     return_fields: Optional[List[str]] = None,
     course_list: Optional[List[str]] = None,
+    student_filters: Optional[List[str]] = None,
 ) -> str:
     """
     A flexible multi-criteria search engine over the course graph — finds
@@ -403,18 +423,59 @@ def filter_courses(
     course_types: ["core"], ["elective"], or both.
     course_list: restricts filtering to a specific set of course names.
     return_fields: limits which fields appear in the output.
+    student_filters: optional list of student-context filters applied after the
+        Neo4j query:
+        - "not_completed": exclude courses the student has already completed.
+        - "eligible": keep only courses the student is currently eligible for
+          (all prerequisites met and credit-hour requirements satisfied).
+        Both can be combined, e.g. ["not_completed", "eligible"].
     """
     try:
         from neo4j_course_functions import filter_courses as _fn
-        return _to_str(
-            _fn(
-                filters=filters,
-                course_types=course_types,
-                return_fields=return_fields,
-                program_name=program_name,
-                course_list=course_list,
-            )
+        courses = _fn(
+            filters=filters,
+            course_types=course_types,
+            return_fields=return_fields,
+            program_name=program_name,
+            course_list=course_list,
         )
+
+        if student_filters and courses:
+            active_filters = {f.lower() for f in student_filters}
+            sid = _get_student_id()
+
+            if active_filters & {'not_completed', 'eligible'}:
+                from eligibility import get_student_context
+                ctx = get_student_context(sid)
+                completed = ctx['completed_courses']
+
+                if 'not_completed' in active_filters:
+                    courses = [
+                        c for c in courses
+                        if c.get('name', '').lower() not in completed
+                    ]
+
+                if 'eligible' in active_filters and courses:
+                    from neo4j_course_functions import check_course_eligibility as _elig_fn
+                    completed_list = list(completed)
+                    earned = ctx['total_hours_earned']
+                    prog = ctx['program_name']
+                    eligible_courses = []
+                    for c in courses:
+                        name = c.get('name', '').lower()
+                        if not name:
+                            continue
+                        result = _elig_fn(
+                            course_name=name,
+                            completed_courses=completed_list,
+                            earned_credits=earned,
+                            program_name=prog,
+                        )
+                        if result.get('eligible'):
+                            eligible_courses.append(c)
+                    courses = eligible_courses
+
+        return _to_str(courses)
     except Exception as exc:
         return f"Error filtering courses: {exc}"
 
@@ -1646,6 +1707,73 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ── GPA tools ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def calculate_projected_gpa(new_courses: List[dict]) -> str:
+    """
+    Projects the student's GPA if they score specific percentages in new courses.
+
+    Belongs to hypothetical "what if" GPA questions:
+    "If I get 85 in machine learning and 90 in networks, what will my GPA be?"
+
+    new_courses must be a list of objects, each with:
+      - "name":       exact course name (string)
+      - "percentage": numeric score 0–100
+
+    Example: [{"name": "machine learning", "percentage": 85},
+              {"name": "computer networks", "percentage": 90}]
+
+    Credit hours for each course are looked up automatically from the knowledge
+    graph. Does not require any other parameters.
+    """
+    sid = _get_student_id()
+    try:
+        from gpa_service import project_gpa_with_new_courses as _fn
+        return _to_str(_fn(sid, new_courses))
+    except Exception as exc:
+        return f"Error projecting GPA: {exc}"
+
+
+@tool
+def calculate_target_gpa(
+    target_gpa: float,
+    optimization: str = "maximize_credits",
+) -> str:
+    """
+    Analyzes what combination of courses and minimum grades per credit type
+    are needed to reach a target GPA.
+
+    Belongs to goal-oriented GPA questions:
+    "I want my GPA to be 3.2", "How do I increase my GPA to 3.5?",
+    "What do I need to improve my GPA?"
+
+    target_gpa: the desired cumulative GPA (0.0–4.0).
+
+    optimization controls the course-count strategy:
+      - "maximize_credits" (default): fill the available credit limit with as
+        many eligible courses as possible — maximizes GPA leverage.
+        Use when the student does not restrict course count.
+      - "minimize_grade": use the minimum number of credits needed to make
+        the target achievable — fewer courses but higher grade requirements.
+        Use when the student says "I don't want too many courses" or similar.
+
+    Returns:
+      - The recommended combination (n1 one-credit, n2 two-credit, n3 three-credit)
+      - Per-credit-type minimum grade (floor), where ALL types must be met together
+      - Whether the target is achievable; if not, the maximum possible GPA
+      - Advisor notes with follow-up options
+    """
+    sid = _get_student_id()
+    try:
+        from gpa_service import analyze_target_gpa as _fn
+        return _to_str(_fn(sid, target_gpa, optimization))
+    except Exception as exc:
+        return f"Error analyzing target GPA: {exc}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tool list exported to agent.py
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1684,4 +1812,7 @@ ALL_TOOLS = [
     recommend_core,
     # Preference storage
     store_preference,
+    # GPA tools
+    calculate_projected_gpa,
+    calculate_target_gpa,
 ]
