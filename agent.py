@@ -211,6 +211,15 @@ _ANSWER_SYSTEM = (
     "Do NOT cite article numbers, source names, or tool names. "
     "If the context is insufficient, say so and suggest the student contact "
     "the registrar's office.\n"
+    "POLICY + PERSONAL DATA PATTERN: When the context contains BOTH a general "
+    "policy (e.g. credit-load tiers, GPA rules) AND the student's actual personal "
+    "value for that metric (e.g. their real GPA from get_student_info), structure "
+    "the answer in two parts:\n"
+    "  PART 1 — Explain the general policy clearly and completely (all tiers/rules), "
+    "so the student understands the full picture.\n"
+    "  PART 2 — Apply the policy to the student's actual data and state the concrete "
+    "decision/outcome confidently (e.g. 'Based on your GPA of X, you can enroll in '). "
+    "Never ask the student to share data you already have.\n"
     "COURSE COMPLETION ACKNOWLEDGMENT: ONLY trigger this when the student's message "
     "explicitly states in first person that they completed, passed, finished, or earned "
     "a course — the message must contain language like 'I got X', 'I passed X', "
@@ -840,6 +849,20 @@ def _make_judge_node():
             f'   if the other results already answer the query.\n'
             f'5. General answers (not student-specific) are fine — if data exists to '
             f'   give a helpful answer, that is enough.\n'
+            f'   EXCEPTION — PERSONALISED QUERY OVERRIDE: if the query contains a first-person\n'
+            f'   possessive ("my GPA", "my credits", "my courses", "how many can I", "based on my",\n'
+            f'   "what is my") and is asking for a VALUE specific to this student (not just general\n'
+            f'   policy), then a generic policy answer alone is NOT sufficient — the student\'s\n'
+            f'   actual data must also be retrieved. Check whether a get_student_info result is\n'
+            f'   present in the context. If it is absent, set satisfied=false and add\n'
+            f'   "student\'s actual GPA / personal data (get_student_info not called)" to missing.\n'
+            f'   Examples that trigger this override:\n'
+            f'   • "how many credits can I enroll based on my GPA?" → needs real GPA value\n'
+            f'   • "what is my GPA?" → needs get_student_info\n'
+            f'   • "how many hours do I have?" → needs get_student_info\n'
+            f'   Examples that do NOT trigger it (no personal data needed):\n'
+            f'   • "how many credits are required to graduate?" → pure policy, no "my" data\n'
+            f'   • "what is the minimum GPA?" → pure policy question\n'
             f'6. EMPTY DEPENDENCY ARRAYS — MANDATORY RULE:\n'
             f'   `"dependents": []` means the course unlocks NOTHING. This IS the answer.\n'
             f'   `"prerequisites": []` means the course has NO prerequisites. This IS the answer.\n'

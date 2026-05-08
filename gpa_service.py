@@ -156,6 +156,16 @@ def infer_current_semester(courses_degrees: list) -> Optional[str]:
     return result
 
 
+# ── Pass/Fail course detection ───────────────────────────────────────────────
+
+_PASS_FAIL_PATTERNS = ["field training"]
+
+
+def _is_pass_fail(course_name: str) -> bool:
+    name = course_name.lower()
+    return any(p in name for p in _PASS_FAIL_PATTERNS)
+
+
 # ── Eligible-course helper ────────────────────────────────────────────────────
 
 def _get_eligible_not_completed(
@@ -416,6 +426,7 @@ def _advisor_course_notes(
     n1: int, n2: int, n3: int, n4: int,
     courses_1cr: list, courses_2cr: list, courses_3cr: list, courses_4cr: list,
     open_slots_by_term: Optional[dict] = None,
+    mandatory_non_gpa: Optional[list] = None,
 ) -> None:
     """Append notes listing eligible course names by credit type and elective slots."""
     for n, courses, label, is_3cr in [
@@ -437,6 +448,12 @@ def _advisor_course_notes(
             parts.append("; ".join(slot_strs))
         if parts:
             notes.append(f"Eligible {label} course(s) available this semester: {', '.join(parts)}.")
+    if mandatory_non_gpa:
+        for c in mandatory_non_gpa:
+            notes.append(
+                f"⚠️ '{c['name']}' is a mandatory course you haven't completed yet. "
+                f"It is graded Pass/Fail and will NOT affect your GPA — but you must finish it."
+            )
 
 
 def analyze_target_gpa(
@@ -478,10 +495,25 @@ def analyze_target_gpa(
     current_semester = infer_current_semester(courses_degrees)
 
     # Eligible not-completed CORE courses by credit type, filtered by semester
-    courses_1cr = _get_eligible_not_completed(1, program_name, completed, earned, current_semester)
-    courses_2cr = _get_eligible_not_completed(2, program_name, completed, earned, current_semester)
-    courses_3cr = _get_eligible_not_completed(3, program_name, completed, earned, current_semester)
-    courses_4cr = _get_eligible_not_completed(4, program_name, completed, earned, current_semester)
+    def _split_pf(courses):
+        letter = [c for c in courses if not _is_pass_fail(c.get("name", ""))]
+        pf     = [c for c in courses if     _is_pass_fail(c.get("name", ""))]
+        return letter, pf
+
+    courses_1cr, pf_1cr = _split_pf(_get_eligible_not_completed(1, program_name, completed, earned, current_semester))
+    courses_2cr, pf_2cr = _split_pf(_get_eligible_not_completed(2, program_name, completed, earned, current_semester))
+    courses_3cr, pf_3cr = _split_pf(_get_eligible_not_completed(3, program_name, completed, earned, current_semester))
+    courses_4cr, pf_4cr = _split_pf(_get_eligible_not_completed(4, program_name, completed, earned, current_semester))
+
+    # P/F mandatory courses — must complete but do not affect GPA
+    mandatory_non_gpa = [
+        {
+            "name":         c.get("name"),
+            "credit_hours": c.get("credit_hours"),
+            "note":         "Mandatory — must be completed, graded Pass/Fail (does not affect GPA)",
+        }
+        for c in (pf_1cr + pf_2cr + pf_3cr + pf_4cr)
+    ]
 
     # Elective slots: treat open slots as additional 3-credit placeholders
     remaining_slots = _build_remaining_elective_slots(program_name, completed)
@@ -565,18 +597,19 @@ def analyze_target_gpa(
         ]
         _advisor_course_notes(advisor_notes, n1, n2, n3, n4,
                               courses_1cr, courses_2cr, courses_3cr, courses_4cr,
-                              open_slots_by_term)
+                              open_slots_by_term, mandatory_non_gpa)
 
         return {
-            "current_gpa":       round(current_gpa, 3),
-            "target_gpa":        target_gpa,
-            "credit_limit":      credit_limit,
-            "already_at_target": True,
-            "combination":       combination_info,
-            "available_courses": _available_courses_dict(),
-            "type_floors":       floors,
-            "current_semester":  current_semester,
-            "advisor_notes":     advisor_notes,
+            "current_gpa":        round(current_gpa, 3),
+            "target_gpa":         target_gpa,
+            "credit_limit":       credit_limit,
+            "already_at_target":  True,
+            "combination":        combination_info,
+            "available_courses":  _available_courses_dict(),
+            "mandatory_non_gpa":  mandatory_non_gpa,
+            "type_floors":        floors,
+            "current_semester":   current_semester,
+            "advisor_notes":      advisor_notes,
         }
 
     # ── Target not achievable — show max possible GPA ─────────────────────────
@@ -589,7 +622,7 @@ def analyze_target_gpa(
         ]
         _advisor_course_notes(advisor_notes, n1, n2, n3, n4,
                               courses_1cr, courses_2cr, courses_3cr, courses_4cr,
-                              open_slots_by_term)
+                              open_slots_by_term, mandatory_non_gpa)
 
         return {
             "current_gpa":        round(current_gpa, 3),
@@ -599,6 +632,7 @@ def analyze_target_gpa(
             "max_achievable_gpa": max_gpa,
             "combination":        combination_info,
             "available_courses":  _available_courses_dict(),
+            "mandatory_non_gpa":  mandatory_non_gpa,
             "current_semester":   current_semester,
             "advisor_notes":      advisor_notes,
         }
@@ -623,6 +657,7 @@ def analyze_target_gpa(
         "max_achievable_gpa": max_gpa,
         "combination":        combination_info,
         "available_courses":  _available_courses_dict(),
+        "mandatory_non_gpa":  mandatory_non_gpa,
         "type_floors":        floors,
         "current_semester":   current_semester,
         "advisor_notes":      advisor_notes,
