@@ -87,6 +87,15 @@ def chat(student_id: str, message: str) -> Dict[str, Any]:
         # ── 2. Detect language + translate input to English ───────────────
         original_lang, english_message = detect_and_translate_input(message)
 
+        # ── 2b. Inherit language from a pending ambiguity session ──────────
+        # When the student answers a disambiguation question with "1", "2",
+        # or any neutral text, detection returns "english" even though the
+        # original query was Arabic.  Use the language stored with the
+        # pending session so the final answer is still translated back.
+        _stored = _ambiguity_sessions.get(student_id)
+        if isinstance(_stored, dict) and _stored.get("lang", "english") != "english":
+            original_lang = _stored["lang"]
+
         # ── 3. Translate history window to English if needed ──────────────
         english_history = (
             translate_history_to_english(history)
@@ -95,7 +104,7 @@ def chat(student_id: str, message: str) -> Dict[str, Any]:
         )
 
         # ── 4. Route through pipeline (always English) ────────────────────
-        response = _route_message(student_id, english_message, english_history)
+        response = _route_message(student_id, english_message, english_history, original_lang)
 
         # ── 5. Translate response back to student's language if needed ─────
         if original_lang != "english":
@@ -210,9 +219,10 @@ def get_disambiguation_options(student_id: str, term: str) -> Dict[str, Any]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _route_message(
-    student_id: str,
-    message:    str,
-    history:    list,
+    student_id:    str,
+    message:       str,
+    history:       list,
+    original_lang: str = "english",
 ) -> str:
     """
     Route the student's message through the full pipeline:
@@ -223,18 +233,20 @@ def _route_message(
     """
 
     # ── 1. Resolve pending ambiguity ──────────────────────────────────────
-    pending_ambiguity = _ambiguity_sessions.get(student_id)
-    if pending_ambiguity is not None:
-        return _resolve_ambiguity_reply(student_id, message, pending_ambiguity)
+    stored = _ambiguity_sessions.get(student_id)
+    if stored is not None:
+        pending = stored["pending"] if isinstance(stored, dict) else stored
+        return _resolve_ambiguity_reply(student_id, message, pending, original_lang)
 
     # ── 2. Preprocess → agent ─────────────────────────────────────────────
-    return _preprocess_and_run(student_id, message, history)
+    return _preprocess_and_run(student_id, message, history, original_lang)
 
 
 def _preprocess_and_run(
-    student_id: str,
-    message:    str,
-    history:    list,
+    student_id:    str,
+    message:       str,
+    history:       list,
+    original_lang: str = "english",
 ) -> str:
     """
     Run the preprocessing pipeline, then the agent.
@@ -264,8 +276,9 @@ def _preprocess_and_run(
     result = pre.process(message, history, student_track=student_track)
 
     if result.status == "ambiguous":
-        # Store the pending state and ask the student to clarify
-        _ambiguity_sessions[student_id] = result.pending
+        # Store pending state + original language so disambiguation replies
+        # are translated back to the student's language correctly.
+        _ambiguity_sessions[student_id] = {"pending": result.pending, "lang": original_lang}
         return result.clarification
 
     # "ready" or "passthrough" — we have a clean query
@@ -298,9 +311,10 @@ def _preprocess_and_run(
 
 
 def _resolve_ambiguity_reply(
-    student_id: str,
-    reply:      str,
-    pending:    any,
+    student_id:    str,
+    reply:         str,
+    pending:       any,
+    original_lang: str = "english",
 ) -> str:
     """
     The student has answered a disambiguation question.
@@ -317,7 +331,8 @@ def _resolve_ambiguity_reply(
 
     # Another course in the original query was also ambiguous — ask again
     if result.status == "ambiguous":
-        _ambiguity_sessions[student_id] = result.pending
+        # Preserve the original language for the chained disambiguation turn
+        _ambiguity_sessions[student_id] = {"pending": result.pending, "lang": original_lang}
         return result.clarification
 
     clean_query = result.clean_query or pending.original_query

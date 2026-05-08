@@ -148,6 +148,9 @@ MULTI_COURSE_ALIASES: Dict[str, List[str]] = {
 # ── Track / program aliases ───────────────────────────────────────────────────
 # Map shorthand → canonical Neo4j program name (all lowercase).
 
+# Terms that should ALWAYS resolve as a track, never trigger course conflict.
+_ALWAYS_TRACK_TERMS: frozenset = frozenset({"aim"})
+
 TRACK_ALIASES: Dict[str, str] = {
     # AI & ML track
     "aim":                      "artificial intelligence & machine learning",
@@ -654,6 +657,12 @@ class QueryPreprocessor:
                 continue  # handled by Part A
             track_canon, _ = self._map_track_with_method(deduped)
             if not track_canon:
+                continue
+            # Special case: always a track, never trigger course conflict
+            if deduped.lower().strip() in _ALWAYS_TRACK_TERMS:
+                conflict_debug.append(
+                    f'"{original}" @{pos}  →  track "{track_canon}"  [FORCED-TRACK]'
+                )
                 continue
             course_canon = self._has_course_match(deduped) or self._has_course_match(track_canon)
             if not course_canon:

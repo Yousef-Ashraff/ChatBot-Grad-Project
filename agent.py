@@ -1875,6 +1875,7 @@ if __name__ == "__main__":
     agent           = BNUAdvisorAgent(student_id=student_id)
     session_history: List[Dict] = []
     pending_ambiguity = None
+    pending_lang      = "english"   # language of the message that triggered the pending ambiguity
 
     # Import planning session routing (monkey-patch applied on chatbot_api import)
     try:
@@ -1933,6 +1934,13 @@ if __name__ == "__main__":
                 translate_history_to_english,
             )
             original_lang, english_input = detect_and_translate_input(user_input)
+
+            # Inherit language from a pending ambiguity session so that a
+            # neutral reply like "2" still triggers output translation back
+            # to the student's original language (Arabic / Franco-Arabic).
+            if pending_ambiguity is not None and pending_lang != "english":
+                original_lang = pending_lang
+
             english_history = (
                 translate_history_to_english(session_history)
                 if original_lang != "english"
@@ -1954,14 +1962,16 @@ if __name__ == "__main__":
 
                 # ── Resolve pending ambiguity ─────────────────────────────
                 if pending_ambiguity is not None:
-                    result          = pre.resolve_ambiguity(pending_ambiguity, english_input)
+                    result            = pre.resolve_ambiguity(pending_ambiguity, english_input)
                     pending_ambiguity = None
+                    pending_lang      = "english"
                 else:
                     result = pre.process(english_input, english_history)
 
                 # ── Route based on preprocessor outcome ──────────────────
                 if result.status == "ambiguous":
                     pending_ambiguity = result.pending
+                    pending_lang      = original_lang   # remember for the reply turn
                     response          = result.clarification
                 else:
                     clean_query = result.clean_query or english_input
@@ -1995,7 +2005,8 @@ if __name__ == "__main__":
                 response = translate_to_arabic(response)
 
         except Exception as exc:
-            pending_ambiguity = None   # clear stale state on error
+            pending_ambiguity = None    # clear stale state on error
+            pending_lang      = "english"
             response = f"⚠️  Error: {exc}"
 
         if args.verbose:
