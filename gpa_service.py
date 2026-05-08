@@ -84,10 +84,22 @@ def _grade_range_str(grade_letter: str, min_pct: int) -> str:
 
 # ── GPA computation ───────────────────────────────────────────────────────────
 
+GRADE_POINTS = {
+    "A+": 4.00, "A": 3.70, "A-": 3.40,
+    "B+": 3.20, "B": 3.00, "B-": 2.80,
+    "C+": 2.60, "C": 2.40, "C-": 2.20,
+    "D+": 2.00, "D": 1.50, "D-": 1.00,
+    "F":  0.00,
+}
+# P (Pass) and similar non-GPA grades are excluded from QP/credit totals.
+_NON_GPA_GRADES = {"p", "pass", "i", "w", "ip"}
+
+
 def compute_gpa_from_courses(courses_degrees: list) -> Tuple[float, int, float]:
     """
-    Compute GPA directly from the courses_degrees JSON column.
-    F grades contribute 0 quality points but still count in the credit total.
+    Compute GPA from the courses_degrees JSON column using the grade letter field.
+    Pass/Fail courses (grade='P') are excluded — they carry credit hours but no
+    quality points and do not factor into cumulative GPA.
 
     Returns (gpa, total_credits, total_quality_points).
     """
@@ -96,9 +108,13 @@ def compute_gpa_from_courses(courses_degrees: list) -> Tuple[float, int, float]:
     for c in (courses_degrees or []):
         if not isinstance(c, dict):
             continue
-        pct = float(c.get("degree") or 0)
+        grade = (c.get("grade") or "").strip()
+        if grade.lower() in _NON_GPA_GRADES:
+            continue
         cr  = int(c.get("credit_hours") or 0)
-        pts, _ = percentage_to_points(pct)
+        pts = GRADE_POINTS.get(grade, None)
+        if pts is None:
+            continue
         total_qp += pts * cr
         total_cr += cr
     gpa = round(total_qp / total_cr, 4) if total_cr > 0 else 0.0
@@ -440,21 +456,17 @@ def analyze_target_gpa(
     if not row:
         return {"error": "Student not found."}
 
-    courses_degrees = row.get("courses_degrees") or []
-    current_gpa     = float(row.get("gpa") or 0.0)
+    courses_degrees  = row.get("courses_degrees") or []
+    current_gpa      = float(row.get("gpa") or 0.0)
+    _, existing_cr, existing_qp = compute_gpa_from_courses(courses_degrees)
+
+    if existing_cr == 0:
+        return {"error": "No completed courses found to establish a GPA basis."}
 
     ctx          = get_student_context(student_id)
     program_name = ctx["program_name"]
     completed    = ctx["completed_courses"]
     earned       = ctx["total_hours_earned"]
-
-    # Use authoritative DB values — compute_gpa_from_courses treats courses
-    # with degree=None as F (0 pts) which under-counts existing_qp vs. DB GPA.
-    existing_cr = earned
-    existing_qp = current_gpa * existing_cr
-
-    if existing_cr == 0:
-        return {"error": "No completed courses found to establish a GPA basis."}
 
     if not program_name:
         return {"error": "Could not determine your program."}
