@@ -1768,7 +1768,8 @@ def calculate_target_gpa(
     sid = _get_student_id()
     try:
         from gpa_service import analyze_target_gpa as _fn
-        return _to_str(_fn(sid, target_gpa, optimization))
+        result = _fn(sid, target_gpa, optimization)
+        return "GPA ANALYSIS RESULT\n" + _to_str(result)
     except Exception as exc:
         return f"Error analyzing target GPA: {exc}"
 

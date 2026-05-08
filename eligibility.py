@@ -111,9 +111,7 @@ class FuzzyCompletedSet:
         if not isinstance(item, str):
             return False
         key = _norm(item.lower())
-        if key in self._exact:
-            return True
-        return any(_similarity(key, n) >= _SIMILARITY_THRESHOLD for n in self._names)
+        return key in self._exact
 
     def __iter__(self):
         return iter(self._names)

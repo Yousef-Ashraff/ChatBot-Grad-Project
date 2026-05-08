@@ -109,18 +109,35 @@ def compute_gpa_from_courses(courses_degrees: list) -> Tuple[float, int, float]:
 
 def infer_current_semester(courses_degrees: list) -> Optional[str]:
     """
-    Infer current semester from the most recent semester string in courses_degrees.
-    "Fall ..."   → "First"
-    "Spring ..." → "Second"
+    Infer the UPCOMING semester from the most recently completed semester.
+    Skips "Summer" entries and moves to the previous element.
+
+    Most recent completed "Fall"   → next upcoming is Spring → "Second"
+    Most recent completed "Spring" → next upcoming is Fall   → "First"
     Returns None if undetermined.
     """
-    for c in reversed(courses_degrees or []):
+    import re
+    best_key = (-1, -1)
+    result = None
+
+    _SEASON_PRIORITY = {"spring": 1, "fall": 3}  # summer (2) skipped
+
+    for c in (courses_degrees or []):
         sem = (c.get("semester") or "").strip().lower()
-        if "fall" in sem:
-            return "First"
-        if "spring" in sem:
-            return "Second"
-    return None
+        if "summer" in sem:
+            continue
+        m = re.search(r"\d{4}", sem)
+        year = int(m.group()) if m else 0
+        for season, priority in _SEASON_PRIORITY.items():
+            if season in sem:
+                if (year, priority) > best_key:
+                    best_key = (year, priority)
+                    # completed Fall → next is Spring (Second)
+                    # completed Spring → next is Fall (First)
+                    result = "Second" if season == "fall" else "First"
+                break
+
+    return result
 
 
 # ── Eligible-course helper ────────────────────────────────────────────────────
@@ -133,8 +150,8 @@ def _get_eligible_not_completed(
     semester: Optional[str],
 ) -> List[dict]:
     """
-    Return eligible, not-completed courses of a given credit_hours value
-    for the student's program, optionally filtered by semester.
+    Return eligible, not-completed CORE (mandatory) courses of a given
+    credit_hours value for the student's program, optionally filtered by semester.
     """
     from neo4j_course_functions import (
         filter_courses as _filter_courses,
@@ -143,6 +160,7 @@ def _get_eligible_not_completed(
 
     courses = _filter_courses(
         filters={"credit_hours": credit_hours},
+        course_types=["core"],
         program_name=program_name,
         semester=semester,
     )
@@ -168,6 +186,45 @@ def _get_eligible_not_completed(
         if result.get("eligible"):
             eligible.append(c)
     return eligible
+
+
+def _build_remaining_elective_slots(
+    program_name: str,
+    completed,
+) -> dict:
+    """
+    Mirror planning.py's pre-computed remaining_slots logic.
+
+    Returns a dict: {(year: int, semester: str): remaining_slots: int}
+    Only terms with at least one total slot are included.
+    Completed electives drain the earliest available slot first.
+    """
+    from planning import get_elective_slots
+    from neo4j_course_functions import get_all_electives_by_program
+
+    # Build the ordered list of terms that have any slots
+    slot_terms = [
+        (y, s)
+        for y in range(1, 5)
+        for s in ["First", "Second"]
+        if get_elective_slots(program_name, y, s) > 0
+    ]
+    remaining_slots = {
+        (y, s): get_elective_slots(program_name, y, s)
+        for (y, s) in slot_terms
+    }
+
+    # Drain one slot per completed elective (earliest term first)
+    all_electives = get_all_electives_by_program(program_name) or []
+    all_elective_names = {e["course_name"].lower() for e in all_electives}
+    for name in completed:
+        if name in all_elective_names:
+            for ys in slot_terms:
+                if remaining_slots[ys] > 0:
+                    remaining_slots[ys] -= 1
+                    break
+
+    return remaining_slots
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,52 +304,49 @@ def project_gpa_with_new_courses(student_id: str, new_courses: List[dict]) -> di
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _find_combination(
-    count_1cr: int, count_2cr: int, count_3cr: int,
+    count_1cr: int, count_2cr: int, count_3cr: int, count_4cr: int,
     credit_limit: int,
     existing_credits: int, existing_qp: float,
     target_gpa: float,
     optimization: str,
 ) -> dict:
     """
-    Find (n1, n2, n3) based on the chosen optimization strategy.
+    Find (n1, n2, n3, n4) based on the chosen optimization strategy.
 
-    maximize_credits: fill the credit limit — 3-credit courses first,
-                      then 2-credit, then 1-credit.
+    maximize_credits: fill the credit limit — highest-credit courses first
+                      (4cr → 3cr → 2cr → 1cr).
     minimize_grade  : use the fewest credits that still make the target
-                      achievable (Q_needed ≤ 4.0×T), again preferring
-                      higher-credit courses to keep the course count low.
+                      achievable (Q_needed ≤ 4.0×T), same priority order.
     """
-    def _greedy_fill(budget: int) -> Tuple[int, int, int]:
-        n3 = min(count_3cr, budget // 3)
-        rem = budget - n3 * 3
+    def _greedy_fill(budget: int) -> Tuple[int, int, int, int]:
+        n4 = min(count_4cr, budget // 4)
+        rem = budget - n4 * 4
+        n3 = min(count_3cr, rem // 3)
+        rem -= n3 * 3
         n2 = min(count_2cr, rem // 2)
         rem -= n2 * 2
         n1 = min(count_1cr, rem)
-        return n1, n2, n3
+        return n1, n2, n3, n4
 
     if optimization == "minimize_grade":
-        # Minimum T where Q_needed ≤ 4.0×T:
-        # target*(existing+T) - existing_qp ≤ 4.0*T
-        # → T ≥ (target*existing - existing_qp) / (4.0 - target)   [if target < 4.0]
         if target_gpa >= 4.0:
             t_min = credit_limit
         else:
             numerator = target_gpa * existing_credits - existing_qp
             t_min = max(0, math.ceil(numerator / (4.0 - target_gpa)))
 
-        # Try t_min first, then increment until we can actually form a combo
         for budget in range(min(t_min, credit_limit), credit_limit + 1):
-            n1, n2, n3 = _greedy_fill(budget)
-            T = n1 + n2 * 2 + n3 * 3
+            n1, n2, n3, n4 = _greedy_fill(budget)
+            T = n1 + n2 * 2 + n3 * 3 + n4 * 4
             if T >= t_min:
                 break
         else:
-            n1, n2, n3 = _greedy_fill(credit_limit)
+            n1, n2, n3, n4 = _greedy_fill(credit_limit)
     else:  # maximize_credits (default)
-        n1, n2, n3 = _greedy_fill(credit_limit)
+        n1, n2, n3, n4 = _greedy_fill(credit_limit)
 
-    T         = n1 + n2 * 2 + n3 * 3
-    Q_needed  = target_gpa * (existing_credits + T) - existing_qp
+    T          = n1 + n2 * 2 + n3 * 3 + n4 * 4
+    Q_needed   = target_gpa * (existing_credits + T) - existing_qp
     achievable = T > 0 and Q_needed <= 4.0 * T
     if T > 0:
         max_gpa = round((existing_qp + 4.0 * T) / (existing_credits + T), 3)
@@ -300,7 +354,7 @@ def _find_combination(
         max_gpa = round(existing_qp / existing_credits, 3) if existing_credits else 0.0
 
     return {
-        "n1": n1, "n2": n2, "n3": n3,
+        "n1": n1, "n2": n2, "n3": n3, "n4": n4,
         "total_credits": T,
         "Q_needed":      Q_needed,
         "achievable":    achievable,
@@ -309,7 +363,7 @@ def _find_combination(
 
 
 def _compute_type_floors(
-    Q_needed: float, T: int, n1: int, n2: int, n3: int,
+    Q_needed: float, T: int, n1: int, n2: int, n3: int, n4: int,
 ) -> dict:
     """
     For each active credit type compute the per-course minimum grade,
@@ -319,10 +373,10 @@ def _compute_type_floors(
         floor_type = (Q_needed - 4.0 × (T - n_type × ch)) / (n_type × ch)
 
     All courses within the same credit type share the same floor.
-    All three floors must be met simultaneously.
+    All four floors must be met simultaneously.
     """
     floors = {}
-    for ch, n, key in [(1, n1, "1cr"), (2, n2, "2cr"), (3, n3, "3cr")]:
+    for ch, n, key in [(1, n1, "1cr"), (2, n2, "2cr"), (3, n3, "3cr"), (4, n4, "4cr")]:
         if n == 0:
             continue
         type_credits  = n * ch
@@ -343,20 +397,30 @@ def _compute_type_floors(
 
 def _advisor_course_notes(
     notes: list,
-    n1: int, n2: int, n3: int,
-    count_1cr: int, count_2cr: int, count_3cr: int,
+    n1: int, n2: int, n3: int, n4: int,
+    courses_1cr: list, courses_2cr: list, courses_3cr: list, courses_4cr: list,
+    open_slots_by_term: Optional[dict] = None,
 ) -> None:
-    """Append follow-up notes offering to list eligible courses by credit type."""
-    for n, count, label in [
-        (n1, count_1cr, "1-credit"),
-        (n2, count_2cr, "2-credit"),
-        (n3, count_3cr, "3-credit"),
+    """Append notes listing eligible course names by credit type and elective slots."""
+    for n, courses, label, is_3cr in [
+        (n1, courses_1cr, "1-credit", False),
+        (n2, courses_2cr, "2-credit", False),
+        (n3, courses_3cr, "3-credit", True),
+        (n4, courses_4cr, "4-credit", False),
     ]:
-        if n > 0 and count > 0:
-            notes.append(
-                f"Would you like to see the {count} eligible {label} "
-                f"course(s) available to you this semester?"
-            )
+        if n == 0:
+            continue
+        parts = []
+        if courses:
+            parts.append(", ".join(c.get("name", "?") for c in courses))
+        if is_3cr and open_slots_by_term:
+            slot_strs = [
+                f"{slots} elective slot(s) in Year {yr} {sem} semester"
+                for (yr, sem), slots in sorted(open_slots_by_term.items())
+            ]
+            parts.append("; ".join(slot_strs))
+        if parts:
+            notes.append(f"Eligible {label} course(s) available this semester: {', '.join(parts)}.")
 
 
 def analyze_target_gpa(
@@ -376,17 +440,21 @@ def analyze_target_gpa(
     if not row:
         return {"error": "Student not found."}
 
-    courses_degrees  = row.get("courses_degrees") or []
-    _, existing_cr, existing_qp = compute_gpa_from_courses(courses_degrees)
-    current_gpa      = float(row.get("gpa") or 0.0)
-
-    if existing_cr == 0:
-        return {"error": "No completed courses found to establish a GPA basis."}
+    courses_degrees = row.get("courses_degrees") or []
+    current_gpa     = float(row.get("gpa") or 0.0)
 
     ctx          = get_student_context(student_id)
     program_name = ctx["program_name"]
     completed    = ctx["completed_courses"]
     earned       = ctx["total_hours_earned"]
+
+    # Use authoritative DB values — compute_gpa_from_courses treats courses
+    # with degree=None as F (0 pts) which under-counts existing_qp vs. DB GPA.
+    existing_cr = earned
+    existing_qp = current_gpa * existing_cr
+
+    if existing_cr == 0:
+        return {"error": "No completed courses found to establish a GPA basis."}
 
     if not program_name:
         return {"error": "Could not determine your program."}
@@ -394,22 +462,40 @@ def analyze_target_gpa(
     # Credit limit based on current GPA
     credit_limit = 15 if current_gpa < 2.0 else (18 if current_gpa < 3.0 else 21)
 
-    # Infer current semester
+    # Infer upcoming semester from the most recently completed semester
     current_semester = infer_current_semester(courses_degrees)
 
-    # Eligible not-completed courses by credit type, filtered by semester
+    # Eligible not-completed CORE courses by credit type, filtered by semester
     courses_1cr = _get_eligible_not_completed(1, program_name, completed, earned, current_semester)
     courses_2cr = _get_eligible_not_completed(2, program_name, completed, earned, current_semester)
     courses_3cr = _get_eligible_not_completed(3, program_name, completed, earned, current_semester)
-    count_1cr, count_2cr, count_3cr = len(courses_1cr), len(courses_2cr), len(courses_3cr)
+    courses_4cr = _get_eligible_not_completed(4, program_name, completed, earned, current_semester)
+
+    # Elective slots: treat open slots as additional 3-credit placeholders
+    remaining_slots = _build_remaining_elective_slots(program_name, completed)
+    # Filter to same semester type as current_semester (any year level)
+    if current_semester:
+        open_slots_by_term = {
+            (yr, sem): slots
+            for (yr, sem), slots in remaining_slots.items()
+            if sem == current_semester and slots > 0
+        }
+    else:
+        open_slots_by_term = {}
+    open_slots = sum(open_slots_by_term.values())
+
+    count_1cr = len(courses_1cr)
+    count_2cr = len(courses_2cr)
+    count_3cr = len(courses_3cr) + open_slots   # elective slots counted as 3-cr mandatory
+    count_4cr = len(courses_4cr)
 
     # Find best combination
-    combo      = _find_combination(
-        count_1cr, count_2cr, count_3cr,
+    combo = _find_combination(
+        count_1cr, count_2cr, count_3cr, count_4cr,
         credit_limit, existing_cr, existing_qp,
         target_gpa, optimization,
     )
-    n1, n2, n3 = combo["n1"], combo["n2"], combo["n3"]
+    n1, n2, n3, n4 = combo["n1"], combo["n2"], combo["n3"], combo["n4"]
     T          = combo["total_credits"]
     Q_needed   = combo["Q_needed"]
     achievable = combo["achievable"]
@@ -429,16 +515,31 @@ def analyze_target_gpa(
         }
 
     combination_info = {
-        "n1_one_credit":    n1,
-        "n2_two_credit":    n2,
-        "n3_three_credit":  n3,
-        "total_credits":    T,
+        "n1_one_credit":   n1,
+        "n2_two_credit":   n2,
+        "n3_three_credit": n3,
+        "n4_four_credit":  n4,
+        "total_credits":   T,
     }
+
+    def _available_courses_dict():
+        return {
+            "1_credit_options": [c.get("name") for c in courses_1cr],
+            "2_credit_options": [c.get("name") for c in courses_2cr],
+            "3_credit_options": {
+                "courses": [c.get("name") for c in courses_3cr],
+                "elective_slots": [
+                    {"year": yr, "semester": sem, "available_slots": slots}
+                    for (yr, sem), slots in sorted(open_slots_by_term.items())
+                ],
+            },
+            "4_credit_options": [c.get("name") for c in courses_4cr],
+        }
 
     # ── Already at / above target — show maintenance minimum ─────────────────
     if current_gpa >= target_gpa:
         Q_maint = target_gpa * (existing_cr + T) - existing_qp
-        floors  = _compute_type_floors(Q_maint, T, n1, n2, n3)
+        floors  = _compute_type_floors(Q_maint, T, n1, n2, n3, n4)
         p_raw   = Q_maint / T if T else 0.0
         grade_m, pct_m, _ = points_to_grade_requirement(max(0.0, p_raw))
 
@@ -450,7 +551,9 @@ def analyze_target_gpa(
             "if any type falls below its floor, the others cannot compensate "
             "(they would need to exceed 100%).",
         ]
-        _advisor_course_notes(advisor_notes, n1, n2, n3, count_1cr, count_2cr, count_3cr)
+        _advisor_course_notes(advisor_notes, n1, n2, n3, n4,
+                              courses_1cr, courses_2cr, courses_3cr, courses_4cr,
+                              open_slots_by_term)
 
         return {
             "current_gpa":       round(current_gpa, 3),
@@ -458,7 +561,7 @@ def analyze_target_gpa(
             "credit_limit":      credit_limit,
             "already_at_target": True,
             "combination":       combination_info,
-            "available_courses": {"1_credit": count_1cr, "2_credit": count_2cr, "3_credit": count_3cr},
+            "available_courses": _available_courses_dict(),
             "type_floors":       floors,
             "current_semester":  current_semester,
             "advisor_notes":     advisor_notes,
@@ -472,7 +575,9 @@ def analyze_target_gpa(
             f"Maximum achievable GPA this semester: {max_gpa:.3f}. "
             f"Aim for this — next semester you can continue toward {target_gpa}.",
         ]
-        _advisor_course_notes(advisor_notes, n1, n2, n3, count_1cr, count_2cr, count_3cr)
+        _advisor_course_notes(advisor_notes, n1, n2, n3, n4,
+                              courses_1cr, courses_2cr, courses_3cr, courses_4cr,
+                              open_slots_by_term)
 
         return {
             "current_gpa":        round(current_gpa, 3),
@@ -481,30 +586,32 @@ def analyze_target_gpa(
             "achievable":         False,
             "max_achievable_gpa": max_gpa,
             "combination":        combination_info,
-            "available_courses":  {"1_credit": count_1cr, "2_credit": count_2cr, "3_credit": count_3cr},
+            "available_courses":  _available_courses_dict(),
             "current_semester":   current_semester,
             "advisor_notes":      advisor_notes,
         }
 
     # ── Achievable — compute per-type floors ──────────────────────────────────
-    floors = _compute_type_floors(Q_needed, T, n1, n2, n3)
+    floors = _compute_type_floors(Q_needed, T, n1, n2, n3, n4)
 
     advisor_notes = [
         "⚠️ All credit-type minimums must be met simultaneously — "
         "if any type falls below its floor, the others cannot compensate "
         "(they would need to exceed 100%).",
     ]
-    _advisor_course_notes(advisor_notes, n1, n2, n3, count_1cr, count_2cr, count_3cr)
+    _advisor_course_notes(advisor_notes, n1, n2, n3, n4,
+                          courses_1cr, courses_2cr, courses_3cr, courses_4cr,
+                          open_slots_by_term)
 
     return {
-        "current_gpa":       round(current_gpa, 3),
-        "target_gpa":        target_gpa,
-        "credit_limit":      credit_limit,
-        "achievable":        True,
+        "current_gpa":        round(current_gpa, 3),
+        "target_gpa":         target_gpa,
+        "credit_limit":       credit_limit,
+        "achievable":         True,
         "max_achievable_gpa": max_gpa,
-        "combination":       combination_info,
-        "available_courses": {"1_credit": count_1cr, "2_credit": count_2cr, "3_credit": count_3cr},
-        "type_floors":       floors,
-        "current_semester":  current_semester,
-        "advisor_notes":     advisor_notes,
+        "combination":        combination_info,
+        "available_courses":  _available_courses_dict(),
+        "type_floors":        floors,
+        "current_semester":   current_semester,
+        "advisor_notes":      advisor_notes,
     }
