@@ -257,6 +257,34 @@ _FRANCO_FEW_SHOTS = """\
 # Compare
 "2arn been el ML w el DL"                               → "Compare ML and DL"
 "2arn been el OS w el networks"                         → "What's the difference between OS and networks?"
+
+# Pronoun references — singular "it" (DO NOT resolve — keep as English pronouns)
+"momken a3rf eh el courses el fih"                      → "Can I know what courses are in it?"
+"momken a3rf eh el courses el feeh"                     → "Can I know what courses are in it?"
+"eh el prerequisites bta3to"                            → "What are its prerequisites?"
+"wareni el electives el feeh"                           → "Show me the electives in it"
+"a3rf aktar 3anh"                                       → "Can I know more about it?"
+"2ad eh credits-o"                                      → "How many credits does it have?"
+"emta byt3lm-o"                                         → "When is it taught?"
+"howa byt2fl eh"                                        → "What does it unlock?"
+"eh el far2 beeno w el AIM"                             → "What is the difference between it and AIM?"
+"mno lazem a5od eh 2abl"                                → "What do I need to take before it?"
+"el mwad el btefd-y mno"                                → "What courses benefit from it?"
+"lih prerequisites wala la2"                            → "Does it have prerequisites or not?"
+
+# Pronoun references — plural "them" (DO NOT resolve — keep as English pronouns)
+"eh el prerequisites bta3ohom"                          → "What are their prerequisites?"
+"2ad eh credits-hom"                                    → "How many credits do they have?"
+"homa byt2flo eh"                                       → "What do they unlock?"
+"wareni el mwad el feehom"                              → "Show me the courses in them"
+"a2dar a5od-hom el semester da"                         → "Can I take them this semester?"
+"3anhom feeh eh aktar"                                  → "What more is there about them?"
+
+# Pronoun references — demonstratives (DO NOT resolve — keep as English pronouns)
+"da byt3lm emta"                                        → "When is this taught?"
+"da prerequisites bta3to eh"                            → "What are this one's prerequisites?"
+"dol mn el core wala electives"                         → "Are these core or electives?"
+"bta3 da 2ad eh credits"                                → "How many credits does this have?"
 """
 
 _ARABIC_FEW_SHOTS = """\
@@ -297,6 +325,31 @@ _ARABIC_FEW_SHOTS = """\
 "أنا بحب الـ NLP جداً"                                 → "I really love NLP"
 "أنا كويس في الرياضيات"                                → "I'm good at math"
 "أنا مش بحب التيوري خالص"                             → "I don't like theory at all"
+
+# Pronoun references — singular "it" (DO NOT resolve — keep as English pronouns)
+"ممكن أعرف إيه المواد اللي فيه"                        → "Can I know what courses are in it?"
+"إيه المتطلبات بتاعته"                                 → "What are its prerequisites?"
+"وريني الـ electives اللي فيه"                         → "Show me the electives in it"
+"أعرف أكتر عنه"                                        → "Can I know more about it?"
+"كام ساعة معتمدة فيه"                                  → "How many credit hours does it have?"
+"بيُدرَّس امتى"                                        → "When is it taught?"
+"هو بيفتح إيه"                                         → "What does it unlock?"
+"إيه الفرق بينه وبين AIM"                              → "What is the difference between it and AIM?"
+"محتاج أخد إيه قبله"                                   → "What do I need to take before it?"
+"له متطلبات سابقة ولا لأ"                              → "Does it have prerequisites or not?"
+
+# Pronoun references — plural "them" (DO NOT resolve — keep as English pronouns)
+"إيه المتطلبات بتاعتهم"                                → "What are their prerequisites?"
+"كام ساعة معتمدة فيهم"                                 → "How many credit hours do they have?"
+"هما بيفتحوا إيه"                                      → "What do they unlock?"
+"وريني المواد اللي فيهم"                               → "Show me the courses in them"
+"أقدر آخدهم السيمستر ده"                               → "Can I take them this semester?"
+
+# Pronoun references — demonstratives (DO NOT resolve — keep as English pronouns)
+"ده بيُدرَّس امتى"                                     → "When is this taught?"
+"دي ليها متطلبات سابقة إيه"                            → "What are this one's prerequisites?"
+"دول من الـ core ولا electives"                        → "Are these core or electives?"
+"بتاع ده كام ساعة"                                     → "How many credits does this have?"
 """
 
 _BASE_RULES = """\
@@ -306,7 +359,31 @@ RULES:
    course codes (e.g. AIM304, BCS311), technical terms, function names, error messages.
 3. Produce fluent, natural English — not word-for-word awkward translation.
 4. If the input is a question, the output must also be a question.
-5. Output ONLY the English translation. No explanations, no notes.\
+5. Output ONLY the English translation. No explanations, no notes.
+6. PRESERVE pronoun references — translate pronouns as English pronouns.
+   NEVER resolve, infer, or guess what a pronoun refers to.
+   The system has a dedicated reference-resolution step that handles this.
+
+   SINGULAR "it" (a course / track / program mentioned earlier):
+     Location  : fih / feeh / feeha / fiha → "in it"
+     Possession: bta3o / bta3to / bta3ha / bta3etha / -o / -h / -ha suffix → "its"
+                 e.g. "credits-o" = "its credits" | "prerequisites bta3to" = "its prerequisites"
+     About     : 3anh / 3aleh / 3aleeh / 3alieh → "about it"
+     From      : mno / mino / minho / mno → "from it"
+     For / To  : leeh / lih / leho → "for it"
+     With / By : bih / beeh / beeha → "with it"
+     Subject   : howa → "it" (masc antecedent) | heya → "it" (fem antecedent)
+     Demonstrative: da / de / dah → "this" | di / deh → "this" (fem) | bta3 da → "of this"
+
+   PLURAL "them" (multiple courses / tracks mentioned earlier):
+     Location  : fihom / feehom → "in them"
+     Possession: bta3ohom / bta3ethom / -hom suffix → "their"
+                 e.g. "prerequisites bta3ohom" = "their prerequisites"
+     About     : 3anhom / 3alehom → "about them"
+     From      : minhom → "from them"
+     For / To  : lihom / leehom → "for them"
+     Subject   : homa → "they" / "them"
+     Demonstrative: dol / duh / doul → "these"\
 """
 
 def _build_translation_messages(message: str, lang: str) -> list[dict]:

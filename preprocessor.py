@@ -1387,8 +1387,8 @@ class QueryPreprocessor:
         # Uses whole-word matching to avoid false positives
         # (e.g. "that" in "I want that course" vs "data" which contains "tha").
         REFERENCE_WORDS = {
-            "it", "its", "this", "that", "these", "those",
-            "them", "they",                              # ← was missing
+            "it", "its", "this", "these", "those",
+            "them", "they",
             "the course", "the subject", "the track", "the program",
             "same course", "that course", "this course",
         }
@@ -1446,6 +1446,12 @@ Rules:
   3. If nothing needs resolving, return the question EXACTLY as-is.
   4. Do NOT add information that was never in the conversation.
   5. Return ONLY the resolved question — nothing else.
+  6. CRITICAL: Do NOT change any part of the current question that is already
+     explicit and specific — even if it is an abbreviation (e.g. "sad", "das",
+     "aim", "ai", a course code, or a full name). If the student already
+     specified a program, track, or course in their question, keep it exactly
+     as-is. Only replace genuinely vague words (it, this, those, them, etc.)
+     that have NO specific referent within the question itself.
 
 Examples:
   Conversation: Student asked "what electives at das?" / Advisor answered about DAS electives

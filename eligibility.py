@@ -210,6 +210,12 @@ def get_student_context(student_id: str) -> dict:
         if isinstance(course, dict) and course.get("name")
         and (course.get("grade") or "").strip().lower() not in _FAILING
     ]
+    raw_failed = [
+        course["name"].lower()
+        for course in courses_degrees
+        if isinstance(course, dict) and course.get("name")
+        and (course.get("grade") or "").strip().lower() in _FAILING
+    ]
     completed_courses = FuzzyCompletedSet(raw_completed)
 
     track_code   = (row.get("track") or "").strip().upper()
@@ -217,6 +223,7 @@ def get_student_context(student_id: str) -> dict:
 
     return {
         "completed_courses":  completed_courses,
+        "failed_courses":     set(raw_failed),
         "program_name":       program_name,
         "total_hours_earned": row.get("total_hours_earned") or 0,
         "university_year":    row.get("university_year"),

@@ -509,6 +509,7 @@ def recommend_programs(student_id: str) -> str:
             if v > 0
         ),
     ]
+
     return "\n".join(lines)
 
 
@@ -642,8 +643,18 @@ def recommend_electives(
     if not catalogue:
         return f"No elective catalogue found for '{canonical}'."
 
+    completed_courses: set = set()
+    try:
+        from eligibility import get_student_context
+        completed_courses = get_student_context(student_id).get("completed_courses", set())
+    except Exception:
+        pass
+
+    already_completed = [name for name in catalogue if name in completed_courses]
+    active_catalogue  = {name: data for name, data in catalogue.items() if name not in completed_courses}
+
     scored: List[Tuple[str, float, dict]] = sorted(
-        [(name, _cosine(student_vec, data["profile"]), data) for name, data in catalogue.items()],
+        [(name, _cosine(student_vec, data["profile"]), data) for name, data in active_catalogue.items()],
         key=lambda x: -x[1],
     )
 
@@ -676,5 +687,14 @@ def recommend_electives(
         lines += ["", f"Top pick: {eligible_rows[0][0].title()} ({eligible_rows[0][2].get('code', '—')})"]
     else:
         lines.append("No eligible electives found based on your completed courses.")
+
+    if already_completed:
+        comp_t = ", ".join(n.title() for n in sorted(already_completed))
+        lines += [
+            "",
+            f"[ADVISOR NOTE] The following {'elective was' if len(already_completed) == 1 else 'electives were'} "
+            f"excluded from this recommendation because the student has already completed "
+            f"{'it' if len(already_completed) == 1 else 'them'}: {comp_t}.",
+        ]
 
     return "\n".join(lines)

@@ -20,6 +20,22 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Unspecialized-student constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+PROXY_TRACK = "artificial intelligence & machine learning"
+
+# Courses shared across ALL programs per term (Year 3/4).
+# Names use the PROXY_TRACK (AIM) canonical form so Neo4j queries are consistent.
+SHARED_COURSES_BY_TERM: Dict[Tuple[int, str], List[str]] = {
+    (3, 'First'):  ['current social issues in egypt', 'artificial intelligence', 'software engineering 1'],
+    (3, 'Second'): ['machine learning'],
+    (4, 'First'):  ['professional ethics', 'graduation project (1)'],
+    (4, 'Second'): ['entrepreneurship', 'graduation project (2)'],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # get_elective_slots
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -86,6 +102,27 @@ def _check_prereqs(
     return True
 
 
+def _get_missing_prereqs(
+    course_name: str,
+    track: str,
+    completed: Set[str],
+    earned: int,
+) -> List[str]:
+    """Return human-readable names of prerequisites the student hasn't met yet."""
+    prereqs = get_prerequisites(course_name, track)
+    missing: List[str] = []
+    for p in prereqs.get('prerequisites', []):
+        if 'Required_Credit_Hours' in p:
+            req = int(p['Required_Credit_Hours'])
+            if earned < req:
+                missing.append(f"{req} earned credit hours (you have {earned})")
+        else:
+            pname = (p.get('name') or '').lower()
+            if pname and pname not in completed:
+                missing.append(pname)
+    return missing
+
+
 def _get_term_mandatory(
     year: int,
     sem: str,
@@ -111,6 +148,60 @@ def _get_term_mandatory(
                         continue
                     if _check_prereqs(name, track, completed, earned):
                         result.append({**course, 'course_name': name})
+    return result
+
+
+def _get_all_term_mandatory_raw(year: int, sem: str, track: str) -> List[dict]:
+    """All mandatory courses for a term regardless of prereq status or completion."""
+    from neo4j_course_functions import get_courses_by_term
+    term_data = get_courses_by_term(year, sem, track)
+    result: List[dict] = []
+    if not term_data:
+        return result
+    for _, semesters in term_data.items():
+        for _, programs in semesters.items():
+            if track in programs:
+                for course in programs[track]:
+                    if course.get('course_type') != 'mandatory':
+                        continue
+                    name = course['course_name'].lower()
+                    result.append({**course, 'course_name': name})
+    return result
+
+
+def _get_shared_term_mandatory(
+    year: int,
+    sem: str,
+    completed: Set[str],
+    planned: Set[str],
+    earned: int,
+) -> List[dict]:
+    """
+    Eligible shared courses for a Y3/Y4 term for unspecialized students.
+    Fetches credit_hours live from Neo4j (PROXY_TRACK); prereqs checked dynamically.
+    """
+    from neo4j_course_functions import get_course_info
+    shared_names = SHARED_COURSES_BY_TERM.get((year, sem), [])
+    result: List[dict] = []
+    for name in shared_names:
+        if name in completed or name in planned:
+            continue
+        if not _check_prereqs(name, PROXY_TRACK, completed, earned):
+            continue
+        try:
+            info_list = get_course_info(name, PROXY_TRACK)
+            info = info_list[0] if info_list else {}
+        except Exception:
+            info = {}
+        credit_hours = info.get('credit_hours', 0)
+        if not credit_hours:
+            continue
+        result.append({
+            'course_name':  name,
+            'credit_hours': credit_hours,
+            'course_type':  'mandatory',
+            'course_code':  info.get('code', ''),
+        })
     return result
 
 
@@ -175,7 +266,29 @@ def _resolve_overflow(
             return 0
         return len(_get_dependents(c['course_name'], track))
 
-    # Priority layers
+    # Pass 0 — Protect combined union of all priority terms.
+    # Removes courses that don't unlock anything in ANY priority term before
+    # the individual-term passes start. Only active when 2+ sets are given
+    # (Stage 1 backlog: cur_names + next_names).
+    if len(priority_term_sets) > 1 and total_cr(remaining) > avail:
+        combined = set().union(*priority_term_sets)
+        pass0_candidates: List[Tuple[dict, int]] = []
+        for c in remaining:
+            closes = set() if c.get('is_elective_pick') else _get_dependents(c['course_name'], track)
+            if not closes.intersection(combined):
+                pass0_candidates.append((c, eff_deps(c)))
+        pass0_candidates.sort(key=lambda x: x[1])
+        for c, d in pass0_candidates:
+            if total_cr(remaining) <= avail:
+                break
+            remaining.remove(c)
+            removed.append(c)
+            advisor_notes.append(
+                f"Removed '{c['course_name']}' to fit credit limit "
+                f"(dependents: {d}, does not close any combined priority term courses)"
+            )
+
+    # Priority layers (Pass 1, Pass 2, …)
     for term_names in priority_term_sets:
         if total_cr(remaining) <= avail:
             break
@@ -256,26 +369,26 @@ def _stage4_candidates(
 
 
 def _build_result(
-    student_id:     str,
-    year:           int,
-    semester:       str,
-    track:          str,
-    original_avail: int,
+    student_id:      str,
+    year:            int,
+    semester:        str,
+    track:           str,
+    original_avail:  int,
     suggest_courses: List[dict],
-    advisor_notes:  List[str],
-    course_details: Dict[str, dict],
+    advisor_notes:   List[str],
+    course_details:  Dict[str, dict],
 ) -> dict:
     planned_credits = sum(c['credit_hours'] for c in suggest_courses)
     return {
-        'student_id':       student_id,
-        'year':             year,
-        'semester':         semester,
-        'track':            track,
+        'student_id':        student_id,
+        'year':              year,
+        'semester':          semester,
+        'track':             track,
         'available_credits': original_avail,
-        'planned_credits':  planned_credits,
-        'planned_courses':  suggest_courses,
-        'advisor_notes':    advisor_notes,
-        'course_details':   course_details,
+        'planned_credits':   planned_credits,
+        'planned_courses':   suggest_courses,
+        'advisor_notes':     advisor_notes,
+        'course_details':    course_details,
     }
 
 
@@ -311,16 +424,57 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
 
     # ── Student data ──────────────────────────────────────────────────────────
     ctx = get_student_context(student_id)
-    if not ctx or not ctx.get('program_name'):
+    if not ctx:
         return None
 
-    completed: Set[str] = set(ctx['completed_courses'])
-    track:     str      = ctx['program_name']
-    earned:    int      = ctx['total_hours_earned']
-    gpa:       float    = ctx['gpa'] or 0.0
-    uni_year:  int      = ctx['university_year']
-    sem_num:   int      = ctx['current_term'] or 1
-    semester:  str      = 'First' if sem_num == 1 else 'Second'
+    completed:  Set[str] = set(ctx['completed_courses'])
+    earned:     int      = ctx['total_hours_earned']
+    gpa:        float    = ctx['gpa'] or 0.0
+    uni_year:   int      = ctx.get('university_year') or 0
+    sem_num:    int      = ctx['current_term'] or 2
+    semester:   str      = 'First' if sem_num == 1 else 'Second'
+
+    # ── Failed courses (for tagging backlog and classifying unplanned courses) ─
+    failed_courses_set: Set[str] = ctx.get('failed_courses', set())
+
+    # ── Track / unspecialized detection ──────────────────────────────────────
+    raw_track:        Optional[str] = ctx.get('program_name')
+    is_unspecialized: bool          = False
+
+    if not raw_track:
+        if uni_year in (3, 4):
+            # Data error — Year 3/4 students must have a declared track
+            return {
+                'student_id':        student_id,
+                'year':              uni_year,
+                'semester':          semester,
+                'track':             '',
+                'available_credits': 0,
+                'planned_credits':   0,
+                'planned_courses':   [],
+                'advisor_notes': [
+                    "⚠️ Your specialization track is missing from our records. "
+                    "Year 3 and Year 4 courses are program-specific and cannot be "
+                    "planned without a declared track. Please contact the registrar "
+                    "to have your track assigned before we can generate a plan for you."
+                ],
+                'course_details': {},
+            }
+        if not uni_year:
+            return None  # incomplete record — cannot plan
+        is_unspecialized = True
+        track = PROXY_TRACK
+    else:
+        track = raw_track
+
+    # Display label shown in the result dict and advisor notes (not used for queries)
+    _display_track = "Pre-Specialization (Universal Curriculum)" if is_unspecialized else track
+
+    # ── Internal state for note generation ───────────────────────────────────
+    _termination_info:       dict       = {}   # set by process_stage on termination
+    _stage_overflow_removed: List[dict] = []   # all courses dropped by overflow
+    _has_backlog:  bool = False                # set after Stage 1 scan
+    _has_current:  bool = False                # set after Stage 2 scan
 
     # ── Credit limit ──────────────────────────────────────────────────────────
     if gpa >= 3.0:
@@ -333,8 +487,17 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
     avail_credits: int = original_avail
     advisor_notes.append(
         f"Planning Year {uni_year}, {semester} Semester | "
-        f"Track: {track} | GPA: {gpa} → {avail_credits}-credit limit"
+        f"Track: {_display_track} | GPA: {gpa} → {avail_credits}-credit limit"
     )
+
+    if is_unspecialized:
+        advisor_notes.append(
+            "📋 You have not declared a specialization track yet. This plan covers "
+            "your universal Year 1–2 curriculum plus courses shared across all programs "
+            "in Years 3–4. Course names reflect the standard curriculum and may vary "
+            "slightly depending on your final track. Once you specialize, a full "
+            "track-specific plan will be available."
+        )
 
     # ── Student preference vector (for elective reasoning) ────────────────────
     _student_vec, _ = merge_preferences(student_id)
@@ -452,26 +615,371 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
         if total <= avail_credits:
             suggest_courses.extend(_tag(candidates))
             avail_credits -= total
-            note = f"{label}: added {len(mandatory)} mandatory course(s)"
-            if elective_picks:
-                note += f" + {len(elective_picks)} elective(s)"
-            advisor_notes.append(note)
             if avail_credits == 0:
-                advisor_notes.append("Credit limit reached.")
+                _termination_info.update({'reason': 'exact', 'stage_type': stage_type})
                 return True
             return False
 
-        else:  # overflow
-            advisor_notes.append(
-                f"{label}: {total} credits exceeds {avail_credits} available — resolving overflow"
-            )
+        else:  # overflow — redirect _resolve_overflow's internal notes to a sink
+            _avail_before   = avail_credits
+            _overflow_sink: List[str] = []
             resolved, removed = _resolve_overflow(
-                candidates, avail_credits, track, advisor_notes, priority_term_sets
+                candidates, avail_credits, track, _overflow_sink, priority_term_sets
             )
+            _stage_overflow_removed.extend(removed)
             return_to_pool(removed)
             suggest_courses.extend(_tag(resolved))
             avail_credits -= sum(c['credit_hours'] for c in resolved)
-            return True  # always terminate on overflow
+            _termination_info.update({
+                'reason':       'overflow',
+                'stage_type':   stage_type,
+                'total_needed': total,
+                'avail_before': _avail_before,
+                'resolved':     list(resolved),
+                'removed':      list(removed),
+            })
+            return True
+
+    # ── Note generators (called after process_stage returns True) ─────────────
+
+    def _generate_overflow_note() -> None:
+        """Append a student-friendly explanation of the overflow decision."""
+        total_needed = _termination_info.get('total_needed', 0)
+        avail_before = _termination_info.get('avail_before', 0)
+        resolved     = _termination_info.get('resolved', [])
+        removed      = _termination_info.get('removed', [])
+        stage_type   = _termination_info.get('stage_type', '')
+
+        elec_removed = [c for c in removed if     c.get('is_elective_pick')]
+        mand_removed = [c for c in removed if not c.get('is_elective_pick')]
+        mand_kept    = [c for c in resolved if not c.get('is_elective_pick')]
+
+        stage_labels = {
+            'backlog': 'previous-semester backlog',
+            'current': f'Year {uni_year} {semester} Semester (current term)',
+            'future':  'advanced future courses',
+        }
+        stage_label = stage_labels.get(stage_type, stage_type)
+
+        advisor_notes.append(
+            f"⚠️ Credit limit situation ({stage_label}): you had "
+            f"{total_needed} credits worth of eligible courses but only "
+            f"{avail_before} credits were available in your allowance."
+        )
+        advisor_notes.append(
+            "How the selection was made: Elective picks are always removed first "
+            "because they do not block any required course. Among mandatory courses, "
+            "those that unlock courses in your upcoming terms are protected first. "
+            "The remaining are sorted by downstream impact — courses with fewer future "
+            "dependencies are removed before those with more."
+        )
+        if elec_removed:
+            names = ', '.join(c['course_name'].title() for c in elec_removed)
+            advisor_notes.append(
+                f"Elective(s) set aside this session: {names}. "
+                f"They will be available again in your next planning session."
+            )
+        if mand_kept:
+            names = ', '.join(c['course_name'].title() for c in mand_kept)
+            advisor_notes.append(
+                f"✅ Mandatory courses kept in your plan: {names}. "
+                f"These were prioritised because they open doors to your upcoming "
+                f"terms or have the most downstream dependencies."
+            )
+        if mand_removed:
+            names = ', '.join(c['course_name'].title() for c in mand_removed)
+            advisor_notes.append(
+                f"🚫 Mandatory course(s) moved to your next session: {names}. "
+                f"These had less immediate impact on your upcoming path and will "
+                f"be given priority again in your next semester's plan."
+            )
+
+    def _generate_termination_note() -> None:
+        """Append a note explaining what subsequent stages were blocked."""
+        reason     = _termination_info.get('reason', '')
+        stage_type = _termination_info.get('stage_type', '')
+
+        if stage_type == 'backlog':
+            if reason == 'overflow':
+                advisor_notes.append(
+                    f"📌 Because the credit limit was reached during backlog processing, "
+                    f"your current-term courses (Year {uni_year}, {semester} Semester) "
+                    f"and any advanced future courses could not be added this session. "
+                    f"Clearing your backlog is the top priority right now."
+                )
+            else:
+                advisor_notes.append(
+                    f"📌 Your backlog courses filled your entire {original_avail}-credit "
+                    f"allowance completely. No credit remained for your current-term courses "
+                    f"(Year {uni_year}, {semester} Semester) or any advanced future courses. "
+                    f"Once you clear this backlog, those will take centre stage."
+                )
+
+        elif stage_type == 'current':
+            backlog_part = " backlog and" if _has_backlog else ""
+            if reason == 'overflow':
+                advisor_notes.append(
+                    f"📌 The credit limit was reached while planning your current-term "
+                    f"courses (Year {uni_year}, {semester} Semester). "
+                    f"No advanced future courses could be pulled forward this session."
+                )
+            else:
+                advisor_notes.append(
+                    f"📌 Your{backlog_part} current-term courses "
+                    f"(Year {uni_year}, {semester} Semester) filled your entire "
+                    f"{original_avail}-credit allowance. "
+                    f"No advanced future courses were added this session."
+                )
+
+        elif stage_type == 'future':
+            if reason == 'overflow':
+                advisor_notes.append(
+                    f"📌 The credit limit was reached while pulling forward advanced "
+                    f"future courses. Your plan is now complete within your "
+                    f"{original_avail}-credit allowance."
+                )
+            else:
+                advisor_notes.append(
+                    f"📌 Your {original_avail}-credit allowance is fully used — "
+                    f"your plan is complete for this semester."
+                )
+
+        else:
+            advisor_notes.append(
+                f"📌 Credit allowance of {original_avail} credits fully used."
+            )
+
+    # ── Unplanned course classifier ───────────────────────────────────────────
+
+    def _add_unplanned_notes() -> None:
+        """
+        Scan all past and current terms to classify every unplanned mandatory
+        course and append student-friendly notes to advisor_notes.
+        """
+        def _term_idx(y: int, s: str) -> int:
+            return y * 2 + (0 if s == 'First' else 1)
+
+        current_idx            = _term_idx(uni_year, semester)
+        planned                = planned_names()
+        overflow_removed_names = {c['course_name'] for c in _stage_overflow_removed}
+
+        failed_wrong_sem:   List[dict] = []
+        eligible_wrong_sem: List[dict] = []
+        blocked_wrong_sem:  List[dict] = []
+        blocked_same_sem:   List[dict] = []
+
+        # ── Scan all previous terms (any semester type) ───────────────────────
+        for y in range(1, uni_year + 1):
+            for s in ['First', 'Second']:
+                if _term_idx(y, s) >= current_idx:
+                    break  # reached current term — stop inner loop
+
+                raw_courses = _get_all_term_mandatory_raw(y, s, track)
+                for course in raw_courses:
+                    name = course['course_name']
+                    if name in completed or name in planned:
+                        continue
+                    if name in overflow_removed_names:
+                        continue  # already explained in the overflow note
+
+                    is_failed   = name in failed_courses_set
+                    is_same_sem = (s == semester)
+                    prereqs_ok  = _check_prereqs(name, track, completed, earned)
+
+                    if is_same_sem:
+                        # Was a candidate for the backlog stage.
+                        # If prereqs were met it should have been planned or overflow-removed.
+                        # Only reach here if prereqs are NOT met.
+                        if not prereqs_ok:
+                            missing = _get_missing_prereqs(name, track, completed, earned)
+                            blocked_same_sem.append({
+                                'course_name':       name,
+                                'year':              y,
+                                'semester':          s,
+                                'missing_prereqs':   missing,
+                                'previously_failed': is_failed,
+                            })
+                    else:
+                        # Different semester type — cannot be planned this term at all.
+                        if is_failed:
+                            failed_wrong_sem.append({
+                                'course_name': name, 'year': y, 'semester': s,
+                            })
+                        elif prereqs_ok:
+                            eligible_wrong_sem.append({
+                                'course_name': name, 'year': y, 'semester': s,
+                            })
+                        else:
+                            missing = _get_missing_prereqs(name, track, completed, earned)
+                            blocked_wrong_sem.append({
+                                'course_name':     name,
+                                'year':            y,
+                                'semester':        s,
+                                'missing_prereqs': missing,
+                            })
+
+        # ── Scan current term for prereq-blocked courses ───────────────────────
+        current_term_blocked: List[dict] = []
+        cur_all_raw = _get_all_term_mandatory_raw(uni_year, semester, track)
+        for course in cur_all_raw:
+            name = course['course_name']
+            if name in completed or name in planned:
+                continue
+            if name in overflow_removed_names:
+                continue
+            if not _check_prereqs(name, track, completed, earned):
+                missing = _get_missing_prereqs(name, track, completed, earned)
+                current_term_blocked.append({
+                    'course_name':     name,
+                    'year':            uni_year,
+                    'semester':        semester,
+                    'missing_prereqs': missing,
+                })
+
+        # ── Generate notes ────────────────────────────────────────────────────
+
+        if failed_wrong_sem:
+            advisor_notes.append(
+                f"── Courses you previously failed that are not offered in the "
+                f"{semester} semester ──"
+            )
+            for entry in failed_wrong_sem:
+                name = entry['course_name'].title()
+                y, s = entry['year'], entry['semester']
+                advisor_notes.append(
+                    f"❌ You previously failed {name} (Year {y}, {s} Semester). "
+                    f"This course is only offered in the {s} semester — not your "
+                    f"current {semester} semester, so it cannot be planned right now. "
+                    f"Your options: check whether it runs in summer by visiting the "
+                    f"Community → Q&A tab in the app (the team replies in under 12 hours), "
+                    f"or take it next time the {s} semester comes around."
+                )
+
+        if eligible_wrong_sem:
+            advisor_notes.append(
+                f"── Courses you haven't completed yet, prerequisites met, "
+                f"but offered in the other semester ──"
+            )
+            for entry in eligible_wrong_sem:
+                name = entry['course_name'].title()
+                y, s = entry['year'], entry['semester']
+                advisor_notes.append(
+                    f"📅 You haven't completed {name} yet (Year {y}, {s} Semester) — "
+                    f"and your prerequisites ARE met, so you are fully eligible. "
+                    f"However, it is only offered in the {s} semester, not your current "
+                    f"{semester} semester. "
+                    f"You can check summer availability via the Community → Q&A tab "
+                    f"(reply in under 12 hours), or take it next {s} semester."
+                )
+
+        if blocked_wrong_sem:
+            advisor_notes.append(
+                f"── Courses not yet complete, prerequisites missing, "
+                f"and offered in the other semester ──"
+            )
+            for entry in blocked_wrong_sem:
+                name    = entry['course_name'].title()
+                y, s    = entry['year'], entry['semester']
+                prereqs = (', '.join(p.title() for p in entry['missing_prereqs'])
+                           or 'certain prerequisites')
+                advisor_notes.append(
+                    f"📅 You haven't completed {name} yet (Year {y}, {s} Semester). "
+                    f"You are not eligible yet — you are still missing: {prereqs}. "
+                    f"On top of that, it is only offered in the {s} semester "
+                    f"(not your current {semester} semester), so it could not be planned "
+                    f"right now regardless. Focus on completing the prerequisites first."
+                )
+
+        if blocked_same_sem:
+            advisor_notes.append(
+                f"── Courses from previous {semester} semesters that you can't take "
+                f"yet due to missing prerequisites ──"
+            )
+            for entry in blocked_same_sem:
+                name       = entry['course_name'].title()
+                y, s       = entry['year'], entry['semester']
+                prereqs    = (', '.join(p.title() for p in entry['missing_prereqs'])
+                              or 'certain prerequisites')
+                was_failed = entry['previously_failed']
+                if was_failed:
+                    advisor_notes.append(
+                        f"🔒 You previously failed {name} (Year {y}, {s} Semester). "
+                        f"You are not eligible to retake it this term because you are "
+                        f"still missing: {prereqs}. "
+                        f"Complete those courses first to unlock it."
+                    )
+                else:
+                    advisor_notes.append(
+                        f"🔒 You haven't completed {name} yet (Year {y}, {s} Semester). "
+                        f"You are not eligible this term because you are still missing: "
+                        f"{prereqs}. Complete those prerequisites first to unlock it."
+                    )
+
+        if current_term_blocked:
+            advisor_notes.append(
+                f"── Current-term courses (Year {uni_year}, {semester} Semester) "
+                f"you can't take yet due to missing prerequisites ──"
+            )
+            for entry in current_term_blocked:
+                name    = entry['course_name'].title()
+                prereqs = (', '.join(p.title() for p in entry['missing_prereqs'])
+                           or 'certain prerequisites')
+                advisor_notes.append(
+                    f"⛔ {name} is part of your Year {uni_year}, {semester} Semester "
+                    f"curriculum, but you cannot take it this term because you are still "
+                    f"missing: {prereqs}. "
+                    f"Complete those prerequisites to unlock it in a future term."
+                )
+
+        # ── Scan future terms (same semester type) for prereq-blocked courses ──
+        future_blocked: List[dict] = []
+        for future_y in range(uni_year + 1, 5):
+            if is_unspecialized and future_y >= 3:
+                # Only shared courses for unspecialized students
+                for name in SHARED_COURSES_BY_TERM.get((future_y, semester), []):
+                    if name in completed or name in planned or name in overflow_removed_names:
+                        continue
+                    if not _check_prereqs(name, track, completed, earned):
+                        missing = _get_missing_prereqs(name, track, completed, earned)
+                        future_blocked.append({
+                            'course_name':     name,
+                            'year':            future_y,
+                            'semester':        semester,
+                            'missing_prereqs': missing,
+                        })
+            else:
+                for course in _get_all_term_mandatory_raw(future_y, semester, track):
+                    name = course['course_name']
+                    if name in completed or name in planned or name in overflow_removed_names:
+                        continue
+                    if not _check_prereqs(name, track, completed, earned):
+                        missing = _get_missing_prereqs(name, track, completed, earned)
+                        future_blocked.append({
+                            'course_name':     name,
+                            'year':            future_y,
+                            'semester':        semester,
+                            'missing_prereqs': missing,
+                        })
+
+        if future_blocked:
+            advisor_notes.append(
+                f"── Future {semester} semester courses you are not yet eligible for ──"
+            )
+            for entry in future_blocked:
+                name    = entry['course_name'].title()
+                y       = entry['year']
+                prereqs = (', '.join(p.title() for p in entry['missing_prereqs'])
+                           or 'certain prerequisites')
+                advisor_notes.append(
+                    f"🔒 {name} is scheduled for Year {y}, {semester} Semester — a future term. "
+                    f"You are not yet eligible because you are still missing: {prereqs}. "
+                    f"Work on completing these prerequisites now so the course is fully "
+                    f"unlocked when that semester arrives."
+                )
+
+    def _finalize_with_unplanned() -> Dict[str, dict]:
+        _add_unplanned_notes()
+        return _finalize()
 
     # ── Post-stage enrichment ─────────────────────────────────────────────────
 
@@ -498,8 +1006,8 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
             'optimization':           'operations research and performance engineering',
         }
 
-        course_details: Dict[str, dict] = {}
-        per_course_notes: List[str] = []
+        course_details:   Dict[str, dict] = {}
+        per_course_notes: List[str]        = []
 
         for c in suggest_courses:
             name  = c['course_name']
@@ -524,23 +1032,35 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
             what     = mot if mot else desc   # prefer the motivation (why-focused) over raw description
 
             if stage == 'backlog':
-                from_y = c.get('_from_year', '?')
-                from_s = c.get('_from_sem', '?')
+                from_y     = c.get('_from_year', '?')
+                from_s     = c.get('_from_sem', '?')
+                was_failed = c.get('_previously_failed', False)
+                if was_failed:
+                    history = (
+                        f"You previously attempted and failed this course "
+                        f"(Year {from_y}, {from_s} Semester). "
+                        f"This is your opportunity to retake it and clear it from your record."
+                    )
+                else:
+                    history = (
+                        f"This mandatory course from Year {from_y}, {from_s} Semester "
+                        f"was not completed at the time. "
+                        f"Taking it now keeps your academic record clean and on track."
+                    )
                 note = (
-                    f"📚 {title}{code_tag} ({cr} cr) — BACKLOG from Year {from_y}, {from_s} Semester. "
-                    f"You have not yet completed this mandatory course. Skipping mandatory courses "
-                    f"can lower your GPA and block future courses that depend on it as a prerequisite. "
-                    f"Completing it now improves your academic standing and clears the path for "
-                    f"advanced courses in your curriculum."
+                    f"📚 {title}{code_tag} ({cr} cr) — BACKLOG: {history} "
+                    f"Completing mandatory backlog courses protects your GPA and unblocks "
+                    f"future courses that depend on this one as a prerequisite."
                 )
                 if desc:
                     note += f" What you will study: {desc}"
 
             elif stage == 'current':
                 note = (
-                    f"📖 {title}{code_tag} ({cr} cr) — CURRENT TERM mandatory (Year {uni_year}, "
-                    f"{semester} Semester). This course is part of your official curriculum for "
-                    f"this semester. Completing it on schedule keeps your graduation plan on track "
+                    f"📖 {title}{code_tag} ({cr} cr) — CURRENT TERM mandatory "
+                    f"(Year {uni_year}, {semester} Semester). "
+                    f"This course is part of your official curriculum for this semester. "
+                    f"Completing it on schedule keeps your graduation plan on track "
                     f"and ensures you do not accumulate backlog in future terms."
                 )
                 if what:
@@ -549,10 +1069,12 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
             elif stage == 'future':
                 from_y = c.get('_from_year', '?')
                 note = (
-                    f"🔮 {title}{code_tag} ({cr} cr) — ADVANCED from Year {from_y}. "
-                    f"You still have available credit space this term, so this future course is "
-                    f"pulled forward to make the most of your allowance. Taking it now lightens "
-                    f"your workload in upcoming semesters and keeps you ahead of schedule."
+                    f"🔮 {title}{code_tag} ({cr} cr) — ADVANCED from Year {from_y}, "
+                    f"{semester} Semester. "
+                    f"You still have available credit space this term, so this future course "
+                    f"is pulled forward to make the most of your allowance. "
+                    f"Taking it now lightens your workload in upcoming semesters and keeps "
+                    f"you ahead of schedule."
                 )
                 if what:
                     note += f" What you will gain: {what}"
@@ -607,24 +1129,38 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
                 continue
             term_courses = _get_term_mandatory(y, s, track, completed, planned_names(), earned)
             for c in term_courses:
-                c['_from_year'] = y
-                c['_from_sem']  = s
+                c['_from_year']         = y
+                c['_from_sem']          = s
+                c['_previously_failed'] = c['course_name'] in failed_courses_set
             prev_mandatory.extend(term_courses)
             prev_elective_slots += remaining_slots.get((y, s), 0)
 
-    if prev_mandatory or prev_elective_slots > 0:
+    _has_backlog = bool(prev_mandatory or prev_elective_slots > 0)
+
+    if _has_backlog:
         cur_names      = _get_term_all_names(uni_year, semester, track)
         next_y, next_s = _next_term(uni_year, semester)
-        next_names     = _get_term_all_names(next_y, next_s, track)
+        if is_unspecialized and next_y >= 3:
+            next_names = set(SHARED_COURSES_BY_TERM.get((next_y, next_s), []))
+        else:
+            next_names = _get_term_all_names(next_y, next_s, track)
         if process_stage(
             prev_mandatory, prev_elective_slots,
             [cur_names, next_names],
             "Previous terms backlog",
             stage_type='backlog',
         ):
-            cd = _finalize()
-            return _build_result(student_id, uni_year, semester, track,
+            if _termination_info.get('reason') == 'overflow':
+                _generate_overflow_note()
+            _generate_termination_note()
+            cd = _finalize_with_unplanned()
+            return _build_result(student_id, uni_year, semester, _display_track,
                                   original_avail, suggest_courses, advisor_notes, cd)
+    else:
+        advisor_notes.append(
+            f"✅ Great news — you have completed all mandatory courses from your previous "
+            f"{semester} semesters! Your backlog is completely clear. Well done!"
+        )
 
     # ── Stage 2: Current term ─────────────────────────────────────────────────
     cur_mandatory = _get_term_mandatory(
@@ -635,28 +1171,52 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
         c['_from_sem']  = semester
     cur_elective_slots = remaining_slots.get((uni_year, semester), 0)
 
-    if cur_mandatory or cur_elective_slots > 0:
+    _has_current = bool(cur_mandatory or cur_elective_slots > 0)
+
+    if _has_current:
         next_y, next_s = _next_term(uni_year, semester)
-        next_names     = _get_term_all_names(next_y, next_s, track)
+        if is_unspecialized and next_y >= 3:
+            next_names = set(SHARED_COURSES_BY_TERM.get((next_y, next_s), []))
+        else:
+            next_names = _get_term_all_names(next_y, next_s, track)
         if process_stage(
             cur_mandatory, cur_elective_slots,
             [next_names],
             f"Year {uni_year} {semester} Semester",
             stage_type='current',
         ):
-            cd = _finalize()
-            return _build_result(student_id, uni_year, semester, track,
+            if _termination_info.get('reason') == 'overflow':
+                _generate_overflow_note()
+            _generate_termination_note()
+            cd = _finalize_with_unplanned()
+            return _build_result(student_id, uni_year, semester, _display_track,
                                   original_avail, suggest_courses, advisor_notes, cd)
+    else:
+        advisor_notes.append(
+            f"⭐ You have already completed all mandatory courses for your current term "
+            f"(Year {uni_year}, {semester} Semester). That is exceptional progress — "
+            f"you are ahead of your curriculum!"
+        )
 
     # ── Stage 3: Future years (same semester), uni_year+1 → 4 ────────────────
     for future_y in range(uni_year + 1, 5):
-        fut_mandatory = _get_term_mandatory(
-            future_y, semester, track, completed, planned_names(), earned
-        )
-        for c in fut_mandatory:
-            c['_from_year'] = future_y
-            c['_from_sem']  = semester
-        fut_elective_slots = remaining_slots.get((future_y, semester), 0)
+        if is_unspecialized and future_y >= 3:
+            # Only shared courses — no track-specific electives
+            fut_mandatory = _get_shared_term_mandatory(
+                future_y, semester, completed, planned_names(), earned
+            )
+            for c in fut_mandatory:
+                c['_from_year'] = future_y
+                c['_from_sem']  = semester
+            fut_elective_slots = 0
+        else:
+            fut_mandatory = _get_term_mandatory(
+                future_y, semester, track, completed, planned_names(), earned
+            )
+            for c in fut_mandatory:
+                c['_from_year'] = future_y
+                c['_from_sem']  = semester
+            fut_elective_slots = remaining_slots.get((future_y, semester), 0)
 
         if not fut_mandatory and fut_elective_slots == 0:
             continue
@@ -667,14 +1227,19 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
             f"Year {future_y} {semester} Semester (advanced)",
             stage_type='future',
         ):
-            cd = _finalize()
-            return _build_result(student_id, uni_year, semester, track,
+            if _termination_info.get('reason') == 'overflow':
+                _generate_overflow_note()
+            _generate_termination_note()
+            cd = _finalize_with_unplanned()
+            return _build_result(student_id, uni_year, semester, _display_track,
                                   original_avail, suggest_courses, advisor_notes, cd)
 
     # ── Stage 4: Fill leftover 1-2 credits from closest future year ───────────
     if 0 < avail_credits <= 2:
         pnames = planned_names()
         for future_y in range(uni_year + 1, 5):
+            if is_unspecialized and future_y >= 3:
+                continue  # shared Y3/4 courses were handled in Stage 3
             candidates = _stage4_candidates(
                 avail_credits, future_y, semester, track, completed, pnames, earned
             )
@@ -712,13 +1277,13 @@ def planning(student_id: str, supabase_client) -> Optional[dict]:
 
             if added:
                 for c in added:
-                    c['_stage'] = 'stage4'
+                    c['_stage']     = 'stage4'
                     c['_from_year'] = future_y
                 suggest_courses.extend(added)
                 break
 
-    cd = _finalize()
+    cd = _finalize_with_unplanned()
     return _build_result(
-        student_id, uni_year, semester, track,
+        student_id, uni_year, semester, _display_track,
         original_avail, suggest_courses, advisor_notes, cd,
     )

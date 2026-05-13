@@ -560,26 +560,79 @@ def start_course_planning() -> str:
         ]
 
         notes = result.get('advisor_notes', [])
-        if notes:
+
+        # ── Categorise notes by emoji prefix ─────────────────────────────────
+        _COURSE_NOTE_EMOJIS = ('📖', '🔮', '📚', '⭐', '✨')
+        _BLOCKED_EMOJIS     = ('⛔', '🔒', '❌', '📅')
+
+        general_notes = []
+        blocked_notes = []
+        course_notes  = []
+        for note in notes:
+            if any(note.startswith(e) for e in _COURSE_NOTE_EMOJIS):
+                course_notes.append(note)
+            elif any(note.startswith(e) for e in _BLOCKED_EMOJIS) or note.startswith('──'):
+                blocked_notes.append(note)
+            else:
+                general_notes.append(note)
+
+        # 1 — General planning context (credit limit, track status, backlog status …)
+        if general_notes:
             lines.append("")
-            lines.append("Planning notes:")
-            for note in notes:
+            lines.append("Planning context:")
+            for note in general_notes:
                 lines.append(f"  • {note}")
 
+        # 2 — Recommended courses with origin (year / semester / stage)
+        _STAGE_LABELS = {
+            'backlog':  'Backlog',
+            'current':  'Current Term',
+            'future':   'Advanced',
+            'stage4':   'Credit Filler',
+            'elective': 'Elective',
+        }
         courses = result.get('planned_courses', [])
         if courses:
             lines.append("")
             lines.append("Recommended courses:")
-            for i, course in enumerate(courses, 1):
-                name  = course.get('course_name', 'Unknown')
-                cr    = course.get('credit_hours', '?')
-                ctype = course.get('course_type', 'course')
-                code  = course.get('course_code', '')
-                tag   = f" [{code}]" if code else ""
-                lines.append(f"  {i}. {name}{tag} — {cr} cr ({ctype})")
+            for idx, course in enumerate(courses, 1):
+                name   = course.get('course_name', 'Unknown')
+                cr     = course.get('credit_hours', '?')
+                ctype  = course.get('course_type', 'course')
+                code   = course.get('course_code', '')
+                from_y = course.get('_from_year', '')
+                from_s = course.get('_from_sem', '')
+                stage  = course.get('_stage', '')
+                tag    = f" [{code}]" if code else ""
+                if from_y and from_s:
+                    slabel = _STAGE_LABELS.get(stage, '')
+                    origin = f" | Year {from_y}, {from_s} Semester"
+                    if slabel:
+                        origin += f" ({slabel})"
+                else:
+                    origin = ""
+                lines.append(f"  {idx}. {name}{tag} — {cr} cr ({ctype}){origin}")
         else:
             lines.append("")
             lines.append("No courses could be planned for this term.")
+
+        # 3 — Per-course details and recommendations (what/why/career)
+        if course_notes:
+            lines.append("")
+            lines.append("Course details and advisor recommendations:")
+            for note in course_notes:
+                lines.append(f"  • {note}")
+
+        # 4 — Blocked / unavailable courses (prominently labelled so the answer LLM
+        #     includes them in the student-facing response)
+        if blocked_notes:
+            lines.append("")
+            lines.append(
+                "IMPORTANT — Courses not included in this semester's plan "
+                "(explain each of these to the student):"
+            )
+            for note in blocked_notes:
+                lines.append(f"  {note}")
 
         return "\n".join(lines)
 
@@ -891,6 +944,22 @@ def get_program_recommendation() -> str:
     - "Which is better for me — data science or AI?"
     """
     sid = _get_student_id()
+
+    student_prog = None
+    try:
+        from eligibility import get_student_context
+        student_prog = get_student_context(sid).get("program_name")
+    except Exception:
+        pass
+
+    if student_prog:
+        return (
+            f"[ADVISOR NOTE] This student is already enrolled in the "
+            f"{student_prog.title()} program. Do not recommend switching programs. "
+            f"Ask if they would like to know more about their program's courses, "
+            f"electives, prerequisites, or schedule."
+        )
+
     try:
         from recommendation_service import recommend_programs
         return recommend_programs(sid)
@@ -1525,12 +1594,15 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
     if len(all_electives) >= 2 or len(all_cores) >= 2:
         sid = _get_student_id()
         prog = program_name
-        if not prog:
-            try:
-                from eligibility import get_student_context
-                prog = get_student_context(sid).get("program_name")
-            except Exception:
-                prog = None
+        completed_courses: set = set()
+        try:
+            from eligibility import get_student_context
+            ctx = get_student_context(sid)
+            if not prog:
+                prog = ctx.get("program_name")
+            completed_courses = ctx.get("completed_courses", set())
+        except Exception:
+            pass
 
         if prog:
             prog_lower = prog.lower().strip()
@@ -1548,17 +1620,26 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
                 ]
                 out_of_prog_elective = [n for n in all_electives if n not in in_prog_elective]
 
-                if len(in_prog_elective) >= 2:
+                completed_in_prog   = [n for n in in_prog_elective if n in completed_courses]
+                uncompleted_in_prog = [n for n in in_prog_elective if n not in completed_courses]
+
+                if len(uncompleted_in_prog) >= 2:
                     rec = ""
                     try:
                         from recommendation_service import recommend_electives
-                        rec = recommend_electives(sid, prog, course_names=in_prog_elective, skip_course_info=True)
+                        rec = recommend_electives(sid, prog, course_names=uncompleted_in_prog, skip_course_info=True)
                         output += "\n\n" + rec
                     except Exception:
                         pass
+                    if completed_in_prog:
+                        comp_t = ", ".join(n.title() for n in completed_in_prog)
+                        output += (
+                            f"\n\n[ADVISOR NOTE] The student has already completed {comp_t}; "
+                            f"{'it is' if len(completed_in_prog) == 1 else 'they are'} excluded from the recommendation above."
+                        )
                     if out_of_prog_elective:
                         out_t = ", ".join(n.title() for n in out_of_prog_elective)
-                        in_t  = ", ".join(n.title() for n in in_prog_elective)
+                        in_t  = ", ".join(n.title() for n in uncompleted_in_prog)
                         covers_suffix = (
                             f" The elective recommendation above covers only: {in_t}."
                             if rec and "No preference data" not in rec
@@ -1570,13 +1651,12 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
                             f"({prog.title()}); do not recommend {'it' if len(out_of_prog_elective) == 1 else 'them'}."
                             f"{covers_suffix}"
                         )
-                elif len(in_prog_elective) == 1:
-                    in_t  = in_prog_elective[0].title()
-                    out_t = ", ".join(n.title() for n in out_of_prog_elective)
+                elif len(uncompleted_in_prog) == 1:
+                    in_t = uncompleted_in_prog[0].title()
                     elig_suffix = ""
                     try:
                         from recommendation_service import _eligibility_for
-                        elig = _eligibility_for(sid, in_prog_elective[0])
+                        elig = _eligibility_for(sid, uncompleted_in_prog[0])
                         if elig.get("eligible") is True:
                             elig_suffix = (
                                 f" The student has completed all prerequisites for {in_t} "
@@ -1599,21 +1679,50 @@ def compare_courses(course_names: List[str], program_name: Optional[str] = None)
                             )
                     except Exception:
                         pass
+                    completed_clause = ""
+                    if completed_in_prog:
+                        comp_t = ", ".join(n.title() for n in completed_in_prog)
+                        completed_clause = f" The student has already completed {comp_t}."
+                    out_of_prog_clause = ""
+                    if out_of_prog_elective:
+                        oop_t = ", ".join(n.title() for n in out_of_prog_elective)
+                        out_of_prog_clause = (
+                            f" {oop_t} {'is' if len(out_of_prog_elective) == 1 else 'are'} "
+                            f"not offered as an elective in their program."
+                        )
                     output += (
-                        f"\n\n[ADVISOR NOTE] Only {in_t} is an elective in the student's program "
-                        f"({prog.title()}). "
-                        f"{out_t} {'is' if len(out_of_prog_elective) == 1 else 'are'} not offered as an elective in their program. "
-                        f"Inform the student that {in_t} is the only elective from these courses that belongs to their program. "
+                        f"\n\n[ADVISOR NOTE] Only {in_t} is an available elective in the student's program "
+                        f"({prog.title()}) that has not yet been completed."
+                        f"{completed_clause}"
+                        f"{out_of_prog_clause}"
+                        f" Inform the student that {in_t} is the only remaining elective choice from these courses."
                         f"{elig_suffix}".rstrip()
                     )
-                else:  # 0 electives in student's program
-                    all_t = ", ".join(n.title() for n in all_electives)
-                    output += (
-                        f"\n\n[ADVISOR NOTE] None of the compared courses ({all_t}) "
-                        f"are offered as electives in the student's program ({prog.title()}). "
-                        f"Do not recommend any of them; inform the student these courses "
-                        f"are not available as electives in their program."
-                    )
+                else:  # 0 uncompleted in-prog electives
+                    if completed_in_prog:
+                        comp_t = ", ".join(n.title() for n in completed_in_prog)
+                        out_clause = ""
+                        if out_of_prog_elective:
+                            oop_t = ", ".join(n.title() for n in out_of_prog_elective)
+                            out_clause = (
+                                f" {oop_t} {'is' if len(out_of_prog_elective) == 1 else 'are'} "
+                                f"also not offered as an elective in their program."
+                            )
+                        output += (
+                            f"\n\n[ADVISOR NOTE] The student has already completed all compared electives "
+                            f"from their program ({prog.title()}): {comp_t}. "
+                            f"No recommendation is needed; inform the student they have already taken "
+                            f"{'this course' if len(completed_in_prog) == 1 else 'these courses'}."
+                            f"{out_clause}"
+                        )
+                    else:  # none are electives in student's program at all
+                        all_t = ", ".join(n.title() for n in all_electives)
+                        output += (
+                            f"\n\n[ADVISOR NOTE] None of the compared courses ({all_t}) "
+                            f"are offered as electives in the student's program ({prog.title()}). "
+                            f"Do not recommend any of them; inform the student these courses "
+                            f"are not available as electives in their program."
+                        )
 
             # ── Core recommendation ───────────────────────────────────────────
             if len(all_cores) >= 2:
